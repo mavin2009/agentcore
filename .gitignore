@@ -1,0 +1,52 @@
+# Build directories
+/build/
+/build-*/
+/out/
+/dist/
+
+# CMake out-of-source and accidental in-source build artifacts
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+CTestTestfile.cmake
+Makefile
+install_manifest.txt
+CMakeFiles/
+Testing/
+
+# Native compilation outputs
+*.o
+*.obj
+*.lo
+*.la
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE and local tooling
+.vscode/
+.idea/
+.VSCodeCounter/
+
+# Editor temp files
+*.swp
+*.swo
+*~
