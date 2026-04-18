@@ -61,6 +61,80 @@ The important pieces are:
 - `compile()` lowers the graph into the native runtime.
 - `invoke()` executes one run and returns the final state mapping.
 
+## Use Higher-Level Builders For Common Shapes
+
+`StateGraph` remains the core Python API, but the package now also includes an optional pattern layer for workflow shapes that otherwise require a lot of repetitive builder code.
+
+### Sequential Pipelines
+
+```python
+from agentcore import PipelineGraph
+
+
+pipeline = PipelineGraph(dict, name="draft_pipeline", worker_count=2)
+pipeline.add_step("seed", lambda state, config: {"topic": "native-runtime"})
+pipeline.add_step("draft", lambda state, config: {"draft": f"draft::{state['topic']}"})
+pipeline.add_step("finalize", lambda state, config: {"final": f"{state['draft']}::final"})
+
+compiled = pipeline.compile()
+result = compiled.invoke({})
+```
+
+`PipelineGraph` is useful when the only manual wiring would have been `START -> step1 -> step2 -> ... -> END`.
+
+### Specialist Teams
+
+```python
+from agentcore import SpecialistTeam, StateGraph
+from agentcore.graph import END, START
+
+
+specialist = StateGraph(dict, name="specialist_child", worker_count=2)
+specialist.add_node("answer", lambda state, config: {"answer": f"{state['session_id']}::{state['query']}"})
+specialist.add_edge(START, "answer")
+specialist.add_edge("answer", END)
+
+team = SpecialistTeam(dict, name="review_team", worker_count=4)
+team.set_dispatch("dispatch", lambda state, config: {"topic": "scheduler"})
+team.add_specialist(
+    "planner",
+    specialist,
+    prepare=lambda state, config: {
+        "planner_session_id": "planner",
+        "planner_query": f"plan::{state['topic']}",
+    },
+    inputs={
+        "planner_session_id": "session_id",
+        "planner_query": "query",
+    },
+    outputs={"planner_answer": "answer"},
+)
+team.add_specialist(
+    "critic",
+    specialist,
+    prepare=lambda state, config: {
+        "critic_session_id": "critic",
+        "critic_query": f"critique::{state['topic']}",
+    },
+    inputs={
+        "critic_session_id": "session_id",
+        "critic_query": "query",
+    },
+    outputs={"critic_answer": "answer"},
+)
+team.set_aggregate(
+    "synthesize",
+    lambda state, config: {
+        "summary": f"{state['planner_answer']}|{state['critic_answer']}",
+    },
+)
+
+compiled = team.compile()
+details = compiled.invoke_with_metadata({})
+```
+
+`SpecialistTeam` exists for a specific reason: specialist flows usually want the same structure every time, namely dispatch, optional specialist-specific preparation, persistent child-session execution, and a single aggregation point. The helper keeps that structure explicit while avoiding repeated fan-out/join/subgraph wiring in application code.
+
 ## Inspect Execution
 
 The compiled graph supports several useful inspection surfaces:
@@ -133,6 +207,99 @@ This seam is intentionally narrow:
 - the producer runs only on the first committed occurrence
 - later visits for the same key and request replay the prior output
 - the recorded outcome is committed through the same native state/checkpoint path as other updates
+
+## Register Native Adapters From Python
+
+Compiled graphs now expose graph-owned native registries through `.tools` and `.models`.
+
+```python
+compiled = graph.compile()
+
+compiled.tools.register_sqlite("kv_store")
+compiled.models.register_local("summarizer", default_max_tokens=64)
+
+print(compiled.tools.list())
+print(compiled.models.describe("summarizer"))
+```
+
+Those registry views are configuration and inspection surfaces for the same native tool/model registries used by the execution engine. They are per compiled graph, which means subgraph execution inherits the parent run's runtime registries through the native engine rather than relying on Python-global adapter state.
+
+If you need a custom adapter without writing C++, you can also register Python-backed handlers directly into those native registries:
+
+```python
+async def python_tool(request, meta):
+    return {"upper": str(request["text"]).upper(), "adapter": meta["name"]}
+
+
+async def python_model(prompt, schema, meta):
+    return {
+        "output": {"summary": f"{prompt['topic']}::{schema['style']}::{meta['max_tokens']}"},
+        "confidence": 0.75,
+        "token_usage": len(prompt["topic"]),
+    }
+
+
+compiled.tools.register(
+    "py_upper",
+    python_tool,
+    decode_input="json",
+    metadata={"request_format": "json", "response_format": "json"},
+)
+compiled.models.register(
+    "py_summarizer",
+    python_model,
+    decode_prompt="json",
+    decode_schema="json",
+    metadata={"request_format": "json", "response_format": "json"},
+)
+```
+
+That shape is deliberate. The handler ergonomics stay Python-friendly, but registration still lands in the native registry, so direct invocation, `RuntimeContext` invocation, metadata inspection, and subgraph inheritance all continue to use one validated adapter path.
+
+You can also invoke registered adapters directly from Python:
+
+```python
+value = compiled.tools.invoke(
+    "kv_store",
+    "action=put\ntable=memory\nkey=topic\nvalue=native-runtime",
+    decode="text",
+)
+summary = compiled.models.invoke(
+    "summarizer",
+    "topic::native-runtime",
+    max_tokens=12,
+    decode="text",
+)
+```
+
+And from inside a node callback via `RuntimeContext`:
+
+```python
+def step(state, config, runtime):
+    runtime.invoke_tool(
+        "kv_store",
+        "action=put\ntable=memory\nkey=topic\nvalue=adapters",
+        decode="text",
+    )
+    summary = runtime.invoke_model(
+        "summarizer",
+        "topic::adapters",
+        max_tokens=10,
+        decode="text",
+    )
+    return {"summary": summary}
+```
+
+The built-in registration helpers currently cover:
+
+- `compiled.tools.register(...)`
+- `compiled.tools.register_http(...)`
+- `compiled.tools.register_sqlite(...)`
+- `compiled.tools.register_http_json(...)`
+- `compiled.models.register(...)`
+- `compiled.models.register_local(...)`
+- `compiled.models.register_llm_http(...)`
+- `compiled.models.register_openai_chat(...)`
 
 ## Fan-Out, Join, And Subgraphs
 

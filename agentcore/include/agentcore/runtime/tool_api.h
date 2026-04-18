@@ -1,6 +1,7 @@
 #ifndef AGENTCORE_TOOL_API_H
 #define AGENTCORE_TOOL_API_H
 
+#include "agentcore/adapters/common/adapter_metadata.h"
 #include "agentcore/runtime/async_executor.h"
 #include "agentcore/core/types.h"
 #include <cstddef>
@@ -62,6 +63,64 @@ enum ToolResponseFlag : uint32_t {
     kToolFlagUnsupportedRequest = 1U << 7
 };
 
+enum class ToolErrorCategory : uint8_t {
+    None = 0,
+    MissingHandler,
+    Validation,
+    Limits,
+    Timeout,
+    Unsupported,
+    HandlerException,
+    RetryExhausted
+};
+
+[[nodiscard]] inline ToolErrorCategory classify_tool_response_flags(uint32_t flags) noexcept {
+    if ((flags & kToolFlagMissingHandler) != 0U) {
+        return ToolErrorCategory::MissingHandler;
+    }
+    if ((flags & kToolFlagValidationError) != 0U) {
+        return ToolErrorCategory::Validation;
+    }
+    if ((flags & (kToolFlagInputTooLarge | kToolFlagOutputTooLarge)) != 0U) {
+        return ToolErrorCategory::Limits;
+    }
+    if ((flags & kToolFlagTimeoutExceeded) != 0U) {
+        return ToolErrorCategory::Timeout;
+    }
+    if ((flags & kToolFlagUnsupportedRequest) != 0U) {
+        return ToolErrorCategory::Unsupported;
+    }
+    if ((flags & kToolFlagHandlerException) != 0U) {
+        return ToolErrorCategory::HandlerException;
+    }
+    if ((flags & kToolFlagRetriesExhausted) != 0U) {
+        return ToolErrorCategory::RetryExhausted;
+    }
+    return ToolErrorCategory::None;
+}
+
+[[nodiscard]] inline std::string_view tool_error_category_name(ToolErrorCategory category) noexcept {
+    switch (category) {
+        case ToolErrorCategory::MissingHandler:
+            return "missing_handler";
+        case ToolErrorCategory::Validation:
+            return "validation";
+        case ToolErrorCategory::Limits:
+            return "limits";
+        case ToolErrorCategory::Timeout:
+            return "timeout";
+        case ToolErrorCategory::Unsupported:
+            return "unsupported";
+        case ToolErrorCategory::HandlerException:
+            return "handler_exception";
+        case ToolErrorCategory::RetryExhausted:
+            return "retry_exhausted";
+        case ToolErrorCategory::None:
+        default:
+            return "none";
+    }
+}
+
 struct ToolPolicy {
     uint16_t retry_limit{0};
     uint32_t timeout_ms{0};
@@ -84,6 +143,12 @@ public:
 
     void register_tool(std::string_view name, ToolHandler handler);
     void register_tool(std::string_view name, ToolPolicy policy, ToolHandler handler);
+    void register_tool(
+        std::string_view name,
+        ToolPolicy policy,
+        AdapterMetadata metadata,
+        ToolHandler handler
+    );
     void set_async_completion_listener(AsyncToolCompletionListener listener);
     [[nodiscard]] bool has_tool(std::string_view name) const;
     [[nodiscard]] ToolResponse invoke(const ToolRequest& request, ToolInvocationContext& context) const;
@@ -102,6 +167,7 @@ public:
     [[nodiscard]] std::size_t size() const noexcept;
     struct ToolSpec {
         ToolPolicy policy{};
+        AdapterMetadata metadata{};
         ToolHandler handler;
     };
 
@@ -125,6 +191,7 @@ public:
     };
 
     [[nodiscard]] std::vector<NamedToolSpec> registered_tools() const;
+    [[nodiscard]] std::optional<NamedToolSpec> describe_tool(std::string_view name) const;
 
 private:
     mutable std::mutex mutex_;

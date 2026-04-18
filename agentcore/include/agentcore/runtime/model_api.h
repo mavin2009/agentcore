@@ -1,6 +1,7 @@
 #ifndef AGENTCORE_MODEL_API_H
 #define AGENTCORE_MODEL_API_H
 
+#include "agentcore/adapters/common/adapter_metadata.h"
 #include "agentcore/runtime/async_executor.h"
 #include "agentcore/core/types.h"
 #include <cstddef>
@@ -70,6 +71,64 @@ enum ModelResponseFlag : uint32_t {
     kModelFlagUnsupportedRequest = 1U << 7
 };
 
+enum class ModelErrorCategory : uint8_t {
+    None = 0,
+    MissingHandler,
+    Validation,
+    Limits,
+    Timeout,
+    Unsupported,
+    HandlerException,
+    RetryExhausted
+};
+
+[[nodiscard]] inline ModelErrorCategory classify_model_response_flags(uint32_t flags) noexcept {
+    if ((flags & kModelFlagMissingHandler) != 0U) {
+        return ModelErrorCategory::MissingHandler;
+    }
+    if ((flags & kModelFlagValidationError) != 0U) {
+        return ModelErrorCategory::Validation;
+    }
+    if ((flags & (kModelFlagPromptTooLarge | kModelFlagOutputTooLarge)) != 0U) {
+        return ModelErrorCategory::Limits;
+    }
+    if ((flags & kModelFlagTimeoutExceeded) != 0U) {
+        return ModelErrorCategory::Timeout;
+    }
+    if ((flags & kModelFlagUnsupportedRequest) != 0U) {
+        return ModelErrorCategory::Unsupported;
+    }
+    if ((flags & kModelFlagHandlerException) != 0U) {
+        return ModelErrorCategory::HandlerException;
+    }
+    if ((flags & kModelFlagRetriesExhausted) != 0U) {
+        return ModelErrorCategory::RetryExhausted;
+    }
+    return ModelErrorCategory::None;
+}
+
+[[nodiscard]] inline std::string_view model_error_category_name(ModelErrorCategory category) noexcept {
+    switch (category) {
+        case ModelErrorCategory::MissingHandler:
+            return "missing_handler";
+        case ModelErrorCategory::Validation:
+            return "validation";
+        case ModelErrorCategory::Limits:
+            return "limits";
+        case ModelErrorCategory::Timeout:
+            return "timeout";
+        case ModelErrorCategory::Unsupported:
+            return "unsupported";
+        case ModelErrorCategory::HandlerException:
+            return "handler_exception";
+        case ModelErrorCategory::RetryExhausted:
+            return "retry_exhausted";
+        case ModelErrorCategory::None:
+        default:
+            return "none";
+    }
+}
+
 struct ModelPolicy {
     uint16_t retry_limit{0};
     uint32_t timeout_ms{0};
@@ -92,6 +151,12 @@ public:
 
     void register_model(std::string_view name, ModelHandler handler);
     void register_model(std::string_view name, ModelPolicy policy, ModelHandler handler);
+    void register_model(
+        std::string_view name,
+        ModelPolicy policy,
+        AdapterMetadata metadata,
+        ModelHandler handler
+    );
     void set_async_completion_listener(AsyncModelCompletionListener listener);
     [[nodiscard]] bool has_model(std::string_view name) const;
     [[nodiscard]] ModelResponse invoke(const ModelRequest& request, ModelInvocationContext& context) const;
@@ -110,6 +175,7 @@ public:
     [[nodiscard]] std::size_t size() const noexcept;
     struct ModelSpec {
         ModelPolicy policy{};
+        AdapterMetadata metadata{};
         ModelHandler handler;
     };
 
@@ -137,6 +203,7 @@ public:
     };
 
     [[nodiscard]] std::vector<NamedModelSpec> registered_models() const;
+    [[nodiscard]] std::optional<NamedModelSpec> describe_model(std::string_view name) const;
 
 private:
     mutable std::mutex mutex_;

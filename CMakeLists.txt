@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(agentcore VERSION 0.1.0 LANGUAGES CXX)
+project(agentcore VERSION 0.1.2 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -16,6 +16,7 @@ option(AGENTCORE_BUILD_EXAMPLES "Build agentcore example executables." ON)
 option(AGENTCORE_BUILD_BENCHMARKS "Build agentcore benchmark executables." ON)
 option(AGENTCORE_BUILD_PYTHON_BINDINGS "Build the CPython bindings for the agentcore graph API." ON)
 option(AGENTCORE_ENABLE_SQLITE_CHECKPOINTS "Enable SQLite-backed checkpoint storage." ON)
+option(AGENTCORE_ENABLE_CURL_ADAPTERS "Enable libcurl-backed HTTP transports for adapters." ON)
 
 set(AGENTCORE_HAVE_SQLITE3 OFF)
 if(AGENTCORE_ENABLE_SQLITE_CHECKPOINTS)
@@ -24,6 +25,16 @@ if(AGENTCORE_ENABLE_SQLITE_CHECKPOINTS)
         set(AGENTCORE_HAVE_SQLITE3 ON)
     else()
         message(STATUS "SQLite3 not found; SQLite checkpoint backend disabled.")
+    endif()
+endif()
+
+set(AGENTCORE_HAVE_CURL OFF)
+if(AGENTCORE_ENABLE_CURL_ADAPTERS)
+    find_package(CURL QUIET)
+    if(CURL_FOUND)
+        set(AGENTCORE_HAVE_CURL ON)
+    else()
+        message(STATUS "CURL not found; libcurl-backed adapters disabled.")
     endif()
 endif()
 
@@ -56,9 +67,12 @@ set(AGENTCORE_STATE_SOURCES
 )
 
 set(AGENTCORE_ADAPTER_SOURCES
+    agentcore/adapters/common/http_transport.cpp
     agentcore/adapters/models/llm_http_adapter.cpp
     agentcore/adapters/models/local_model_adapter.cpp
+    agentcore/adapters/models/openai_chat_model_adapter.cpp
     agentcore/adapters/tools/http_tool.cpp
+    agentcore/adapters/tools/http_json_tool.cpp
     agentcore/adapters/tools/sqlite_tool.cpp
 )
 
@@ -123,6 +137,10 @@ agentcore_source_group(agentcore_execution)
 add_library(agentcore_adapters STATIC ${AGENTCORE_ADAPTER_SOURCES})
 set_target_properties(agentcore_adapters PROPERTIES EXPORT_NAME adapters)
 target_link_libraries(agentcore_adapters PUBLIC agentcore_runtime PRIVATE agentcore_state)
+if(AGENTCORE_HAVE_CURL AND TARGET CURL::libcurl)
+    target_link_libraries(agentcore_adapters PUBLIC CURL::libcurl)
+    target_compile_definitions(agentcore_adapters PUBLIC AGENTCORE_HAVE_CURL=1)
+endif()
 agentcore_configure_target(agentcore_adapters)
 agentcore_source_group(agentcore_adapters)
 
@@ -301,6 +319,30 @@ if(BUILD_TESTING)
         )
         set_tests_properties(
             agentcore_python_agent_workflows_smoke
+            PROPERTIES
+                ENVIRONMENT "PYTHONPATH=${AGENTCORE_PYTHON_BUILD_ROOT}"
+        )
+
+        add_test(
+            NAME agentcore_python_patterns_smoke
+            COMMAND
+                ${Python3_EXECUTABLE}
+                "${CMAKE_CURRENT_SOURCE_DIR}/python/tests/patterns_smoke.py"
+        )
+        set_tests_properties(
+            agentcore_python_patterns_smoke
+            PROPERTIES
+                ENVIRONMENT "PYTHONPATH=${AGENTCORE_PYTHON_BUILD_ROOT}"
+        )
+
+        add_test(
+            NAME agentcore_python_adapters_runtime_smoke
+            COMMAND
+                ${Python3_EXECUTABLE}
+                "${CMAKE_CURRENT_SOURCE_DIR}/python/tests/adapters_runtime_smoke.py"
+        )
+        set_tests_properties(
+            agentcore_python_adapters_runtime_smoke
             PROPERTIES
                 ENVIRONMENT "PYTHONPATH=${AGENTCORE_PYTHON_BUILD_ROOT}"
         )

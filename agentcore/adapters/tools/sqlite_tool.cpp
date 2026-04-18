@@ -29,6 +29,24 @@ std::unordered_map<std::string, std::string> parse_request_map(std::string_view 
     return values;
 }
 
+AdapterMetadata default_sqlite_tool_metadata() {
+    AdapterMetadata metadata;
+    metadata.provider = "agentcore";
+    metadata.implementation = "sqlite_tool";
+    metadata.display_name = "SQLite-like KV Tool Adapter";
+    metadata.transport = AdapterTransportKind::Database;
+    metadata.auth = AdapterAuthKind::ConnectionString;
+    metadata.capabilities =
+        static_cast<uint64_t>(kAdapterCapabilitySync) |
+        static_cast<uint64_t>(kAdapterCapabilityAsync) |
+        static_cast<uint64_t>(kAdapterCapabilityStructuredRequest) |
+        static_cast<uint64_t>(kAdapterCapabilityCheckpointSafe) |
+        static_cast<uint64_t>(kAdapterCapabilitySql);
+    metadata.request_format = "line_map:action,table,key,value";
+    metadata.response_format = "text";
+    return metadata;
+}
+
 } // namespace
 
 void register_sqlite_tool_adapter(
@@ -37,7 +55,11 @@ void register_sqlite_tool_adapter(
     const SqliteToolAdapterOptions& options
 ) {
     const auto database = std::make_shared<KeyValueDatabase>();
-    registry.register_tool(tool_name, options.policy, [database](const ToolRequest& request, ToolInvocationContext& context) {
+    registry.register_tool(
+        tool_name,
+        options.policy,
+        resolve_adapter_metadata(options.metadata, default_sqlite_tool_metadata()),
+        [database](const ToolRequest& request, ToolInvocationContext& context) {
         const std::string_view payload = context.blobs.read_string(request.input);
         const auto values = parse_request_map(payload);
 

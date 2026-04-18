@@ -27,6 +27,29 @@ bool starts_with(std::string_view value, std::string_view prefix) {
     return value.size() >= prefix.size() && value.substr(0, prefix.size()) == prefix;
 }
 
+AdapterMetadata default_http_tool_metadata(const HttpToolAdapterOptions& options) {
+    AdapterMetadata metadata;
+    metadata.provider = "agentcore";
+    metadata.implementation = "http_tool";
+    metadata.display_name = "HTTP Tool Adapter";
+    metadata.transport = AdapterTransportKind::Http;
+    metadata.auth = AdapterAuthKind::None;
+    metadata.capabilities =
+        static_cast<uint64_t>(kAdapterCapabilitySync) |
+        static_cast<uint64_t>(kAdapterCapabilityAsync) |
+        static_cast<uint64_t>(kAdapterCapabilityStructuredRequest) |
+        static_cast<uint64_t>(kAdapterCapabilityCheckpointSafe);
+    if (options.enable_mock_scheme) {
+        metadata.capabilities |= static_cast<uint64_t>(kAdapterCapabilityStructuredResponse);
+    }
+    if (options.enable_file_scheme) {
+        metadata.capabilities |= static_cast<uint64_t>(kAdapterCapabilityLocalFilesystem);
+    }
+    metadata.request_format = "line_map:url,method,body";
+    metadata.response_format = "raw_text_or_json_text";
+    return metadata;
+}
+
 } // namespace
 
 void register_http_tool_adapter(
@@ -34,7 +57,11 @@ void register_http_tool_adapter(
     std::string_view tool_name,
     const HttpToolAdapterOptions& options
 ) {
-    registry.register_tool(tool_name, options.policy, [options](const ToolRequest& request, ToolInvocationContext& context) {
+    registry.register_tool(
+        tool_name,
+        options.policy,
+        resolve_adapter_metadata(options.metadata, default_http_tool_metadata(options)),
+        [options](const ToolRequest& request, ToolInvocationContext& context) {
         const std::string_view payload = context.blobs.read_string(request.input);
         const auto values = parse_request_map(payload);
         const auto url_iterator = values.find("url");

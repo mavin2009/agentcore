@@ -5,6 +5,8 @@
 
 #include "agentcore/execution/engine.h"
 #include "agentcore/execution/proof.h"
+#include "agentcore/runtime/model_api.h"
+#include "agentcore/runtime/tool_api.h"
 
 #include <memory>
 #include <mutex>
@@ -54,6 +56,20 @@ public:
     bool add_edge(std::string_view from_name, std::string_view to_name, std::string* error_message);
     bool set_entry_point(std::string_view node_name, std::string* error_message);
     bool finalize(std::string* error_message);
+    bool register_python_tool(
+        std::string_view name,
+        PyObject* callback,
+        ToolPolicy policy,
+        AdapterMetadata metadata,
+        std::string* error_message
+    );
+    bool register_python_model(
+        std::string_view name,
+        PyObject* callback,
+        ModelPolicy policy,
+        AdapterMetadata metadata,
+        std::string* error_message
+    );
     bool invoke(
         PyObject* input_state,
         PyObject* config,
@@ -90,6 +106,14 @@ public:
 
     [[nodiscard]] GraphId graph_id() const noexcept { return graph_id_; }
     [[nodiscard]] const GraphDefinition& graph() const noexcept { return graph_; }
+    [[nodiscard]] ToolRegistry& tools() noexcept { return engine_.tools(); }
+    [[nodiscard]] const ToolRegistry& tools() const noexcept {
+        return const_cast<ExecutionEngine&>(engine_).tools();
+    }
+    [[nodiscard]] ModelRegistry& models() noexcept { return engine_.models(); }
+    [[nodiscard]] const ModelRegistry& models() const noexcept {
+        return const_cast<ExecutionEngine&>(engine_).models();
+    }
     [[nodiscard]] std::string node_name(NodeId node_id) const;
     [[nodiscard]] static std::string fetch_python_error();
     [[nodiscard]] static std::string node_status_name(NodeResult::Status status);
@@ -209,6 +233,8 @@ private:
     std::unordered_map<std::string, StateKey> state_keys_;
     std::unordered_map<RunId, PyObject*> pending_initial_inputs_;
     std::unordered_map<RunId, PyObject*> pending_configs_;
+    std::unordered_map<std::string, std::shared_ptr<PyObject>> python_tool_callbacks_;
+    std::unordered_map<std::string, std::shared_ptr<PyObject>> python_model_callbacks_;
     bool finalized_{false};
 };
 
@@ -224,6 +250,52 @@ private:
     std::string_view key,
     PyObject* request,
     PyObject* producer,
+    std::string* error_message
+);
+[[nodiscard]] PyObject* list_registered_tools(
+    const ToolRegistry& registry,
+    std::string* error_message
+);
+[[nodiscard]] PyObject* describe_registered_tool(
+    const ToolRegistry& registry,
+    std::string_view name,
+    std::string* error_message
+);
+[[nodiscard]] PyObject* invoke_tool_registry(
+    ToolRegistry& registry,
+    std::string_view name,
+    const std::vector<std::byte>& input_bytes,
+    std::string* error_message
+);
+[[nodiscard]] PyObject* list_registered_models(
+    const ModelRegistry& registry,
+    std::string* error_message
+);
+[[nodiscard]] PyObject* describe_registered_model(
+    const ModelRegistry& registry,
+    std::string_view name,
+    std::string* error_message
+);
+[[nodiscard]] PyObject* invoke_model_registry(
+    ModelRegistry& registry,
+    std::string_view name,
+    const std::vector<std::byte>& prompt_bytes,
+    const std::vector<std::byte>& schema_bytes,
+    uint32_t max_tokens,
+    std::string* error_message
+);
+[[nodiscard]] PyObject* runtime_invoke_tool(
+    PyObject* runtime_capsule,
+    std::string_view name,
+    const std::vector<std::byte>& input_bytes,
+    std::string* error_message
+);
+[[nodiscard]] PyObject* runtime_invoke_model(
+    PyObject* runtime_capsule,
+    std::string_view name,
+    const std::vector<std::byte>& prompt_bytes,
+    const std::vector<std::byte>& schema_bytes,
+    uint32_t max_tokens,
     std::string* error_message
 );
 

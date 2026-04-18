@@ -6,12 +6,37 @@
 
 namespace agentcore {
 
+namespace {
+
+AdapterMetadata default_local_model_metadata() {
+    AdapterMetadata metadata;
+    metadata.provider = "agentcore";
+    metadata.implementation = "local_model";
+    metadata.display_name = "Local Model Adapter";
+    metadata.transport = AdapterTransportKind::InProcess;
+    metadata.auth = AdapterAuthKind::None;
+    metadata.capabilities =
+        static_cast<uint64_t>(kAdapterCapabilitySync) |
+        static_cast<uint64_t>(kAdapterCapabilityAsync) |
+        static_cast<uint64_t>(kAdapterCapabilityCheckpointSafe) |
+        static_cast<uint64_t>(kAdapterCapabilityStructuredRequest);
+    metadata.request_format = "prompt_blob";
+    metadata.response_format = "text";
+    return metadata;
+}
+
+} // namespace
+
 void register_local_model_adapter(
     ModelRegistry& registry,
     std::string_view model_name,
     const LocalModelAdapterOptions& options
 ) {
-    registry.register_model(model_name, options.policy, [options](const ModelRequest& request, ModelInvocationContext& context) {
+    registry.register_model(
+        model_name,
+        options.policy,
+        resolve_adapter_metadata(options.metadata, default_local_model_metadata()),
+        [options](const ModelRequest& request, ModelInvocationContext& context) {
         const std::string_view prompt = context.blobs.read_string(request.prompt);
         if (prompt.empty()) {
             return ModelResponse{false, {}, 0.0F, 0U, kModelFlagValidationError};

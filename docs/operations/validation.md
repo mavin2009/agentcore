@@ -24,6 +24,8 @@ These are useful when you are changing the Python binding seam or graph-builder 
 ```bash
 PYTHONPATH=./build/python python3 ./python/tests/state_graph_api_smoke.py
 PYTHONPATH=./build/python python3 ./python/tests/agent_workflows_smoke.py
+PYTHONPATH=./build/python python3 ./python/tests/patterns_smoke.py
+PYTHONPATH=./build/python python3 ./python/tests/adapters_runtime_smoke.py
 ```
 
 What they cover:
@@ -32,7 +34,10 @@ What they cover:
 - async Python node callbacks
 - metadata and streaming surfaces
 - Python runtime helper injection and recorded-effect replay
+- Python adapter registration, discovery, direct invocation, and runtime invocation
+- Python-backed custom tool/model handlers registered into the native registries
 - single-agent and multi-agent flows
+- higher-level pipeline and specialist-team builders
 - fan-out and join behavior
 - subgraph composition and nested config propagation
 - persistent subgraph session reuse
@@ -50,12 +55,17 @@ rm -rf /tmp/agentcore-wheel-test && mkdir -p /tmp/agentcore-wheel-test
 python3 -m pip install --no-deps --target /tmp/agentcore-wheel-test dist/agentcore_graph-*.whl
 PYTHONPATH=/tmp/agentcore-wheel-test python3 ./python/tests/state_graph_api_smoke.py
 PYTHONPATH=/tmp/agentcore-wheel-test python3 ./python/tests/agent_workflows_smoke.py
+PYTHONPATH=/tmp/agentcore-wheel-test python3 ./python/tests/patterns_smoke.py
+PYTHONPATH=/tmp/agentcore-wheel-test python3 ./python/tests/adapters_runtime_smoke.py
 ```
 
 That path proves the installed wheel, not the build tree, still supports:
 
 - Python graph construction and execution
+- graph-owned adapter registry configuration and invocation
+- custom Python-backed adapter handlers routed through the native registry seam
 - multi-agent and subgraph flows
+- higher-level pipeline and specialist-team builders
 - persistent-session reuse and resume
 - streaming and metadata inspection
 
@@ -148,7 +158,7 @@ It also emits the direct/resumed proof digests so Python-side changes can be ins
 When changing scheduler, subgraph, or streaming behavior:
 
 1. Run `ctest --test-dir build --output-on-failure`.
-2. Run the two Python smoke scripts.
+2. Run the four Python smoke scripts.
 3. Run `./build/agentcore_runtime_benchmark`.
 4. Run `./build/agentcore_persistent_subgraph_session_benchmark`.
 5. If the change touched Python orchestration, also run the Python benchmark.

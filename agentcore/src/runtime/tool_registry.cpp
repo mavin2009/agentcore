@@ -107,8 +107,35 @@ void ToolRegistry::register_tool(std::string_view name, ToolHandler handler) {
 }
 
 void ToolRegistry::register_tool(std::string_view name, ToolPolicy policy, ToolHandler handler) {
+    AdapterMetadata metadata;
+    metadata.provider = "custom";
+    metadata.implementation = std::string(name);
+    metadata.display_name = std::string(name);
+    metadata.transport = AdapterTransportKind::InProcess;
+    metadata.auth = AdapterAuthKind::None;
+    metadata.capabilities =
+        static_cast<uint64_t>(kAdapterCapabilitySync) |
+        static_cast<uint64_t>(kAdapterCapabilityAsync) |
+        static_cast<uint64_t>(kAdapterCapabilityCheckpointSafe);
+    metadata.request_format = "blob";
+    metadata.response_format = "blob";
+    register_tool(name, std::move(policy), std::move(metadata), std::move(handler));
+}
+
+void ToolRegistry::register_tool(
+    std::string_view name,
+    ToolPolicy policy,
+    AdapterMetadata metadata,
+    ToolHandler handler
+) {
     std::lock_guard<std::mutex> lock(mutex_);
-    handlers_[std::string(name)] = ToolSpec{policy, std::move(handler)};
+    if (metadata.implementation.empty()) {
+        metadata.implementation = std::string(name);
+    }
+    if (metadata.display_name.empty()) {
+        metadata.display_name = std::string(name);
+    }
+    handlers_[std::string(name)] = ToolSpec{policy, std::move(metadata), std::move(handler)};
 }
 
 void ToolRegistry::set_async_completion_listener(AsyncToolCompletionListener listener) {
@@ -417,6 +444,15 @@ std::vector<ToolRegistry::NamedToolSpec> ToolRegistry::registered_tools() const 
         tools.push_back(NamedToolSpec{name, spec});
     }
     return tools;
+}
+
+std::optional<ToolRegistry::NamedToolSpec> ToolRegistry::describe_tool(std::string_view name) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto iterator = handlers_.find(std::string(name));
+    if (iterator == handlers_.end()) {
+        return std::nullopt;
+    }
+    return NamedToolSpec{iterator->first, iterator->second};
 }
 
 } // namespace agentcore

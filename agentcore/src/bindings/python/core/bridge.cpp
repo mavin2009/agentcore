@@ -1,6 +1,8 @@
 #include "bridge.h"
 
+#include "agentcore/runtime/model_api.h"
 #include "agentcore/runtime/tool_api.h"
+#include "agentcore/state/state_store.h"
 
 #include <algorithm>
 #include <atomic>
@@ -51,6 +53,21 @@ private:
 struct CallbackRuntimeHandle {
     ExecutionContext* context{nullptr};
 };
+
+std::shared_ptr<PyObject> make_owned_python_callback(PyObject* callback) {
+    Py_XINCREF(callback);
+    return std::shared_ptr<PyObject>(
+        callback,
+        [](PyObject* object) {
+            if (object == nullptr || Py_IsInitialized() == 0) {
+                return;
+            }
+            const PyGILState_STATE gil_state = PyGILState_Ensure();
+            Py_DECREF(object);
+            PyGILState_Release(gil_state);
+        }
+    );
+}
 
 void destroy_graph_capsule(PyObject* capsule) {
     auto* handle = static_cast<GraphHandle*>(PyCapsule_GetPointer(capsule, kGraphCapsuleName));
@@ -399,6 +416,536 @@ PyObject* event_to_python(
     return event_dict;
 }
 
+struct AdapterCapabilityName {
+    uint64_t bit;
+    const char* name;
+};
+
+constexpr AdapterCapabilityName kAdapterCapabilityNames[] = {
+    {kAdapterCapabilitySync, "sync"},
+    {kAdapterCapabilityAsync, "async"},
+    {kAdapterCapabilityStreaming, "streaming"},
+    {kAdapterCapabilityStructuredRequest, "structured_request"},
+    {kAdapterCapabilityStructuredResponse, "structured_response"},
+    {kAdapterCapabilityCheckpointSafe, "checkpoint_safe"},
+    {kAdapterCapabilityExternalNetwork, "external_network"},
+    {kAdapterCapabilityLocalFilesystem, "local_filesystem"},
+    {kAdapterCapabilityJsonSchema, "json_schema"},
+    {kAdapterCapabilityToolCalling, "tool_calling"},
+    {kAdapterCapabilitySql, "sql"},
+    {kAdapterCapabilityChatMessages, "chat_messages"},
+};
+
+PyObject* adapter_metadata_to_python(
+    const AdapterMetadata& metadata,
+    std::string* error_message
+) {
+    PyObject* metadata_dict = PyDict_New();
+    if (metadata_dict == nullptr) {
+        *error_message = GraphHandle::fetch_python_error();
+        return nullptr;
+    }
+
+    PyObject* capabilities = PyList_New(0);
+    if (capabilities == nullptr) {
+        Py_DECREF(metadata_dict);
+        *error_message = GraphHandle::fetch_python_error();
+        return nullptr;
+    }
+
+    for (const AdapterCapabilityName& capability : kAdapterCapabilityNames) {
+        if ((metadata.capabilities & capability.bit) == 0U) {
+            continue;
+        }
+        PyObject* capability_name = PyUnicode_FromString(capability.name);
+        if (capability_name == nullptr || PyList_Append(capabilities, capability_name) != 0) {
+            Py_XDECREF(capability_name);
+            Py_DECREF(capabilities);
+            Py_DECREF(metadata_dict);
+            *error_message = GraphHandle::fetch_python_error();
+            return nullptr;
+        }
+        Py_DECREF(capability_name);
+    }
+
+    const bool ok =
+        set_dict_item(metadata_dict, "provider", unicode_from_utf8(metadata.provider)) &&
+        set_dict_item(metadata_dict, "implementation", unicode_from_utf8(metadata.implementation)) &&
+        set_dict_item(metadata_dict, "display_name", unicode_from_utf8(metadata.display_name)) &&
+        set_dict_item(
+            metadata_dict,
+            "transport",
+            unicode_from_utf8(adapter_transport_name(metadata.transport))
+        ) &&
+        set_dict_item(
+            metadata_dict,
+            "auth",
+            unicode_from_utf8(adapter_auth_name(metadata.auth))
+        ) &&
+        set_dict_item(
+            metadata_dict,
+            "capabilities_mask",
+            PyLong_FromUnsignedLongLong(metadata.capabilities)
+        ) &&
+        set_dict_item(metadata_dict, "capabilities", capabilities) &&
+        set_dict_item(metadata_dict, "request_format", unicode_from_utf8(metadata.request_format)) &&
+        set_dict_item(metadata_dict, "response_format", unicode_from_utf8(metadata.response_format));
+    if (!ok) {
+        Py_DECREF(metadata_dict);
+        *error_message = GraphHandle::fetch_python_error();
+        return nullptr;
+    }
+    return metadata_dict;
+}
+
+PyObject* tool_policy_to_python(
+    const ToolPolicy& policy,
+    std::string* error_message
+) {
+    PyObject* policy_dict = PyDict_New();
+    if (policy_dict == nullptr) {
+        *error_message = GraphHandle::fetch_python_error();
+        return nullptr;
+    }
+    const bool ok =
+        set_dict_item(policy_dict, "retry_limit", PyLong_FromUnsignedLong(policy.retry_limit)) &&
+        set_dict_item(policy_dict, "timeout_ms", PyLong_FromUnsignedLong(policy.timeout_ms)) &&
+        set_dict_item(
+            policy_dict,
+            "max_input_bytes",
+            PyLong_FromUnsignedLongLong(policy.max_input_bytes)
+        ) &&
+        set_dict_item(
+            policy_dict,
+            "max_output_bytes",
+            PyLong_FromUnsignedLongLong(policy.max_output_bytes)
+        );
+    if (!ok) {
+        Py_DECREF(policy_dict);
+        *error_message = GraphHandle::fetch_python_error();
+        return nullptr;
+    }
+    return policy_dict;
+}
+
+PyObject* model_policy_to_python(
+    const ModelPolicy& policy,
+    std::string* error_message
+) {
+    PyObject* policy_dict = PyDict_New();
+    if (policy_dict == nullptr) {
+        *error_message = GraphHandle::fetch_python_error();
+        return nullptr;
+    }
+    const bool ok =
+        set_dict_item(policy_dict, "retry_limit", PyLong_FromUnsignedLong(policy.retry_limit)) &&
+        set_dict_item(policy_dict, "timeout_ms", PyLong_FromUnsignedLong(policy.timeout_ms)) &&
+        set_dict_item(
+            policy_dict,
+            "max_prompt_bytes",
+            PyLong_FromUnsignedLongLong(policy.max_prompt_bytes)
+        ) &&
+        set_dict_item(
+            policy_dict,
+            "max_output_bytes",
+            PyLong_FromUnsignedLongLong(policy.max_output_bytes)
+        );
+    if (!ok) {
+        Py_DECREF(policy_dict);
+        *error_message = GraphHandle::fetch_python_error();
+        return nullptr;
+    }
+    return policy_dict;
+}
+
+PyObject* tool_spec_to_python(
+    const ToolRegistry::NamedToolSpec& spec,
+    std::string* error_message
+) {
+    PyObject* result = PyDict_New();
+    if (result == nullptr) {
+        *error_message = GraphHandle::fetch_python_error();
+        return nullptr;
+    }
+    PyObject* policy = tool_policy_to_python(spec.spec.policy, error_message);
+    if (policy == nullptr) {
+        Py_DECREF(result);
+        return nullptr;
+    }
+    PyObject* metadata = adapter_metadata_to_python(spec.spec.metadata, error_message);
+    if (metadata == nullptr) {
+        Py_DECREF(policy);
+        Py_DECREF(result);
+        return nullptr;
+    }
+    const bool ok =
+        set_dict_item(result, "name", unicode_from_utf8(spec.name)) &&
+        set_dict_item(result, "policy", policy) &&
+        set_dict_item(result, "metadata", metadata);
+    if (!ok) {
+        Py_DECREF(result);
+        *error_message = GraphHandle::fetch_python_error();
+        return nullptr;
+    }
+    return result;
+}
+
+PyObject* model_spec_to_python(
+    const ModelRegistry::NamedModelSpec& spec,
+    std::string* error_message
+) {
+    PyObject* result = PyDict_New();
+    if (result == nullptr) {
+        *error_message = GraphHandle::fetch_python_error();
+        return nullptr;
+    }
+    PyObject* policy = model_policy_to_python(spec.spec.policy, error_message);
+    if (policy == nullptr) {
+        Py_DECREF(result);
+        return nullptr;
+    }
+    PyObject* metadata = adapter_metadata_to_python(spec.spec.metadata, error_message);
+    if (metadata == nullptr) {
+        Py_DECREF(policy);
+        Py_DECREF(result);
+        return nullptr;
+    }
+    const bool ok =
+        set_dict_item(result, "name", unicode_from_utf8(spec.name)) &&
+        set_dict_item(result, "policy", policy) &&
+        set_dict_item(result, "metadata", metadata);
+    if (!ok) {
+        Py_DECREF(result);
+        *error_message = GraphHandle::fetch_python_error();
+        return nullptr;
+    }
+    return result;
+}
+
+PyObject* tool_response_to_python(
+    const ToolResponse& response,
+    const BlobStore& blobs,
+    std::string* error_message
+) {
+    PyObject* response_dict = PyDict_New();
+    if (response_dict == nullptr) {
+        *error_message = GraphHandle::fetch_python_error();
+        return nullptr;
+    }
+
+    const std::vector<std::byte> output_bytes = response.output.empty()
+        ? std::vector<std::byte>{}
+        : blobs.read_bytes(response.output);
+    PyObject* output = PyBytes_FromStringAndSize(
+        reinterpret_cast<const char*>(output_bytes.data()),
+        static_cast<Py_ssize_t>(output_bytes.size())
+    );
+    if (output == nullptr) {
+        Py_DECREF(response_dict);
+        *error_message = GraphHandle::fetch_python_error();
+        return nullptr;
+    }
+
+    const ToolErrorCategory category = classify_tool_response_flags(response.flags);
+    const bool ok =
+        set_dict_item(response_dict, "ok", PyBool_FromLong(response.ok ? 1 : 0)) &&
+        set_dict_item(response_dict, "output", output) &&
+        set_dict_item(response_dict, "flags", PyLong_FromUnsignedLong(response.flags)) &&
+        set_dict_item(response_dict, "attempts", PyLong_FromUnsignedLong(response.attempts)) &&
+        set_dict_item(
+            response_dict,
+            "latency_ns",
+            PyLong_FromUnsignedLongLong(response.latency_ns)
+        ) &&
+        set_dict_item(
+            response_dict,
+            "error_category",
+            unicode_from_utf8(tool_error_category_name(category))
+        );
+    if (!ok) {
+        Py_DECREF(response_dict);
+        *error_message = GraphHandle::fetch_python_error();
+        return nullptr;
+    }
+    return response_dict;
+}
+
+PyObject* model_response_to_python(
+    const ModelResponse& response,
+    const BlobStore& blobs,
+    std::string* error_message
+) {
+    PyObject* response_dict = PyDict_New();
+    if (response_dict == nullptr) {
+        *error_message = GraphHandle::fetch_python_error();
+        return nullptr;
+    }
+
+    const std::vector<std::byte> output_bytes = response.output.empty()
+        ? std::vector<std::byte>{}
+        : blobs.read_bytes(response.output);
+    PyObject* output = PyBytes_FromStringAndSize(
+        reinterpret_cast<const char*>(output_bytes.data()),
+        static_cast<Py_ssize_t>(output_bytes.size())
+    );
+    if (output == nullptr) {
+        Py_DECREF(response_dict);
+        *error_message = GraphHandle::fetch_python_error();
+        return nullptr;
+    }
+
+    const ModelErrorCategory category = classify_model_response_flags(response.flags);
+    const bool ok =
+        set_dict_item(response_dict, "ok", PyBool_FromLong(response.ok ? 1 : 0)) &&
+        set_dict_item(response_dict, "output", output) &&
+        set_dict_item(response_dict, "confidence", PyFloat_FromDouble(response.confidence)) &&
+        set_dict_item(
+            response_dict,
+            "token_usage",
+            PyLong_FromUnsignedLong(response.token_usage)
+        ) &&
+        set_dict_item(response_dict, "flags", PyLong_FromUnsignedLong(response.flags)) &&
+        set_dict_item(response_dict, "attempts", PyLong_FromUnsignedLong(response.attempts)) &&
+        set_dict_item(
+            response_dict,
+            "latency_ns",
+            PyLong_FromUnsignedLongLong(response.latency_ns)
+        ) &&
+        set_dict_item(
+            response_dict,
+            "error_category",
+            unicode_from_utf8(model_error_category_name(category))
+        );
+    if (!ok) {
+        Py_DECREF(response_dict);
+        *error_message = GraphHandle::fetch_python_error();
+        return nullptr;
+    }
+    return response_dict;
+}
+
+bool parse_python_bool_default(PyObject* value, bool default_value, bool* output, std::string* error_message) {
+    if (value == nullptr || value == Py_None) {
+        *output = default_value;
+        return true;
+    }
+    const int truth = PyObject_IsTrue(value);
+    if (truth < 0) {
+        *error_message = GraphHandle::fetch_python_error();
+        return false;
+    }
+    *output = truth != 0;
+    return true;
+}
+
+bool parse_python_uint32_default(
+    PyObject* value,
+    uint32_t default_value,
+    uint32_t* output,
+    std::string* error_message
+) {
+    if (value == nullptr || value == Py_None) {
+        *output = default_value;
+        return true;
+    }
+    const unsigned long long parsed = PyLong_AsUnsignedLongLong(value);
+    if (PyErr_Occurred() != nullptr) {
+        *error_message = GraphHandle::fetch_python_error();
+        PyErr_Clear();
+        return false;
+    }
+    *output = static_cast<uint32_t>(parsed);
+    return true;
+}
+
+bool parse_python_uint16_default(
+    PyObject* value,
+    uint16_t default_value,
+    uint16_t* output,
+    std::string* error_message
+) {
+    uint32_t parsed = default_value;
+    if (!parse_python_uint32_default(value, default_value, &parsed, error_message)) {
+        return false;
+    }
+    *output = static_cast<uint16_t>(parsed);
+    return true;
+}
+
+bool parse_python_float_default(
+    PyObject* value,
+    float default_value,
+    float* output,
+    std::string* error_message
+) {
+    if (value == nullptr || value == Py_None) {
+        *output = default_value;
+        return true;
+    }
+    const double parsed = PyFloat_AsDouble(value);
+    if (PyErr_Occurred() != nullptr) {
+        *error_message = GraphHandle::fetch_python_error();
+        PyErr_Clear();
+        return false;
+    }
+    *output = static_cast<float>(parsed);
+    return true;
+}
+
+bool parse_python_bytes_payload(
+    PyObject* value,
+    std::vector<std::byte>* output,
+    std::string* error_message
+) {
+    output->clear();
+    if (value == nullptr || value == Py_None) {
+        return true;
+    }
+
+    Py_buffer view{};
+    if (PyObject_GetBuffer(value, &view, PyBUF_SIMPLE) != 0) {
+        *error_message = "expected a bytes-like payload";
+        PyErr_Clear();
+        return false;
+    }
+    const auto* begin = static_cast<const std::byte*>(view.buf);
+    output->assign(begin, begin + static_cast<std::size_t>(view.len));
+    PyBuffer_Release(&view);
+    return true;
+}
+
+bool tool_response_from_python_result(
+    PyObject* result,
+    ToolInvocationContext& context,
+    ToolResponse* response,
+    std::string* error_message
+) {
+    if (!PyMapping_Check(result)) {
+        *error_message = "python tool adapters must return a mapping result";
+        return false;
+    }
+
+    PyObject* ok_object = PyMapping_GetItemString(result, "ok");
+    PyObject* output_object = PyMapping_GetItemString(result, "output");
+    PyObject* flags_object = PyMapping_GetItemString(result, "flags");
+    PyObject* attempts_object = PyMapping_GetItemString(result, "attempts");
+    PyObject* latency_object = PyMapping_GetItemString(result, "latency_ns");
+
+    if (PyErr_Occurred() != nullptr) {
+        *error_message = GraphHandle::fetch_python_error();
+        PyErr_Clear();
+        Py_XDECREF(ok_object);
+        Py_XDECREF(output_object);
+        Py_XDECREF(flags_object);
+        Py_XDECREF(attempts_object);
+        Py_XDECREF(latency_object);
+        return false;
+    }
+
+    std::vector<std::byte> output_bytes;
+    bool ok = true;
+    uint32_t flags = 0U;
+    uint16_t attempts = 0U;
+    uint32_t latency = 0U;
+    const bool parsed =
+        parse_python_bool_default(ok_object, true, &ok, error_message) &&
+        parse_python_bytes_payload(output_object, &output_bytes, error_message) &&
+        parse_python_uint32_default(flags_object, 0U, &flags, error_message) &&
+        parse_python_uint16_default(attempts_object, 0U, &attempts, error_message) &&
+        parse_python_uint32_default(latency_object, 0U, &latency, error_message);
+
+    Py_XDECREF(ok_object);
+    Py_XDECREF(output_object);
+    Py_XDECREF(flags_object);
+    Py_XDECREF(attempts_object);
+    Py_XDECREF(latency_object);
+
+    if (!parsed) {
+        return false;
+    }
+
+    response->ok = ok;
+    response->output = output_bytes.empty()
+        ? BlobRef{}
+        : context.blobs.append(output_bytes.data(), output_bytes.size());
+    response->flags = flags;
+    response->attempts = attempts;
+    response->latency_ns = latency;
+    return true;
+}
+
+bool model_response_from_python_result(
+    PyObject* result,
+    ModelInvocationContext& context,
+    ModelResponse* response,
+    std::string* error_message
+) {
+    if (!PyMapping_Check(result)) {
+        *error_message = "python model adapters must return a mapping result";
+        return false;
+    }
+
+    PyObject* ok_object = PyMapping_GetItemString(result, "ok");
+    PyObject* output_object = PyMapping_GetItemString(result, "output");
+    PyObject* confidence_object = PyMapping_GetItemString(result, "confidence");
+    PyObject* token_usage_object = PyMapping_GetItemString(result, "token_usage");
+    PyObject* flags_object = PyMapping_GetItemString(result, "flags");
+    PyObject* attempts_object = PyMapping_GetItemString(result, "attempts");
+    PyObject* latency_object = PyMapping_GetItemString(result, "latency_ns");
+
+    if (PyErr_Occurred() != nullptr) {
+        *error_message = GraphHandle::fetch_python_error();
+        PyErr_Clear();
+        Py_XDECREF(ok_object);
+        Py_XDECREF(output_object);
+        Py_XDECREF(confidence_object);
+        Py_XDECREF(token_usage_object);
+        Py_XDECREF(flags_object);
+        Py_XDECREF(attempts_object);
+        Py_XDECREF(latency_object);
+        return false;
+    }
+
+    std::vector<std::byte> output_bytes;
+    bool ok = true;
+    float confidence = 1.0F;
+    uint32_t token_usage = 0U;
+    uint32_t flags = 0U;
+    uint16_t attempts = 0U;
+    uint32_t latency = 0U;
+    const bool parsed =
+        parse_python_bool_default(ok_object, true, &ok, error_message) &&
+        parse_python_bytes_payload(output_object, &output_bytes, error_message) &&
+        parse_python_float_default(confidence_object, 1.0F, &confidence, error_message) &&
+        parse_python_uint32_default(token_usage_object, 0U, &token_usage, error_message) &&
+        parse_python_uint32_default(flags_object, 0U, &flags, error_message) &&
+        parse_python_uint16_default(attempts_object, 0U, &attempts, error_message) &&
+        parse_python_uint32_default(latency_object, 0U, &latency, error_message);
+
+    Py_XDECREF(ok_object);
+    Py_XDECREF(output_object);
+    Py_XDECREF(confidence_object);
+    Py_XDECREF(token_usage_object);
+    Py_XDECREF(flags_object);
+    Py_XDECREF(attempts_object);
+    Py_XDECREF(latency_object);
+
+    if (!parsed) {
+        return false;
+    }
+
+    response->ok = ok;
+    response->output = output_bytes.empty()
+        ? BlobRef{}
+        : context.blobs.append(output_bytes.data(), output_bytes.size());
+    response->confidence = confidence;
+    response->token_usage = token_usage;
+    response->flags = flags;
+    response->attempts = attempts;
+    response->latency_ns = latency;
+    return true;
+}
+
 } // namespace
 
 GraphHandle::GraphHandle(std::string name, std::size_t worker_count, GraphId graph_id)
@@ -514,6 +1061,163 @@ bool GraphHandle::add_node(
     if (!entry_node_id_.has_value()) {
         entry_node_id_ = node_id;
     }
+    return true;
+}
+
+bool GraphHandle::register_python_tool(
+    std::string_view name,
+    PyObject* callback,
+    ToolPolicy policy,
+    AdapterMetadata metadata,
+    std::string* error_message
+) {
+    if (name.empty()) {
+        *error_message = "tool name must not be empty";
+        return false;
+    }
+    if (callback == nullptr || !PyCallable_Check(callback)) {
+        *error_message = "tool callback must be callable";
+        return false;
+    }
+
+    const std::shared_ptr<PyObject> owned_callback = make_owned_python_callback(callback);
+    engine_.tools().register_tool(
+        name,
+        policy,
+        std::move(metadata),
+        [owned_callback](const ToolRequest& request, ToolInvocationContext& context) {
+            const std::vector<std::byte> input_bytes = request.input.empty()
+                ? std::vector<std::byte>{}
+                : context.blobs.read_bytes(request.input);
+
+            const PyGILState_STATE gil_state = PyGILState_Ensure();
+            PyObject* input_object = PyBytes_FromStringAndSize(
+                reinterpret_cast<const char*>(input_bytes.data()),
+                static_cast<Py_ssize_t>(input_bytes.size())
+            );
+            if (input_object == nullptr) {
+                PyErr_Clear();
+                PyGILState_Release(gil_state);
+                return ToolResponse{false, {}, kToolFlagHandlerException};
+            }
+
+            PyObject* callback_result = PyObject_CallFunctionObjArgs(
+                owned_callback.get(),
+                input_object,
+                nullptr
+            );
+            Py_DECREF(input_object);
+            if (callback_result == nullptr) {
+                PyErr_Clear();
+                PyGILState_Release(gil_state);
+                return ToolResponse{false, {}, kToolFlagHandlerException};
+            }
+
+            ToolResponse response{};
+            std::string callback_error;
+            const bool parsed = tool_response_from_python_result(
+                callback_result,
+                context,
+                &response,
+                &callback_error
+            );
+            Py_DECREF(callback_result);
+            PyGILState_Release(gil_state);
+            if (!parsed) {
+                return ToolResponse{false, {}, kToolFlagValidationError};
+            }
+            return response;
+        }
+    );
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    python_tool_callbacks_[std::string(name)] = owned_callback;
+    return true;
+}
+
+bool GraphHandle::register_python_model(
+    std::string_view name,
+    PyObject* callback,
+    ModelPolicy policy,
+    AdapterMetadata metadata,
+    std::string* error_message
+) {
+    if (name.empty()) {
+        *error_message = "model name must not be empty";
+        return false;
+    }
+    if (callback == nullptr || !PyCallable_Check(callback)) {
+        *error_message = "model callback must be callable";
+        return false;
+    }
+
+    const std::shared_ptr<PyObject> owned_callback = make_owned_python_callback(callback);
+    engine_.models().register_model(
+        name,
+        policy,
+        std::move(metadata),
+        [owned_callback](const ModelRequest& request, ModelInvocationContext& context) {
+            const std::vector<std::byte> prompt_bytes = request.prompt.empty()
+                ? std::vector<std::byte>{}
+                : context.blobs.read_bytes(request.prompt);
+            const std::vector<std::byte> schema_bytes = request.schema.empty()
+                ? std::vector<std::byte>{}
+                : context.blobs.read_bytes(request.schema);
+
+            const PyGILState_STATE gil_state = PyGILState_Ensure();
+            PyObject* prompt_object = PyBytes_FromStringAndSize(
+                reinterpret_cast<const char*>(prompt_bytes.data()),
+                static_cast<Py_ssize_t>(prompt_bytes.size())
+            );
+            PyObject* schema_object = PyBytes_FromStringAndSize(
+                reinterpret_cast<const char*>(schema_bytes.data()),
+                static_cast<Py_ssize_t>(schema_bytes.size())
+            );
+            PyObject* max_tokens_object = PyLong_FromUnsignedLong(request.max_tokens);
+            if (prompt_object == nullptr || schema_object == nullptr || max_tokens_object == nullptr) {
+                Py_XDECREF(prompt_object);
+                Py_XDECREF(schema_object);
+                Py_XDECREF(max_tokens_object);
+                PyErr_Clear();
+                PyGILState_Release(gil_state);
+                return ModelResponse{false, {}, 0.0F, 0U, kModelFlagHandlerException};
+            }
+
+            PyObject* callback_result = PyObject_CallFunctionObjArgs(
+                owned_callback.get(),
+                prompt_object,
+                schema_object,
+                max_tokens_object,
+                nullptr
+            );
+            Py_DECREF(prompt_object);
+            Py_DECREF(schema_object);
+            Py_DECREF(max_tokens_object);
+            if (callback_result == nullptr) {
+                PyErr_Clear();
+                PyGILState_Release(gil_state);
+                return ModelResponse{false, {}, 0.0F, 0U, kModelFlagHandlerException};
+            }
+
+            ModelResponse response{};
+            std::string callback_error;
+            const bool parsed = model_response_from_python_result(
+                callback_result,
+                context,
+                &response,
+                &callback_error
+            );
+            Py_DECREF(callback_result);
+            PyGILState_Release(gil_state);
+            if (!parsed) {
+                return ModelResponse{false, {}, 0.0F, 0U, kModelFlagValidationError};
+            }
+            return response;
+        }
+    );
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    python_model_callbacks_[std::string(name)] = owned_callback;
     return true;
 }
 
@@ -1734,6 +2438,188 @@ PyObject* runtime_record_once(
         *error_message = error.what();
         return nullptr;
     }
+}
+
+PyObject* list_registered_tools(
+    const ToolRegistry& registry,
+    std::string* error_message
+) {
+    const std::vector<ToolRegistry::NamedToolSpec> specs = registry.registered_tools();
+    PyObject* result = PyList_New(0);
+    if (result == nullptr) {
+        *error_message = GraphHandle::fetch_python_error();
+        return nullptr;
+    }
+    for (const ToolRegistry::NamedToolSpec& spec : specs) {
+        PyObject* item = tool_spec_to_python(spec, error_message);
+        if (item == nullptr || PyList_Append(result, item) != 0) {
+            Py_XDECREF(item);
+            Py_DECREF(result);
+            if (error_message->empty()) {
+                *error_message = GraphHandle::fetch_python_error();
+            }
+            return nullptr;
+        }
+        Py_DECREF(item);
+    }
+    return result;
+}
+
+PyObject* describe_registered_tool(
+    const ToolRegistry& registry,
+    std::string_view name,
+    std::string* error_message
+) {
+    const std::optional<ToolRegistry::NamedToolSpec> spec = registry.describe_tool(name);
+    if (!spec.has_value()) {
+        Py_RETURN_NONE;
+    }
+    return tool_spec_to_python(*spec, error_message);
+}
+
+PyObject* invoke_tool_registry(
+    ToolRegistry& registry,
+    std::string_view name,
+    const std::vector<std::byte>& input_bytes,
+    std::string* error_message
+) {
+    StateStore store;
+    BlobStore& blobs = store.blobs();
+    StringInterner& strings = store.strings();
+    ToolInvocationContext context{blobs, strings};
+    const BlobRef input = input_bytes.empty()
+        ? BlobRef{}
+        : blobs.append(input_bytes.data(), input_bytes.size());
+    const ToolRequest request{
+        strings.intern(name),
+        input
+    };
+    PyThreadState* released_thread_state = PyEval_SaveThread();
+    const ToolResponse response = registry.invoke(request, context);
+    PyEval_RestoreThread(released_thread_state);
+    return tool_response_to_python(response, blobs, error_message);
+}
+
+PyObject* list_registered_models(
+    const ModelRegistry& registry,
+    std::string* error_message
+) {
+    const std::vector<ModelRegistry::NamedModelSpec> specs = registry.registered_models();
+    PyObject* result = PyList_New(0);
+    if (result == nullptr) {
+        *error_message = GraphHandle::fetch_python_error();
+        return nullptr;
+    }
+    for (const ModelRegistry::NamedModelSpec& spec : specs) {
+        PyObject* item = model_spec_to_python(spec, error_message);
+        if (item == nullptr || PyList_Append(result, item) != 0) {
+            Py_XDECREF(item);
+            Py_DECREF(result);
+            if (error_message->empty()) {
+                *error_message = GraphHandle::fetch_python_error();
+            }
+            return nullptr;
+        }
+        Py_DECREF(item);
+    }
+    return result;
+}
+
+PyObject* describe_registered_model(
+    const ModelRegistry& registry,
+    std::string_view name,
+    std::string* error_message
+) {
+    const std::optional<ModelRegistry::NamedModelSpec> spec = registry.describe_model(name);
+    if (!spec.has_value()) {
+        Py_RETURN_NONE;
+    }
+    return model_spec_to_python(*spec, error_message);
+}
+
+PyObject* invoke_model_registry(
+    ModelRegistry& registry,
+    std::string_view name,
+    const std::vector<std::byte>& prompt_bytes,
+    const std::vector<std::byte>& schema_bytes,
+    uint32_t max_tokens,
+    std::string* error_message
+) {
+    StateStore store;
+    BlobStore& blobs = store.blobs();
+    StringInterner& strings = store.strings();
+    ModelInvocationContext context{blobs, strings};
+    const BlobRef prompt = prompt_bytes.empty()
+        ? BlobRef{}
+        : blobs.append(prompt_bytes.data(), prompt_bytes.size());
+    const BlobRef schema = schema_bytes.empty()
+        ? BlobRef{}
+        : blobs.append(schema_bytes.data(), schema_bytes.size());
+    const ModelRequest request{
+        strings.intern(name),
+        prompt,
+        schema,
+        max_tokens
+    };
+    PyThreadState* released_thread_state = PyEval_SaveThread();
+    const ModelResponse response = registry.invoke(request, context);
+    PyEval_RestoreThread(released_thread_state);
+    return model_response_to_python(response, blobs, error_message);
+}
+
+PyObject* runtime_invoke_tool(
+    PyObject* runtime_capsule,
+    std::string_view name,
+    const std::vector<std::byte>& input_bytes,
+    std::string* error_message
+) {
+    ExecutionContext* context = runtime_context_from_capsule(runtime_capsule, error_message);
+    if (context == nullptr) {
+        return nullptr;
+    }
+    const BlobRef input = input_bytes.empty()
+        ? BlobRef{}
+        : context->blobs.append(input_bytes.data(), input_bytes.size());
+    const ToolRequest request{
+        context->strings.intern(name),
+        input
+    };
+    ToolInvocationContext invoke_context{context->blobs, context->strings};
+    PyThreadState* released_thread_state = PyEval_SaveThread();
+    const ToolResponse response = context->tools.invoke(request, invoke_context);
+    PyEval_RestoreThread(released_thread_state);
+    return tool_response_to_python(response, context->blobs, error_message);
+}
+
+PyObject* runtime_invoke_model(
+    PyObject* runtime_capsule,
+    std::string_view name,
+    const std::vector<std::byte>& prompt_bytes,
+    const std::vector<std::byte>& schema_bytes,
+    uint32_t max_tokens,
+    std::string* error_message
+) {
+    ExecutionContext* context = runtime_context_from_capsule(runtime_capsule, error_message);
+    if (context == nullptr) {
+        return nullptr;
+    }
+    const BlobRef prompt = prompt_bytes.empty()
+        ? BlobRef{}
+        : context->blobs.append(prompt_bytes.data(), prompt_bytes.size());
+    const BlobRef schema = schema_bytes.empty()
+        ? BlobRef{}
+        : context->blobs.append(schema_bytes.data(), schema_bytes.size());
+    const ModelRequest request{
+        context->strings.intern(name),
+        prompt,
+        schema,
+        max_tokens
+    };
+    ModelInvocationContext invoke_context{context->blobs, context->strings};
+    PyThreadState* released_thread_state = PyEval_SaveThread();
+    const ModelResponse response = context->models.invoke(request, invoke_context);
+    PyEval_RestoreThread(released_thread_state);
+    return model_response_to_python(response, context->blobs, error_message);
 }
 
 NodeResult python_bootstrap_executor(ExecutionContext& context) {

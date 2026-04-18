@@ -14,6 +14,12 @@ Exports:
 - `END`
 - `Command`
 - `RuntimeContext`
+- `ToolRegistryView`
+- `ModelRegistryView`
+- `PipelineGraph`
+- `PipelineStep`
+- `SpecialistTeam`
+- `Specialist`
 
 ### `StateGraph`
 
@@ -77,6 +83,54 @@ Metadata and stream events include the usual run/node identifiers plus:
 - `session_revision`
 - `namespaces`
 
+Registry properties:
+
+- `compiled.tools`
+- `compiled.models`
+
+### `agentcore.patterns`
+
+The optional higher-level builder layer lives under [`../../python/agentcore/patterns`](../../python/agentcore/patterns). These helpers still compile into the same native-backed `StateGraph` runtime.
+
+#### `PipelineGraph`
+
+Constructor:
+
+```python
+PipelineGraph(state_schema=None, *, name=None, worker_count=1)
+```
+
+Methods:
+
+- `add_step(name, action=None, *, kind="compute", stop_after=False, allow_fan_out=False, create_join_scope=False, join_incoming_branches=False, merge=None)`
+- `extend(steps)`
+- `build()`
+- `compile(*, worker_count=None)`
+
+`PipelineGraph` is the higher-level surface for strictly sequential stage workflows. It removes the repetitive `START -> step1 -> step2 -> ... -> END` wiring while preserving the same native execution path underneath.
+
+#### `SpecialistTeam`
+
+Related type:
+
+- `Specialist`
+
+Constructor:
+
+```python
+SpecialistTeam(state_schema=None, *, name=None, worker_count=4)
+```
+
+Methods:
+
+- `set_dispatch(name="dispatch", action=None, *, kind="control")`
+- `set_aggregate(name="aggregate", action=None, *, merge=None, kind="aggregate")`
+- `add_specialist(specialist, graph=None, *, inputs=None, outputs=None, namespace=None, propagate_knowledge_graph=False, session_mode="persistent", session_id_from=None, prepare=None, prepare_kind="compute")`
+- `build()`
+- `compile(*, worker_count=None)`
+
+`SpecialistTeam` lowers a common multi-agent shape into a dispatch fan-out, optional per-specialist preparation, subgraph invocation, and aggregate/join node. Persistent specialists can infer `session_id_from` automatically when exactly one input binding maps a parent field to child `session_id`.
+
 ### `Command`
 
 ```python
@@ -94,6 +148,10 @@ Current surface:
 - `runtime.available`
 - `runtime.record_once(key, request, producer)`
 - `runtime.record_once_with_metadata(key, request, producer)`
+- `runtime.invoke_tool(name, request, decode="auto")`
+- `runtime.invoke_tool_with_metadata(name, request, decode="auto")`
+- `runtime.invoke_model(name, prompt, schema=None, max_tokens=0, decode="auto")`
+- `runtime.invoke_model_with_metadata(name, prompt, schema=None, max_tokens=0, decode="auto")`
 
 `record_once(...)` returns the produced value. `record_once_with_metadata(...)` returns a dictionary with:
 
@@ -102,6 +160,48 @@ Current surface:
 - `flags`
 
 The `producer` callable is invoked only when no previously committed recorded effect exists for the same key and request payload inside the active run.
+
+### `ToolRegistryView` And `ModelRegistryView`
+
+`CompiledStateGraph` exposes graph-owned native registries through `.tools` and `.models`.
+
+`ToolRegistryView` methods:
+
+- `list()`
+- `describe(name)`
+- `register(name, handler, *, policy=None, metadata=None, decode_input="auto")`
+- `register_http(name="http_tool", *, policy=None, enable_mock_scheme=True, enable_file_scheme=True)`
+- `register_sqlite(name="sqlite_tool", *, policy=None)`
+- `register_http_json(name="http_json_tool", *, policy=None, transport=None, default_method="POST")`
+- `invoke(name, request, *, decode="auto")`
+- `invoke_with_metadata(name, request, *, decode="auto")`
+
+`ModelRegistryView` methods:
+
+- `list()`
+- `describe(name)`
+- `register(name, handler, *, policy=None, metadata=None, decode_prompt="auto", decode_schema="auto")`
+- `register_local(name="local_model", *, policy=None, default_max_tokens=256)`
+- `register_llm_http(name="llm_http", *, policy=None, enable_mock_transport=True)`
+- `register_openai_chat(name="openai_chat", *, policy=None, transport=None, provider_model_name="", endpoint_path="/chat/completions", system_prompt="", include_json_schema=True)`
+- `invoke(name, prompt, *, schema=None, max_tokens=0, decode="auto")`
+- `invoke_with_metadata(name, prompt, *, schema=None, max_tokens=0, decode="auto")`
+
+Invocation details currently include:
+
+- `ok`
+- `output`
+- `flags`
+- `attempts`
+- `latency_ns`
+- `error_category`
+
+Model invocation details also include:
+
+- `confidence`
+- `token_usage`
+
+Custom Python-backed registry handlers are still registered into the native graph-owned registries rather than a Python-only side table. That keeps direct invocation, runtime invocation through `RuntimeContext`, adapter discovery, and subgraph inheritance on the same native registry path.
 
 ### Python Node Callback Contract
 
@@ -156,8 +256,77 @@ The engine exposes registries directly:
 
 - `engine.tools().register_tool(...)`
 - `engine.models().register_model(...)`
+- `engine.tools().describe_tool(name)`
+- `engine.models().describe_model(name)`
 
 Those adapters are invoked from nodes through `ExecutionContext`.
+
+Current registry specs also carry adapter metadata through [`../../agentcore/include/agentcore/adapters/common/adapter_metadata.h`](../../agentcore/include/agentcore/adapters/common/adapter_metadata.h).
+
+Provider-style HTTP adapters also build on the shared transport seam in [`../../agentcore/include/agentcore/adapters/common/http_transport.h`](../../agentcore/include/agentcore/adapters/common/http_transport.h), which defines:
+
+- `HttpRequest`
+- `HttpResponse`
+- `HttpTransport`
+- `HttpTransportOptions`
+
+That seam is used by the built-in HTTP JSON tool adapter and the OpenAI-compatible chat model adapter so auth, timeout, and header handling stay shared across providers instead of being reimplemented inside each adapter.
+
+### Adapter Metadata And Capabilities
+
+`AdapterMetadata` currently describes:
+
+- `provider`
+- `implementation`
+- `display_name`
+- `transport`
+- `auth`
+- `capabilities`
+- `request_format`
+- `response_format`
+
+Capability flags currently include:
+
+- `kAdapterCapabilitySync`
+- `kAdapterCapabilityAsync`
+- `kAdapterCapabilityStreaming`
+- `kAdapterCapabilityStructuredRequest`
+- `kAdapterCapabilityStructuredResponse`
+- `kAdapterCapabilityCheckpointSafe`
+- `kAdapterCapabilityExternalNetwork`
+- `kAdapterCapabilityLocalFilesystem`
+- `kAdapterCapabilityJsonSchema`
+- `kAdapterCapabilityToolCalling`
+- `kAdapterCapabilitySql`
+- `kAdapterCapabilityChatMessages`
+
+Helpers:
+
+- `adapter_has_capability(metadata, capability)`
+- `adapter_transport_name(...)`
+- `adapter_auth_name(...)`
+
+The built-in adapters now register metadata by default, so callers can inspect registry contents without relying on adapter-specific naming conventions.
+
+### Stable Error Categorization
+
+Tool/model handlers still return flag-based results, but the public runtime surface now includes stable category helpers:
+
+- `classify_tool_response_flags(flags)`
+- `tool_error_category_name(category)`
+- `classify_model_response_flags(flags)`
+- `model_error_category_name(category)`
+
+The current categories are:
+
+- `missing_handler`
+- `validation`
+- `limits`
+- `timeout`
+- `unsupported`
+- `handler_exception`
+- `retry_exhausted`
+- `none`
 
 ### Recorded Synchronous Effects
 

@@ -186,17 +186,29 @@ The runtime uses registries rather than special-casing tools and models inside t
 Built-in adapters currently include:
 
 - HTTP tool adapter
+- HTTP JSON tool adapter
 - SQLite-style tool adapter
 - local model adapter
 - HTTP LLM adapter
+- OpenAI-compatible chat model adapter
 
 Those implementations live under `./agentcore/adapters/`.
 
 The adapter boundary is intentionally narrow so that model/tool payloads can move as `BlobRef` values through the state system and execution engine without introducing engine-specific logic for individual external systems.
 
+The registries now also carry an explicit adapter contract through `AdapterMetadata`, transport/auth enums, capability flags, and stable error categorization helpers. That means adapters are no longer just callable handlers; they can describe:
+
+- provider and implementation identity
+- transport kind and auth expectations
+- request and response formats
+- sync/async, structured I/O, checkpoint-safe, JSON-schema, and SQL capabilities
+- stable failure categories derived from tool/model response flags
+
+This is the foundation for the next layer of work: richer provider adapters and higher-level Python ergonomics built on top of a discoverable runtime contract rather than ad hoc handler conventions.
+
 ### Python Binding Surface
 
-The Python package under `./python/agentcore` is a thin builder and orchestration layer over the native runtime. Python callbacks may opt into a third `runtime` argument when they need access to native execution services that should stay coupled to the engine rather than reimplemented in Python.
+The Python package under `./python/agentcore` is a compact builder and orchestration layer over the native runtime. The low-level graph surface still centers on `StateGraph`, but the package now also includes optional higher-level builders for common workflow shapes under `./python/agentcore/patterns`. Python callbacks may opt into a third `runtime` argument when they need access to native execution services that should stay coupled to the engine rather than reimplemented in Python.
 
 The first exposed service in that seam is recorded once-only synchronous work through `RuntimeContext.record_once(...)` and `RuntimeContext.record_once_with_metadata(...)`. The motivation is operational rather than stylistic: if a callback performs synchronous work that must remain restart-safe, the outcome should be committed through the same native patch/checkpoint path as the rest of the run state. That keeps replay behavior explicit and verifiable instead of depending on ad hoc Python-side memoization.
 
@@ -357,6 +369,12 @@ The current Python surface is implemented in [`./python/agentcore/graph/state.py
 - `END`
 - `Command`
 - `RuntimeContext`
+- `ToolRegistryView`
+- `ModelRegistryView`
+- `PipelineGraph`
+- `PipelineStep`
+- `SpecialistTeam`
+- `Specialist`
 
 The graph builder currently provides:
 
@@ -368,6 +386,13 @@ The graph builder currently provides:
 - `add_subgraph()`
 - `set_entry_point()`
 - `compile()`
+
+For users who want a more declarative Python surface without giving up the native execution path, the optional pattern layer under [`./python/agentcore/patterns`](./python/agentcore/patterns) adds:
+
+- `PipelineGraph` for sequential stage pipelines
+- `SpecialistTeam` for dispatch/fan-out/aggregate specialist workflows backed by persistent child-session subgraphs
+
+Those helpers still compile into the same native `StateGraph` runtime underneath. The goal is to remove repetitive wiring for common orchestration shapes without introducing a second execution model beside the native core.
 
 The compiled graph object provides:
 
@@ -381,6 +406,8 @@ The compiled graph object provides:
 - `astream()`
 - `batch()`
 - `abatch()`
+- `.tools`
+- `.models`
 
 Python callbacks may currently accept:
 
@@ -420,8 +447,14 @@ When a callback accepts a third positional argument, the runtime passes a `Runti
 - `runtime.available`
 - `runtime.record_once(key, request, producer)`
 - `runtime.record_once_with_metadata(key, request, producer)`
+- `runtime.invoke_tool(name, request, decode="auto")`
+- `runtime.invoke_tool_with_metadata(name, request, decode="auto")`
+- `runtime.invoke_model(name, prompt, schema=None, max_tokens=0, decode="auto")`
+- `runtime.invoke_model_with_metadata(name, prompt, schema=None, max_tokens=0, decode="auto")`
 
 That seam exists for restart-safe synchronous work. If a Python node needs to compute or fetch a value once and then replay the committed outcome on later visits within the same run, the runtime helper routes that through the native task journal rather than asking application code to invent its own replay policy.
+
+Compiled graphs also expose graph-owned adapter registries directly through `.tools` and `.models`. That lets Python code register built-in adapters such as the SQLite-like tool adapter, the HTTP JSON tool adapter, the local model adapter, and the OpenAI-compatible chat model adapter without dropping into C++. The same registry views now also accept custom Python-backed tool/model handlers through `compiled.tools.register(...)` and `compiled.models.register(...)`, with optional payload decoding and metadata overrides. The important part is where those handlers land: they are still registered into the native graph-owned registries, so direct invocation, `RuntimeContext` invocation, registry inspection, and subgraph inheritance all go through the same runtime-owned adapter path rather than a separate Python-only dispatch layer.
 
 Subgraph notes:
 
@@ -448,6 +481,8 @@ Additional runnable entry points include:
 - `./build/agentcore_persistent_subgraph_session_benchmark`
 - `PYTHONPATH=./build/python python3 ./python/tests/state_graph_api_smoke.py`
 - `PYTHONPATH=./build/python python3 ./python/tests/agent_workflows_smoke.py`
+- `PYTHONPATH=./build/python python3 ./python/tests/patterns_smoke.py`
+- `PYTHONPATH=./build/python python3 ./python/tests/adapters_runtime_smoke.py`
 - `PYTHONPATH=./build/python python3 ./python/benchmarks/state_graph_api_benchmark.py`
 - `python3 ./python/benchmarks/langgraph_head_to_head.py` after installing upstream `langgraph`
 

@@ -1,5 +1,7 @@
 #include "bridge.h"
 
+#include "agentcore/adapters/adapter_factories.h"
+
 #include <Python.h>
 
 #include <memory>
@@ -214,6 +216,511 @@ bool parse_merge_rules(
         }
         merge_rules->push_back(std::make_pair(field_name, strategy));
     }
+    return true;
+}
+
+bool mapping_contains_key(PyObject* mapping, const char* key, std::string* error_message) {
+    const int contains = PyMapping_HasKeyString(mapping, key);
+    if (contains < 0) {
+        *error_message = GraphHandle::fetch_python_error();
+        return false;
+    }
+    return contains != 0;
+}
+
+bool get_mapping_item(
+    PyObject* mapping,
+    const char* key,
+    PyObject** value,
+    std::string* error_message
+) {
+    *value = nullptr;
+    if (mapping == nullptr || mapping == Py_None) {
+        return true;
+    }
+    if (!PyMapping_Check(mapping)) {
+        *error_message = "expected a mapping";
+        return false;
+    }
+    const int contains = PyMapping_HasKeyString(mapping, key);
+    if (contains < 0) {
+        *error_message = GraphHandle::fetch_python_error();
+        return false;
+    }
+    if (contains == 0) {
+        return true;
+    }
+    *value = PyMapping_GetItemString(mapping, key);
+    if (*value == nullptr) {
+        *error_message = GraphHandle::fetch_python_error();
+        return false;
+    }
+    return true;
+}
+
+bool parse_bool_from_mapping(
+    PyObject* mapping,
+    const char* key,
+    bool default_value,
+    bool* value,
+    std::string* error_message
+) {
+    *value = default_value;
+    PyObject* item = nullptr;
+    if (!get_mapping_item(mapping, key, &item, error_message)) {
+        return false;
+    }
+    if (item == nullptr || item == Py_None) {
+        Py_XDECREF(item);
+        return true;
+    }
+    const int truth = PyObject_IsTrue(item);
+    Py_DECREF(item);
+    if (truth < 0) {
+        *error_message = GraphHandle::fetch_python_error();
+        return false;
+    }
+    *value = truth != 0;
+    return true;
+}
+
+bool parse_uint32_from_mapping(
+    PyObject* mapping,
+    const char* key,
+    uint32_t default_value,
+    uint32_t* value,
+    std::string* error_message
+) {
+    *value = default_value;
+    PyObject* item = nullptr;
+    if (!get_mapping_item(mapping, key, &item, error_message)) {
+        return false;
+    }
+    if (item == nullptr || item == Py_None) {
+        Py_XDECREF(item);
+        return true;
+    }
+    const unsigned long long parsed = PyLong_AsUnsignedLongLong(item);
+    Py_DECREF(item);
+    if (PyErr_Occurred() != nullptr) {
+        *error_message = GraphHandle::fetch_python_error();
+        PyErr_Clear();
+        return false;
+    }
+    *value = static_cast<uint32_t>(parsed);
+    return true;
+}
+
+bool parse_uint16_from_mapping(
+    PyObject* mapping,
+    const char* key,
+    uint16_t default_value,
+    uint16_t* value,
+    std::string* error_message
+) {
+    uint32_t parsed = default_value;
+    if (!parse_uint32_from_mapping(mapping, key, default_value, &parsed, error_message)) {
+        return false;
+    }
+    *value = static_cast<uint16_t>(parsed);
+    return true;
+}
+
+bool parse_size_t_from_mapping(
+    PyObject* mapping,
+    const char* key,
+    std::size_t default_value,
+    std::size_t* value,
+    std::string* error_message
+) {
+    *value = default_value;
+    PyObject* item = nullptr;
+    if (!get_mapping_item(mapping, key, &item, error_message)) {
+        return false;
+    }
+    if (item == nullptr || item == Py_None) {
+        Py_XDECREF(item);
+        return true;
+    }
+    const unsigned long long parsed = PyLong_AsUnsignedLongLong(item);
+    Py_DECREF(item);
+    if (PyErr_Occurred() != nullptr) {
+        *error_message = GraphHandle::fetch_python_error();
+        PyErr_Clear();
+        return false;
+    }
+    *value = static_cast<std::size_t>(parsed);
+    return true;
+}
+
+bool parse_string_from_mapping(
+    PyObject* mapping,
+    const char* key,
+    std::string* value,
+    std::string* error_message
+) {
+    PyObject* item = nullptr;
+    if (!get_mapping_item(mapping, key, &item, error_message)) {
+        return false;
+    }
+    if (item == nullptr || item == Py_None) {
+        Py_XDECREF(item);
+        return true;
+    }
+    const bool ok = parse_python_string(item, value, error_message);
+    Py_DECREF(item);
+    return ok;
+}
+
+bool parse_headers_from_mapping(
+    PyObject* mapping,
+    const char* key,
+    std::vector<HttpHeader>* headers,
+    std::string* error_message
+) {
+    headers->clear();
+    PyObject* item = nullptr;
+    if (!get_mapping_item(mapping, key, &item, error_message)) {
+        return false;
+    }
+    if (item == nullptr || item == Py_None) {
+        Py_XDECREF(item);
+        return true;
+    }
+
+    std::vector<std::pair<std::string, std::string>> entries;
+    const bool ok = parse_string_mapping(item, &entries, error_message);
+    Py_DECREF(item);
+    if (!ok) {
+        return false;
+    }
+    headers->reserve(entries.size());
+    for (auto& [name, value] : entries) {
+        headers->push_back(HttpHeader{std::move(name), std::move(value)});
+    }
+    return true;
+}
+
+bool parse_tool_policy(
+    PyObject* mapping,
+    ToolPolicy* policy,
+    std::string* error_message
+) {
+    if (mapping == nullptr || mapping == Py_None) {
+        return true;
+    }
+    if (!PyMapping_Check(mapping)) {
+        *error_message = "tool policy must be a mapping or None";
+        return false;
+    }
+    return parse_uint16_from_mapping(mapping, "retry_limit", policy->retry_limit, &policy->retry_limit, error_message) &&
+        parse_uint32_from_mapping(mapping, "timeout_ms", policy->timeout_ms, &policy->timeout_ms, error_message) &&
+        parse_size_t_from_mapping(mapping, "max_input_bytes", policy->max_input_bytes, &policy->max_input_bytes, error_message) &&
+        parse_size_t_from_mapping(mapping, "max_output_bytes", policy->max_output_bytes, &policy->max_output_bytes, error_message);
+}
+
+bool parse_model_policy(
+    PyObject* mapping,
+    ModelPolicy* policy,
+    std::string* error_message
+) {
+    if (mapping == nullptr || mapping == Py_None) {
+        return true;
+    }
+    if (!PyMapping_Check(mapping)) {
+        *error_message = "model policy must be a mapping or None";
+        return false;
+    }
+    return parse_uint16_from_mapping(mapping, "retry_limit", policy->retry_limit, &policy->retry_limit, error_message) &&
+        parse_uint32_from_mapping(mapping, "timeout_ms", policy->timeout_ms, &policy->timeout_ms, error_message) &&
+        parse_size_t_from_mapping(mapping, "max_prompt_bytes", policy->max_prompt_bytes, &policy->max_prompt_bytes, error_message) &&
+        parse_size_t_from_mapping(mapping, "max_output_bytes", policy->max_output_bytes, &policy->max_output_bytes, error_message);
+}
+
+bool parse_http_transport_options(
+    PyObject* mapping,
+    HttpTransportOptions* options,
+    std::string* error_message
+) {
+    if (mapping == nullptr || mapping == Py_None) {
+        return true;
+    }
+    if (!PyMapping_Check(mapping)) {
+        *error_message = "transport options must be a mapping or None";
+        return false;
+    }
+    return parse_string_from_mapping(mapping, "base_url", &options->base_url, error_message) &&
+        parse_headers_from_mapping(mapping, "default_headers", &options->default_headers, error_message) &&
+        parse_string_from_mapping(mapping, "bearer_token", &options->bearer_token, error_message) &&
+        parse_string_from_mapping(mapping, "bearer_token_env_var", &options->bearer_token_env_var, error_message) &&
+        parse_string_from_mapping(mapping, "api_key", &options->api_key, error_message) &&
+        parse_string_from_mapping(mapping, "api_key_env_var", &options->api_key_env_var, error_message) &&
+        parse_string_from_mapping(mapping, "api_key_header", &options->api_key_header, error_message);
+}
+
+bool parse_transport_kind(
+    const std::string& value,
+    AdapterTransportKind* transport,
+    std::string* error_message
+) {
+    const std::string normalized = value;
+    if (normalized == "unknown") {
+        *transport = AdapterTransportKind::Unknown;
+        return true;
+    }
+    if (normalized == "in_process") {
+        *transport = AdapterTransportKind::InProcess;
+        return true;
+    }
+    if (normalized == "http") {
+        *transport = AdapterTransportKind::Http;
+        return true;
+    }
+    if (normalized == "database") {
+        *transport = AdapterTransportKind::Database;
+        return true;
+    }
+    if (normalized == "filesystem") {
+        *transport = AdapterTransportKind::FileSystem;
+        return true;
+    }
+    *error_message = "unsupported adapter transport: " + normalized;
+    return false;
+}
+
+bool parse_auth_kind(
+    const std::string& value,
+    AdapterAuthKind* auth,
+    std::string* error_message
+) {
+    const std::string normalized = value;
+    if (normalized == "unknown") {
+        *auth = AdapterAuthKind::Unknown;
+        return true;
+    }
+    if (normalized == "none") {
+        *auth = AdapterAuthKind::None;
+        return true;
+    }
+    if (normalized == "api_key") {
+        *auth = AdapterAuthKind::ApiKey;
+        return true;
+    }
+    if (normalized == "bearer_token") {
+        *auth = AdapterAuthKind::BearerToken;
+        return true;
+    }
+    if (normalized == "basic") {
+        *auth = AdapterAuthKind::Basic;
+        return true;
+    }
+    if (normalized == "connection_string") {
+        *auth = AdapterAuthKind::ConnectionString;
+        return true;
+    }
+    if (normalized == "file_path") {
+        *auth = AdapterAuthKind::FilePath;
+        return true;
+    }
+    *error_message = "unsupported adapter auth kind: " + normalized;
+    return false;
+}
+
+bool parse_capability_name(
+    const std::string& value,
+    uint64_t* capability,
+    std::string* error_message
+) {
+    if (value == "sync") {
+        *capability = kAdapterCapabilitySync;
+        return true;
+    }
+    if (value == "async") {
+        *capability = kAdapterCapabilityAsync;
+        return true;
+    }
+    if (value == "streaming") {
+        *capability = kAdapterCapabilityStreaming;
+        return true;
+    }
+    if (value == "structured_request") {
+        *capability = kAdapterCapabilityStructuredRequest;
+        return true;
+    }
+    if (value == "structured_response") {
+        *capability = kAdapterCapabilityStructuredResponse;
+        return true;
+    }
+    if (value == "checkpoint_safe") {
+        *capability = kAdapterCapabilityCheckpointSafe;
+        return true;
+    }
+    if (value == "external_network") {
+        *capability = kAdapterCapabilityExternalNetwork;
+        return true;
+    }
+    if (value == "local_filesystem") {
+        *capability = kAdapterCapabilityLocalFilesystem;
+        return true;
+    }
+    if (value == "json_schema") {
+        *capability = kAdapterCapabilityJsonSchema;
+        return true;
+    }
+    if (value == "tool_calling") {
+        *capability = kAdapterCapabilityToolCalling;
+        return true;
+    }
+    if (value == "sql") {
+        *capability = kAdapterCapabilitySql;
+        return true;
+    }
+    if (value == "chat_messages") {
+        *capability = kAdapterCapabilityChatMessages;
+        return true;
+    }
+    *error_message = "unsupported adapter capability: " + value;
+    return false;
+}
+
+bool parse_adapter_capabilities(
+    PyObject* mapping,
+    const char* key,
+    uint64_t* capabilities,
+    std::string* error_message
+) {
+    PyObject* item = nullptr;
+    if (!get_mapping_item(mapping, key, &item, error_message)) {
+        return false;
+    }
+    if (item == nullptr || item == Py_None) {
+        Py_XDECREF(item);
+        return true;
+    }
+
+    if (PyLong_Check(item)) {
+        const unsigned long long parsed = PyLong_AsUnsignedLongLong(item);
+        Py_DECREF(item);
+        if (PyErr_Occurred() != nullptr) {
+            *error_message = GraphHandle::fetch_python_error();
+            PyErr_Clear();
+            return false;
+        }
+        *capabilities = parsed;
+        return true;
+    }
+
+    PyObject* sequence = PySequence_Fast(item, "capabilities must be a sequence of strings");
+    Py_DECREF(item);
+    if (sequence == nullptr) {
+        *error_message = GraphHandle::fetch_python_error();
+        return false;
+    }
+    uint64_t parsed_capabilities = 0U;
+    const Py_ssize_t count = PySequence_Fast_GET_SIZE(sequence);
+    PyObject** values = PySequence_Fast_ITEMS(sequence);
+    for (Py_ssize_t index = 0; index < count; ++index) {
+        std::string capability_name;
+        uint64_t capability = 0U;
+        if (!parse_python_string(values[index], &capability_name, error_message) ||
+            !parse_capability_name(capability_name, &capability, error_message)) {
+            Py_DECREF(sequence);
+            return false;
+        }
+        parsed_capabilities |= capability;
+    }
+    Py_DECREF(sequence);
+    *capabilities = parsed_capabilities;
+    return true;
+}
+
+bool parse_adapter_metadata(
+    PyObject* mapping,
+    AdapterMetadata* metadata,
+    std::string* error_message
+) {
+    if (mapping == nullptr || mapping == Py_None) {
+        return true;
+    }
+    if (!PyMapping_Check(mapping)) {
+        *error_message = "adapter metadata must be a mapping or None";
+        return false;
+    }
+
+    std::string transport_name;
+    std::string auth_name;
+    if (!parse_string_from_mapping(mapping, "provider", &metadata->provider, error_message) ||
+        !parse_string_from_mapping(mapping, "implementation", &metadata->implementation, error_message) ||
+        !parse_string_from_mapping(mapping, "display_name", &metadata->display_name, error_message) ||
+        !parse_string_from_mapping(mapping, "transport", &transport_name, error_message) ||
+        !parse_string_from_mapping(mapping, "auth", &auth_name, error_message) ||
+        !parse_adapter_capabilities(mapping, "capabilities", &metadata->capabilities, error_message) ||
+        !parse_string_from_mapping(mapping, "request_format", &metadata->request_format, error_message) ||
+        !parse_string_from_mapping(mapping, "response_format", &metadata->response_format, error_message)) {
+        return false;
+    }
+
+    if (!transport_name.empty() &&
+        !parse_transport_kind(transport_name, &metadata->transport, error_message)) {
+        return false;
+    }
+    if (!auth_name.empty() && !parse_auth_kind(auth_name, &metadata->auth, error_message)) {
+        return false;
+    }
+    return true;
+}
+
+AdapterMetadata default_python_tool_metadata(std::string_view name) {
+    AdapterMetadata metadata;
+    metadata.provider = "python";
+    metadata.implementation = "python_callable_tool";
+    metadata.display_name = std::string(name);
+    metadata.transport = AdapterTransportKind::InProcess;
+    metadata.auth = AdapterAuthKind::None;
+    metadata.capabilities =
+        static_cast<uint64_t>(kAdapterCapabilitySync) |
+        static_cast<uint64_t>(kAdapterCapabilityAsync) |
+        static_cast<uint64_t>(kAdapterCapabilityCheckpointSafe);
+    metadata.request_format = "blob";
+    metadata.response_format = "blob";
+    return metadata;
+}
+
+AdapterMetadata default_python_model_metadata(std::string_view name) {
+    AdapterMetadata metadata;
+    metadata.provider = "python";
+    metadata.implementation = "python_callable_model";
+    metadata.display_name = std::string(name);
+    metadata.transport = AdapterTransportKind::InProcess;
+    metadata.auth = AdapterAuthKind::None;
+    metadata.capabilities =
+        static_cast<uint64_t>(kAdapterCapabilitySync) |
+        static_cast<uint64_t>(kAdapterCapabilityAsync) |
+        static_cast<uint64_t>(kAdapterCapabilityCheckpointSafe);
+    metadata.request_format = "blob";
+    metadata.response_format = "blob";
+    return metadata;
+}
+
+bool parse_python_bytes_like(
+    PyObject* object,
+    std::vector<std::byte>* value,
+    std::string* error_message
+) {
+    value->clear();
+    if (object == nullptr || object == Py_None) {
+        return true;
+    }
+
+    Py_buffer view{};
+    if (PyObject_GetBuffer(object, &view, PyBUF_SIMPLE) != 0) {
+        *error_message = "expected a bytes-like object";
+        PyErr_Clear();
+        return false;
+    }
+    const auto* begin = static_cast<const std::byte*>(view.buf);
+    value->assign(begin, begin + static_cast<std::size_t>(view.len));
+    PyBuffer_Release(&view);
     return true;
 }
 
@@ -721,6 +1228,612 @@ PyObject* py_runtime_record_once(PyObject*, PyObject* args, PyObject* kwargs) {
     return result;
 }
 
+PyObject* py_list_tools(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* capsule = nullptr;
+    static const char* keywords[] = {"graph", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "O",
+            const_cast<char**>(keywords),
+            &capsule
+        )) {
+        return nullptr;
+    }
+
+    GraphHandle* handle = require_graph_handle(capsule);
+    if (handle == nullptr) {
+        return nullptr;
+    }
+
+    std::string error_message;
+    PyObject* result = list_registered_tools(handle->tools(), &error_message);
+    if (result == nullptr) {
+        PyErr_SetString(PyExc_RuntimeError, error_message.c_str());
+        return nullptr;
+    }
+    return result;
+}
+
+PyObject* py_describe_tool(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* capsule = nullptr;
+    const char* name = nullptr;
+    static const char* keywords[] = {"graph", "name", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "Os",
+            const_cast<char**>(keywords),
+            &capsule,
+            &name
+        )) {
+        return nullptr;
+    }
+
+    GraphHandle* handle = require_graph_handle(capsule);
+    if (handle == nullptr) {
+        return nullptr;
+    }
+
+    std::string error_message;
+    PyObject* result = describe_registered_tool(handle->tools(), name, &error_message);
+    if (result == nullptr) {
+        PyErr_SetString(PyExc_RuntimeError, error_message.c_str());
+        return nullptr;
+    }
+    return result;
+}
+
+PyObject* py_register_http_tool_adapter(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* capsule = nullptr;
+    const char* name = "http_tool";
+    PyObject* policy_object = Py_None;
+    int enable_mock_scheme = 1;
+    int enable_file_scheme = 1;
+    static const char* keywords[] = {
+        "graph",
+        "name",
+        "policy",
+        "enable_mock_scheme",
+        "enable_file_scheme",
+        nullptr
+    };
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "O|sOpp",
+            const_cast<char**>(keywords),
+            &capsule,
+            &name,
+            &policy_object,
+            &enable_mock_scheme,
+            &enable_file_scheme
+        )) {
+        return nullptr;
+    }
+
+    GraphHandle* handle = require_graph_handle(capsule);
+    if (handle == nullptr) {
+        return nullptr;
+    }
+
+    HttpToolAdapterOptions options;
+    std::string error_message;
+    if (!parse_tool_policy(policy_object, &options.policy, &error_message)) {
+        PyErr_SetString(PyExc_ValueError, error_message.c_str());
+        return nullptr;
+    }
+    options.enable_mock_scheme = enable_mock_scheme != 0;
+    options.enable_file_scheme = enable_file_scheme != 0;
+    register_http_tool_adapter(handle->tools(), name, options);
+    Py_RETURN_NONE;
+}
+
+PyObject* py_register_sqlite_tool_adapter(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* capsule = nullptr;
+    const char* name = "sqlite_tool";
+    PyObject* policy_object = Py_None;
+    static const char* keywords[] = {"graph", "name", "policy", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "O|sO",
+            const_cast<char**>(keywords),
+            &capsule,
+            &name,
+            &policy_object
+        )) {
+        return nullptr;
+    }
+
+    GraphHandle* handle = require_graph_handle(capsule);
+    if (handle == nullptr) {
+        return nullptr;
+    }
+
+    SqliteToolAdapterOptions options;
+    std::string error_message;
+    if (!parse_tool_policy(policy_object, &options.policy, &error_message)) {
+        PyErr_SetString(PyExc_ValueError, error_message.c_str());
+        return nullptr;
+    }
+    register_sqlite_tool_adapter(handle->tools(), name, options);
+    Py_RETURN_NONE;
+}
+
+PyObject* py_register_http_json_tool_adapter(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* capsule = nullptr;
+    const char* name = "http_json_tool";
+    PyObject* policy_object = Py_None;
+    PyObject* transport_object = Py_None;
+    const char* default_method = "POST";
+    static const char* keywords[] = {"graph", "name", "policy", "transport", "default_method", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "O|sOOs",
+            const_cast<char**>(keywords),
+            &capsule,
+            &name,
+            &policy_object,
+            &transport_object,
+            &default_method
+        )) {
+        return nullptr;
+    }
+
+    GraphHandle* handle = require_graph_handle(capsule);
+    if (handle == nullptr) {
+        return nullptr;
+    }
+
+    JsonHttpToolAdapterOptions options;
+    options.default_method = default_method;
+    std::string error_message;
+    if (!parse_tool_policy(policy_object, &options.policy, &error_message) ||
+        !parse_http_transport_options(transport_object, &options.transport, &error_message)) {
+        PyErr_SetString(PyExc_ValueError, error_message.c_str());
+        return nullptr;
+    }
+    register_http_json_tool_adapter(handle->tools(), name, options);
+    Py_RETURN_NONE;
+}
+
+PyObject* py_register_python_tool_adapter(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* capsule = nullptr;
+    const char* name = nullptr;
+    PyObject* handler = nullptr;
+    PyObject* policy_object = Py_None;
+    PyObject* metadata_object = Py_None;
+    static const char* keywords[] = {"graph", "name", "handler", "policy", "metadata", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "OsO|OO",
+            const_cast<char**>(keywords),
+            &capsule,
+            &name,
+            &handler,
+            &policy_object,
+            &metadata_object
+        )) {
+        return nullptr;
+    }
+
+    GraphHandle* handle = require_graph_handle(capsule);
+    if (handle == nullptr) {
+        return nullptr;
+    }
+
+    ToolPolicy policy;
+    AdapterMetadata metadata = default_python_tool_metadata(name);
+    std::string error_message;
+    if (!parse_tool_policy(policy_object, &policy, &error_message) ||
+        !parse_adapter_metadata(metadata_object, &metadata, &error_message)) {
+        PyErr_SetString(PyExc_ValueError, error_message.c_str());
+        return nullptr;
+    }
+    if (!handle->register_python_tool(name, handler, policy, std::move(metadata), &error_message)) {
+        PyErr_SetString(PyExc_ValueError, error_message.c_str());
+        return nullptr;
+    }
+    Py_RETURN_NONE;
+}
+
+PyObject* py_invoke_tool_with_details(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* capsule = nullptr;
+    const char* name = nullptr;
+    PyObject* input_bytes = Py_None;
+    static const char* keywords[] = {"graph", "name", "input_bytes", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "OsO",
+            const_cast<char**>(keywords),
+            &capsule,
+            &name,
+            &input_bytes
+        )) {
+        return nullptr;
+    }
+
+    GraphHandle* handle = require_graph_handle(capsule);
+    if (handle == nullptr) {
+        return nullptr;
+    }
+
+    std::vector<std::byte> encoded_input;
+    std::string error_message;
+    if (!parse_python_bytes_like(input_bytes, &encoded_input, &error_message)) {
+        PyErr_SetString(PyExc_TypeError, error_message.c_str());
+        return nullptr;
+    }
+    PyObject* result = invoke_tool_registry(handle->tools(), name, encoded_input, &error_message);
+    if (result == nullptr) {
+        PyErr_SetString(PyExc_RuntimeError, error_message.c_str());
+        return nullptr;
+    }
+    return result;
+}
+
+PyObject* py_runtime_invoke_tool_with_details(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* runtime = nullptr;
+    const char* name = nullptr;
+    PyObject* input_bytes = Py_None;
+    static const char* keywords[] = {"runtime", "name", "input_bytes", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "OsO",
+            const_cast<char**>(keywords),
+            &runtime,
+            &name,
+            &input_bytes
+        )) {
+        return nullptr;
+    }
+
+    std::vector<std::byte> encoded_input;
+    std::string error_message;
+    if (!parse_python_bytes_like(input_bytes, &encoded_input, &error_message)) {
+        PyErr_SetString(PyExc_TypeError, error_message.c_str());
+        return nullptr;
+    }
+    PyObject* result = runtime_invoke_tool(runtime, name, encoded_input, &error_message);
+    if (result == nullptr) {
+        if (PyErr_Occurred() == nullptr) {
+            PyErr_SetString(PyExc_RuntimeError, error_message.c_str());
+        }
+        return nullptr;
+    }
+    return result;
+}
+
+PyObject* py_list_models(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* capsule = nullptr;
+    static const char* keywords[] = {"graph", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "O",
+            const_cast<char**>(keywords),
+            &capsule
+        )) {
+        return nullptr;
+    }
+
+    GraphHandle* handle = require_graph_handle(capsule);
+    if (handle == nullptr) {
+        return nullptr;
+    }
+
+    std::string error_message;
+    PyObject* result = list_registered_models(handle->models(), &error_message);
+    if (result == nullptr) {
+        PyErr_SetString(PyExc_RuntimeError, error_message.c_str());
+        return nullptr;
+    }
+    return result;
+}
+
+PyObject* py_describe_model(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* capsule = nullptr;
+    const char* name = nullptr;
+    static const char* keywords[] = {"graph", "name", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "Os",
+            const_cast<char**>(keywords),
+            &capsule,
+            &name
+        )) {
+        return nullptr;
+    }
+
+    GraphHandle* handle = require_graph_handle(capsule);
+    if (handle == nullptr) {
+        return nullptr;
+    }
+
+    std::string error_message;
+    PyObject* result = describe_registered_model(handle->models(), name, &error_message);
+    if (result == nullptr) {
+        PyErr_SetString(PyExc_RuntimeError, error_message.c_str());
+        return nullptr;
+    }
+    return result;
+}
+
+PyObject* py_register_local_model_adapter(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* capsule = nullptr;
+    const char* name = "local_model";
+    PyObject* policy_object = Py_None;
+    unsigned long default_max_tokens = 256U;
+    static const char* keywords[] = {"graph", "name", "policy", "default_max_tokens", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "O|sOk",
+            const_cast<char**>(keywords),
+            &capsule,
+            &name,
+            &policy_object,
+            &default_max_tokens
+        )) {
+        return nullptr;
+    }
+
+    GraphHandle* handle = require_graph_handle(capsule);
+    if (handle == nullptr) {
+        return nullptr;
+    }
+
+    LocalModelAdapterOptions options;
+    options.default_max_tokens = static_cast<uint32_t>(default_max_tokens);
+    std::string error_message;
+    if (!parse_model_policy(policy_object, &options.policy, &error_message)) {
+        PyErr_SetString(PyExc_ValueError, error_message.c_str());
+        return nullptr;
+    }
+    register_local_model_adapter(handle->models(), name, options);
+    Py_RETURN_NONE;
+}
+
+PyObject* py_register_llm_http_adapter(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* capsule = nullptr;
+    const char* name = "llm_http";
+    PyObject* policy_object = Py_None;
+    int enable_mock_transport = 1;
+    static const char* keywords[] = {"graph", "name", "policy", "enable_mock_transport", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "O|sOp",
+            const_cast<char**>(keywords),
+            &capsule,
+            &name,
+            &policy_object,
+            &enable_mock_transport
+        )) {
+        return nullptr;
+    }
+
+    GraphHandle* handle = require_graph_handle(capsule);
+    if (handle == nullptr) {
+        return nullptr;
+    }
+
+    LlmHttpAdapterOptions options;
+    options.enable_mock_transport = enable_mock_transport != 0;
+    std::string error_message;
+    if (!parse_model_policy(policy_object, &options.policy, &error_message)) {
+        PyErr_SetString(PyExc_ValueError, error_message.c_str());
+        return nullptr;
+    }
+    register_llm_http_adapter(handle->models(), name, options);
+    Py_RETURN_NONE;
+}
+
+PyObject* py_register_openai_chat_model_adapter(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* capsule = nullptr;
+    const char* name = "openai_chat";
+    PyObject* policy_object = Py_None;
+    PyObject* transport_object = Py_None;
+    const char* provider_model_name = "";
+    const char* endpoint_path = "/chat/completions";
+    const char* system_prompt = "";
+    int include_json_schema = 1;
+    static const char* keywords[] = {
+        "graph",
+        "name",
+        "policy",
+        "transport",
+        "provider_model_name",
+        "endpoint_path",
+        "system_prompt",
+        "include_json_schema",
+        nullptr
+    };
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "O|sOOsssp",
+            const_cast<char**>(keywords),
+            &capsule,
+            &name,
+            &policy_object,
+            &transport_object,
+            &provider_model_name,
+            &endpoint_path,
+            &system_prompt,
+            &include_json_schema
+        )) {
+        return nullptr;
+    }
+
+    GraphHandle* handle = require_graph_handle(capsule);
+    if (handle == nullptr) {
+        return nullptr;
+    }
+
+    OpenAiChatModelAdapterOptions options;
+    options.provider_model_name = provider_model_name;
+    options.endpoint_path = endpoint_path;
+    options.system_prompt = system_prompt;
+    options.include_json_schema = include_json_schema != 0;
+    std::string error_message;
+    if (!parse_model_policy(policy_object, &options.policy, &error_message) ||
+        !parse_http_transport_options(transport_object, &options.transport, &error_message)) {
+        PyErr_SetString(PyExc_ValueError, error_message.c_str());
+        return nullptr;
+    }
+    register_openai_chat_model_adapter(handle->models(), name, options);
+    Py_RETURN_NONE;
+}
+
+PyObject* py_register_python_model_adapter(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* capsule = nullptr;
+    const char* name = nullptr;
+    PyObject* handler = nullptr;
+    PyObject* policy_object = Py_None;
+    PyObject* metadata_object = Py_None;
+    static const char* keywords[] = {"graph", "name", "handler", "policy", "metadata", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "OsO|OO",
+            const_cast<char**>(keywords),
+            &capsule,
+            &name,
+            &handler,
+            &policy_object,
+            &metadata_object
+        )) {
+        return nullptr;
+    }
+
+    GraphHandle* handle = require_graph_handle(capsule);
+    if (handle == nullptr) {
+        return nullptr;
+    }
+
+    ModelPolicy policy;
+    AdapterMetadata metadata = default_python_model_metadata(name);
+    std::string error_message;
+    if (!parse_model_policy(policy_object, &policy, &error_message) ||
+        !parse_adapter_metadata(metadata_object, &metadata, &error_message)) {
+        PyErr_SetString(PyExc_ValueError, error_message.c_str());
+        return nullptr;
+    }
+    if (!handle->register_python_model(
+            name,
+            handler,
+            policy,
+            std::move(metadata),
+            &error_message
+        )) {
+        PyErr_SetString(PyExc_ValueError, error_message.c_str());
+        return nullptr;
+    }
+    Py_RETURN_NONE;
+}
+
+PyObject* py_invoke_model_with_details(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* capsule = nullptr;
+    const char* name = nullptr;
+    PyObject* prompt_bytes = Py_None;
+    PyObject* schema_bytes = Py_None;
+    unsigned long max_tokens = 0U;
+    static const char* keywords[] = {"graph", "name", "prompt_bytes", "schema_bytes", "max_tokens", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "OsO|Ok",
+            const_cast<char**>(keywords),
+            &capsule,
+            &name,
+            &prompt_bytes,
+            &schema_bytes,
+            &max_tokens
+        )) {
+        return nullptr;
+    }
+
+    GraphHandle* handle = require_graph_handle(capsule);
+    if (handle == nullptr) {
+        return nullptr;
+    }
+
+    std::vector<std::byte> encoded_prompt;
+    std::vector<std::byte> encoded_schema;
+    std::string error_message;
+    if (!parse_python_bytes_like(prompt_bytes, &encoded_prompt, &error_message) ||
+        !parse_python_bytes_like(schema_bytes, &encoded_schema, &error_message)) {
+        PyErr_SetString(PyExc_TypeError, error_message.c_str());
+        return nullptr;
+    }
+    PyObject* result = invoke_model_registry(
+        handle->models(),
+        name,
+        encoded_prompt,
+        encoded_schema,
+        static_cast<uint32_t>(max_tokens),
+        &error_message
+    );
+    if (result == nullptr) {
+        PyErr_SetString(PyExc_RuntimeError, error_message.c_str());
+        return nullptr;
+    }
+    return result;
+}
+
+PyObject* py_runtime_invoke_model_with_details(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* runtime = nullptr;
+    const char* name = nullptr;
+    PyObject* prompt_bytes = Py_None;
+    PyObject* schema_bytes = Py_None;
+    unsigned long max_tokens = 0U;
+    static const char* keywords[] = {"runtime", "name", "prompt_bytes", "schema_bytes", "max_tokens", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "OsO|Ok",
+            const_cast<char**>(keywords),
+            &runtime,
+            &name,
+            &prompt_bytes,
+            &schema_bytes,
+            &max_tokens
+        )) {
+        return nullptr;
+    }
+
+    std::vector<std::byte> encoded_prompt;
+    std::vector<std::byte> encoded_schema;
+    std::string error_message;
+    if (!parse_python_bytes_like(prompt_bytes, &encoded_prompt, &error_message) ||
+        !parse_python_bytes_like(schema_bytes, &encoded_schema, &error_message)) {
+        PyErr_SetString(PyExc_TypeError, error_message.c_str());
+        return nullptr;
+    }
+    PyObject* result = runtime_invoke_model(
+        runtime,
+        name,
+        encoded_prompt,
+        encoded_schema,
+        static_cast<uint32_t>(max_tokens),
+        &error_message
+    );
+    if (result == nullptr) {
+        if (PyErr_Occurred() == nullptr) {
+            PyErr_SetString(PyExc_RuntimeError, error_message.c_str());
+        }
+        return nullptr;
+    }
+    return result;
+}
+
 PyMethodDef kModuleMethods[] = {
     {
         "_create_graph",
@@ -793,6 +1906,102 @@ PyMethodDef kModuleMethods[] = {
         reinterpret_cast<PyCFunction>(py_runtime_record_once),
         METH_VARARGS | METH_KEYWORDS,
         "Record a once-only synchronous effect for the active Python node callback."
+    },
+    {
+        "_list_tools",
+        reinterpret_cast<PyCFunction>(py_list_tools),
+        METH_VARARGS | METH_KEYWORDS,
+        "List registered native tools for a compiled graph."
+    },
+    {
+        "_describe_tool",
+        reinterpret_cast<PyCFunction>(py_describe_tool),
+        METH_VARARGS | METH_KEYWORDS,
+        "Describe one registered native tool."
+    },
+    {
+        "_register_http_tool_adapter",
+        reinterpret_cast<PyCFunction>(py_register_http_tool_adapter),
+        METH_VARARGS | METH_KEYWORDS,
+        "Register the built-in HTTP tool adapter on a compiled graph."
+    },
+    {
+        "_register_sqlite_tool_adapter",
+        reinterpret_cast<PyCFunction>(py_register_sqlite_tool_adapter),
+        METH_VARARGS | METH_KEYWORDS,
+        "Register the built-in SQLite-like tool adapter on a compiled graph."
+    },
+    {
+        "_register_http_json_tool_adapter",
+        reinterpret_cast<PyCFunction>(py_register_http_json_tool_adapter),
+        METH_VARARGS | METH_KEYWORDS,
+        "Register the built-in HTTP JSON tool adapter on a compiled graph."
+    },
+    {
+        "_register_python_tool_adapter",
+        reinterpret_cast<PyCFunction>(py_register_python_tool_adapter),
+        METH_VARARGS | METH_KEYWORDS,
+        "Register a Python-backed tool handler on a compiled graph."
+    },
+    {
+        "_invoke_tool_with_details",
+        reinterpret_cast<PyCFunction>(py_invoke_tool_with_details),
+        METH_VARARGS | METH_KEYWORDS,
+        "Invoke a registered native tool from Python."
+    },
+    {
+        "_runtime_invoke_tool_with_details",
+        reinterpret_cast<PyCFunction>(py_runtime_invoke_tool_with_details),
+        METH_VARARGS | METH_KEYWORDS,
+        "Invoke a registered native tool from an active Python runtime context."
+    },
+    {
+        "_list_models",
+        reinterpret_cast<PyCFunction>(py_list_models),
+        METH_VARARGS | METH_KEYWORDS,
+        "List registered native models for a compiled graph."
+    },
+    {
+        "_describe_model",
+        reinterpret_cast<PyCFunction>(py_describe_model),
+        METH_VARARGS | METH_KEYWORDS,
+        "Describe one registered native model."
+    },
+    {
+        "_register_local_model_adapter",
+        reinterpret_cast<PyCFunction>(py_register_local_model_adapter),
+        METH_VARARGS | METH_KEYWORDS,
+        "Register the built-in local model adapter on a compiled graph."
+    },
+    {
+        "_register_llm_http_adapter",
+        reinterpret_cast<PyCFunction>(py_register_llm_http_adapter),
+        METH_VARARGS | METH_KEYWORDS,
+        "Register the built-in HTTP LLM adapter on a compiled graph."
+    },
+    {
+        "_register_openai_chat_model_adapter",
+        reinterpret_cast<PyCFunction>(py_register_openai_chat_model_adapter),
+        METH_VARARGS | METH_KEYWORDS,
+        "Register the built-in OpenAI-compatible chat model adapter on a compiled graph."
+    },
+    {
+        "_register_python_model_adapter",
+        reinterpret_cast<PyCFunction>(py_register_python_model_adapter),
+        METH_VARARGS | METH_KEYWORDS,
+        "Register a Python-backed model handler on a compiled graph."
+    },
+    {
+        "_invoke_model_with_details",
+        reinterpret_cast<PyCFunction>(py_invoke_model_with_details),
+        METH_VARARGS | METH_KEYWORDS,
+        "Invoke a registered native model from Python."
+    },
+    {
+        "_runtime_invoke_model_with_details",
+        reinterpret_cast<PyCFunction>(py_runtime_invoke_model_with_details),
+        METH_VARARGS | METH_KEYWORDS,
+        "Invoke a registered native model from an active Python runtime context."
     },
     {nullptr, nullptr, 0, nullptr}
 };

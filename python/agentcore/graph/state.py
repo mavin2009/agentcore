@@ -6,6 +6,7 @@ import inspect
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Sequence
 
+from ..adapters.registry import ModelRegistryView, ToolRegistryView, _raise_adapter_error, _decode_response_details, encode_adapter_payload
 from .. import _agentcore_native as _native
 
 START = "__start__"
@@ -158,6 +159,74 @@ class RuntimeContext:
 
     def record_once(self, key: str, request: Any, producer: Any) -> Any:
         return self.record_once_with_metadata(key, request, producer)["value"]
+
+    def invoke_tool_with_metadata(
+        self,
+        name: str,
+        request: Any,
+        *,
+        decode: str = "auto",
+    ) -> dict[str, Any]:
+        if not self.available:
+            raise RuntimeError("runtime context is not available for this callback")
+        details = _native._runtime_invoke_tool_with_details(
+            self._native_runtime,
+            str(name),
+            encode_adapter_payload(request),
+        )
+        return _decode_response_details(details, decode=decode)
+
+    def invoke_tool(
+        self,
+        name: str,
+        request: Any,
+        *,
+        decode: str = "auto",
+    ) -> Any:
+        details = self.invoke_tool_with_metadata(name, request, decode=decode)
+        if not details.get("ok", False):
+            _raise_adapter_error("tool", str(name), details)
+        return details["output"]
+
+    def invoke_model_with_metadata(
+        self,
+        name: str,
+        prompt: Any,
+        *,
+        schema: Any | None = None,
+        max_tokens: int = 0,
+        decode: str = "auto",
+    ) -> dict[str, Any]:
+        if not self.available:
+            raise RuntimeError("runtime context is not available for this callback")
+        details = _native._runtime_invoke_model_with_details(
+            self._native_runtime,
+            str(name),
+            encode_adapter_payload(prompt),
+            encode_adapter_payload(schema),
+            int(max_tokens),
+        )
+        return _decode_response_details(details, decode=decode)
+
+    def invoke_model(
+        self,
+        name: str,
+        prompt: Any,
+        *,
+        schema: Any | None = None,
+        max_tokens: int = 0,
+        decode: str = "auto",
+    ) -> Any:
+        details = self.invoke_model_with_metadata(
+            name,
+            prompt,
+            schema=schema,
+            max_tokens=max_tokens,
+            decode=decode,
+        )
+        if not details.get("ok", False):
+            _raise_adapter_error("model", str(name), details)
+        return details["output"]
 
 
 def _extract_runtime_and_config(config: Any) -> tuple[dict[str, Any], RuntimeContext]:
@@ -540,10 +609,20 @@ class CompiledStateGraph:
         self._native_graph = native_graph
         self._name = name
         self._owned_subgraphs = list(owned_subgraphs or [])
+        self._tool_registry_view = ToolRegistryView(native_graph)
+        self._model_registry_view = ModelRegistryView(native_graph)
 
     @property
     def name(self) -> str:
         return self._name
+
+    @property
+    def tools(self) -> ToolRegistryView:
+        return self._tool_registry_view
+
+    @property
+    def models(self) -> ModelRegistryView:
+        return self._model_registry_view
 
     def invoke(
         self,

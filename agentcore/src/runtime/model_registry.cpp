@@ -120,8 +120,35 @@ void ModelRegistry::register_model(std::string_view name, ModelHandler handler) 
 }
 
 void ModelRegistry::register_model(std::string_view name, ModelPolicy policy, ModelHandler handler) {
+    AdapterMetadata metadata;
+    metadata.provider = "custom";
+    metadata.implementation = std::string(name);
+    metadata.display_name = std::string(name);
+    metadata.transport = AdapterTransportKind::InProcess;
+    metadata.auth = AdapterAuthKind::None;
+    metadata.capabilities =
+        static_cast<uint64_t>(kAdapterCapabilitySync) |
+        static_cast<uint64_t>(kAdapterCapabilityAsync) |
+        static_cast<uint64_t>(kAdapterCapabilityCheckpointSafe);
+    metadata.request_format = "blob";
+    metadata.response_format = "blob";
+    register_model(name, std::move(policy), std::move(metadata), std::move(handler));
+}
+
+void ModelRegistry::register_model(
+    std::string_view name,
+    ModelPolicy policy,
+    AdapterMetadata metadata,
+    ModelHandler handler
+) {
     std::lock_guard<std::mutex> lock(mutex_);
-    handlers_[std::string(name)] = ModelSpec{policy, std::move(handler)};
+    if (metadata.implementation.empty()) {
+        metadata.implementation = std::string(name);
+    }
+    if (metadata.display_name.empty()) {
+        metadata.display_name = std::string(name);
+    }
+    handlers_[std::string(name)] = ModelSpec{policy, std::move(metadata), std::move(handler)};
 }
 
 void ModelRegistry::set_async_completion_listener(AsyncModelCompletionListener listener) {
@@ -460,6 +487,15 @@ std::vector<ModelRegistry::NamedModelSpec> ModelRegistry::registered_models() co
         models.push_back(NamedModelSpec{name, spec});
     }
     return models;
+}
+
+std::optional<ModelRegistry::NamedModelSpec> ModelRegistry::describe_model(std::string_view name) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto iterator = handlers_.find(std::string(name));
+    if (iterator == handlers_.end()) {
+        return std::nullopt;
+    }
+    return NamedModelSpec{iterator->first, iterator->second};
 }
 
 } // namespace agentcore
