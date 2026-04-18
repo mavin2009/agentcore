@@ -183,16 +183,25 @@ if(AGENTCORE_BUILD_PYTHON_BINDINGS)
         set(AGENTCORE_PYTHON_PACKAGE_ROOT "${AGENTCORE_PYTHON_BUILD_ROOT}/agentcore")
         file(
             GLOB_RECURSE AGENTCORE_PYTHON_PACKAGE_FILES CONFIGURE_DEPENDS
-            "${CMAKE_CURRENT_SOURCE_DIR}/python/agentcore/*.py"
+            "${CMAKE_CURRENT_SOURCE_DIR}/python/*.py"
         )
         set(AGENTCORE_PYTHON_PACKAGE_STAMP "${AGENTCORE_PYTHON_BUILD_ROOT}/.python_package.stamp")
 
         add_custom_command(
             OUTPUT "${AGENTCORE_PYTHON_PACKAGE_STAMP}"
             COMMAND ${CMAKE_COMMAND} -E make_directory "${AGENTCORE_PYTHON_BUILD_ROOT}"
+            COMMAND ${CMAKE_COMMAND} -E remove_directory "${AGENTCORE_PYTHON_PACKAGE_ROOT}"
+            COMMAND ${CMAKE_COMMAND} -E remove_directory "${AGENTCORE_PYTHON_BUILD_ROOT}/agentcore_langgraph_native"
+            COMMAND ${CMAKE_COMMAND} -E remove_directory "${AGENTCORE_PYTHON_BUILD_ROOT}/langgraph"
             COMMAND ${CMAKE_COMMAND} -E copy_directory
                 "${CMAKE_CURRENT_SOURCE_DIR}/python/agentcore"
                 "${AGENTCORE_PYTHON_PACKAGE_ROOT}"
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${CMAKE_CURRENT_SOURCE_DIR}/python/agentcore_langgraph_native"
+                "${AGENTCORE_PYTHON_BUILD_ROOT}/agentcore_langgraph_native"
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${CMAKE_CURRENT_SOURCE_DIR}/python/langgraph"
+                "${AGENTCORE_PYTHON_BUILD_ROOT}/langgraph"
             COMMAND ${CMAKE_COMMAND} -E touch "${AGENTCORE_PYTHON_PACKAGE_STAMP}"
             DEPENDS ${AGENTCORE_PYTHON_PACKAGE_FILES}
         )
@@ -298,54 +307,66 @@ if(BUILD_TESTING)
     endif()
 endif()
 
-install(
-    TARGETS
-        agentcore
-        agentcore_graph
-        agentcore_state
-        agentcore_runtime
-        agentcore_execution
-        agentcore_adapters
-    EXPORT agentcoreTargets
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-    INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-)
+set(AGENTCORE_INSTALL_NATIVE_DEV_ARTIFACTS ON)
+if(DEFINED SKBUILD_PLATLIB_DIR AND NOT SKBUILD_PLATLIB_DIR STREQUAL "")
+    set(AGENTCORE_INSTALL_NATIVE_DEV_ARTIFACTS OFF)
+endif()
 
-install(
-    DIRECTORY agentcore/include/agentcore
-    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-)
+if(AGENTCORE_INSTALL_NATIVE_DEV_ARTIFACTS)
+    install(
+        TARGETS
+            agentcore
+            agentcore_graph
+            agentcore_state
+            agentcore_runtime
+            agentcore_execution
+            agentcore_adapters
+        EXPORT agentcoreTargets
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    )
 
-configure_package_config_file(
-    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/agentcoreConfig.cmake.in"
-    "${CMAKE_CURRENT_BINARY_DIR}/agentcoreConfig.cmake"
-    INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/agentcore"
-)
+    install(
+        DIRECTORY agentcore/include/agentcore
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    )
 
-write_basic_package_version_file(
-    "${CMAKE_CURRENT_BINARY_DIR}/agentcoreConfigVersion.cmake"
-    VERSION ${PROJECT_VERSION}
-    COMPATIBILITY SameMajorVersion
-)
-
-install(
-    EXPORT agentcoreTargets
-    FILE agentcoreTargets.cmake
-    NAMESPACE agentcore::
-    DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/agentcore"
-)
-
-install(
-    FILES
+    configure_package_config_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/agentcoreConfig.cmake.in"
         "${CMAKE_CURRENT_BINARY_DIR}/agentcoreConfig.cmake"
+        INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/agentcore"
+    )
+
+    write_basic_package_version_file(
         "${CMAKE_CURRENT_BINARY_DIR}/agentcoreConfigVersion.cmake"
-    DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/agentcore"
-)
+        VERSION ${PROJECT_VERSION}
+        COMPATIBILITY SameMajorVersion
+    )
+
+    install(
+        EXPORT agentcoreTargets
+        FILE agentcoreTargets.cmake
+        NAMESPACE agentcore::
+        DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/agentcore"
+    )
+
+    install(
+        FILES
+            "${CMAKE_CURRENT_BINARY_DIR}/agentcoreConfig.cmake"
+            "${CMAKE_CURRENT_BINARY_DIR}/agentcoreConfigVersion.cmake"
+        DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/agentcore"
+    )
+endif()
 
 if(TARGET _agentcore_native)
-    if(DEFINED Python3_SITELIB AND NOT Python3_SITELIB STREQUAL "")
+    if(DEFINED SKBUILD_PLATLIB_DIR AND NOT SKBUILD_PLATLIB_DIR STREQUAL "")
+        install(
+            TARGETS _agentcore_native
+            LIBRARY DESTINATION "${SKBUILD_PLATLIB_DIR}/agentcore"
+        )
+    elseif(DEFINED Python3_SITELIB AND NOT Python3_SITELIB STREQUAL "")
         install(
             TARGETS _agentcore_native
             LIBRARY DESTINATION "${Python3_SITELIB}/agentcore"
@@ -353,6 +374,10 @@ if(TARGET _agentcore_native)
         install(
             DIRECTORY python/agentcore/
             DESTINATION "${Python3_SITELIB}/agentcore"
+        )
+        install(
+            DIRECTORY python/agentcore_langgraph_native/
+            DESTINATION "${Python3_SITELIB}/agentcore_langgraph_native"
         )
     endif()
 endif()

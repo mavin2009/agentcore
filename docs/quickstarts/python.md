@@ -17,6 +17,18 @@ The build emits a package under `./build/python/agentcore`. To use it directly f
 PYTHONPATH=./build/python python3 -c "from agentcore.graph import StateGraph; print('ok')"
 ```
 
+If you want a pip-installable package artifact instead of using the build tree directly, the published distribution name is `agentcore-graph` while the Python import package remains `agentcore`:
+
+```bash
+CC=cc CXX=c++ python3 -m pip wheel . -w dist
+python3 -m pip install --target /tmp/agentcore-wheel-test dist/agentcore_graph-*.whl
+PYTHONPATH=/tmp/agentcore-wheel-test python3 -c "from agentcore.graph import StateGraph; print('ok')"
+```
+
+That wheel includes the `agentcore` package and the compatibility namespace under `agentcore_langgraph_native`. It intentionally does not install a top-level `langgraph` package into the environment.
+
+For published releases, the repository also includes cibuildwheel-based automation in `./.github/workflows/` that builds Linux `manylinux_2_28` wheels for CPython 3.9-3.12 and runs the Python smoke coverage against those built wheels before release.
+
 ## Define A Minimal Graph
 
 ```python

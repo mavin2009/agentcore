@@ -40,6 +40,42 @@ What they cover:
 - pause/resume preserving child-local memory and streamed session metadata
 - concurrent execution through `abatch(...)`
 
+## Wheel Packaging Smoke
+
+When you need to validate the publishable Python artifact rather than the local build tree:
+
+```bash
+CC=cc CXX=c++ python3 -m pip wheel . -w dist
+rm -rf /tmp/agentcore-wheel-test && mkdir -p /tmp/agentcore-wheel-test
+python3 -m pip install --no-deps --target /tmp/agentcore-wheel-test dist/agentcore_graph-*.whl
+PYTHONPATH=/tmp/agentcore-wheel-test python3 ./python/tests/state_graph_api_smoke.py
+PYTHONPATH=/tmp/agentcore-wheel-test python3 ./python/tests/agent_workflows_smoke.py
+```
+
+That path proves the installed wheel, not the build tree, still supports:
+
+- Python graph construction and execution
+- multi-agent and subgraph flows
+- persistent-session reuse and resume
+- streaming and metadata inspection
+
+## Cibuildwheel Linux Release Smoke
+
+When you need to validate the release-wheel path that CI uses, check the selected build matrix and then run at least one Linux wheel build locally. This requires Docker.
+
+```bash
+python3 -m cibuildwheel --platform linux --print-build-identifiers .
+CIBW_BUILD=cp39-manylinux_x86_64 python3 -m cibuildwheel --platform linux --output-dir wheelhouse .
+```
+
+Then validate the built wheel metadata and installability:
+
+```bash
+python3 -m twine check wheelhouse/*.whl
+```
+
+The release automation in `./.github/workflows/wheels.yml` currently targets Linux `x86_64`, CPython 3.9-3.12, with the `manylinux_2_28` container baseline so C++20 builds remain compatible with a wide range of modern Linux hosts.
+
 ## Native Examples
 
 These are useful as executable documentation and spot checks:
@@ -71,6 +107,13 @@ If the Python bindings were built, the Python benchmark entry point is:
 PYTHONPATH=./build/python python3 ./python/benchmarks/state_graph_api_benchmark.py
 ```
 
+If you want the optional public comparison against upstream LangGraph, install LangGraph into the active Python environment and run:
+
+```bash
+python3 -m pip install langgraph
+python3 ./python/benchmarks/langgraph_head_to_head.py
+```
+
 These benchmarks are most useful when comparing revisions on the same machine with the same build configuration. They should be treated as regression instruments and change-detection tools, not as universal performance claims.
 
 The current benchmark surfaces include:
@@ -81,6 +124,7 @@ The current benchmark surfaces include:
 - Python graph invocation cost
 - Python recorded-effect replay and miss cost through the binding layer
 - Python persistent-session fan-out, streamed session metadata, and pause/resume state validation
+- optional upstream LangGraph vs AgentCore comparison for same-code builder workloads and native persistent-session workloads
 
 The persistent-session native benchmark is the structural replay gate for this feature. It checks:
 

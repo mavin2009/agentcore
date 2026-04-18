@@ -18,6 +18,8 @@ The root README is the landing page. The task-oriented guides live under [`./doc
 - [`./docs/quickstarts/cpp.md`](./docs/quickstarts/cpp.md): build and embed the C++ runtime, construct graphs, and run the native examples
 - [`./docs/concepts/runtime-model.md`](./docs/concepts/runtime-model.md): execution model, state patches, joins, persistent subgraph sessions, knowledge graph state, checkpoints, and streaming
 - [`./docs/reference/api.md`](./docs/reference/api.md): Python surface summary and the key C++ headers and types
+- [`./docs/comparisons/langgraph-head-to-head.md`](./docs/comparisons/langgraph-head-to-head.md): measured head-to-head numbers against upstream LangGraph and reproduction commands
+- [`./docs/migration/langgraph-to-agentcore.md`](./docs/migration/langgraph-to-agentcore.md): one-page guide for moving a LangGraph-style `StateGraph` to AgentCore
 - [`./docs/operations/validation.md`](./docs/operations/validation.md): test, smoke, persistent-session benchmark, and replay validation entry points
 
 ## Why This Shape
@@ -249,6 +251,33 @@ The exported CMake targets are:
 
 The root project name is `agentcore`, and the package configuration is generated through `./cmake/agentcoreConfig.cmake.in`.
 
+## Python Package
+
+The repository also builds a pip-installable wheel through [`./pyproject.toml`](./pyproject.toml). The published distribution name is `agentcore-graph`, while the Python import package remains `agentcore`. The wheel packages the Python API, the native extension, and the compatibility namespace under `agentcore_langgraph_native`.
+
+The simplest way to use AgentCore from Python is to install it directly from PyPI:
+
+```bash
+python3 -m pip install agentcore-graph
+```
+
+Build the wheel from the repository root:
+
+```bash
+CC=cc CXX=c++ python3 -m pip wheel . -w dist
+```
+
+Install the built wheel into an isolated target:
+
+```bash
+python3 -m pip install --target /tmp/agentcore-wheel-test dist/agentcore_graph-*.whl
+PYTHONPATH=/tmp/agentcore-wheel-test python3 -c "from agentcore.graph import StateGraph; print('ok')"
+```
+
+The wheel is intentionally focused on the Python runtime surface. It does not publish the top-level `langgraph` shim package, which avoids colliding with an existing upstream `langgraph` installation while still exposing the compatibility layer through `agentcore_langgraph_native.langgraph_compat`.
+
+The repository now also includes release automation under [`.github/workflows/wheels.yml`](./.github/workflows/wheels.yml) and [`.github/workflows/publish-pypi.yml`](./.github/workflows/publish-pypi.yml). The current wheel matrix is Linux `x86_64`, CPython 3.9-3.12, built against `manylinux_2_28` so the published wheels are broadly installable on modern glibc-based Linux systems while source installs remain available as a fallback.
+
 ## C++ Usage
 
 The basic execution flow is:
@@ -420,6 +449,7 @@ Additional runnable entry points include:
 - `PYTHONPATH=./build/python python3 ./python/tests/state_graph_api_smoke.py`
 - `PYTHONPATH=./build/python python3 ./python/tests/agent_workflows_smoke.py`
 - `PYTHONPATH=./build/python python3 ./python/benchmarks/state_graph_api_benchmark.py`
+- `python3 ./python/benchmarks/langgraph_head_to_head.py` after installing upstream `langgraph`
 
 The native benchmark currently exercises:
 
@@ -442,6 +472,8 @@ The Python benchmark currently exercises:
 - recorded-effect miss cost through the binding layer
 - persistent-session fan-out with namespaced and session-tagged events
 - pause/resume specialist flows with child-local memory and once-only effects
+
+The optional comparison benchmark in [`./python/benchmarks/langgraph_head_to_head.py`](./python/benchmarks/langgraph_head_to_head.py) publishes a measured snapshot against upstream LangGraph and is summarized in [`./docs/comparisons/langgraph-head-to-head.md`](./docs/comparisons/langgraph-head-to-head.md).
 
 The persistent-session native benchmark is also the replay-validation gate for this feature: it checks direct-versus-resumed output equality, proof-digest equality, committed-session counts, once-only producer counts, and namespaced/session-tagged event coverage. The Python benchmark mirrors those workloads through the binding layer, asserts final-state and session invariants, and emits the corresponding digests for inspection.
 

@@ -3,6 +3,7 @@
 /build-*/
 /out/
 /dist/
+/wheelhouse/
 
 # CMake out-of-source and accidental in-source build artifacts
 CMakeCache.txt
