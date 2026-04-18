@@ -143,6 +143,155 @@ def build_subgraph_graph():
     return parent_graph.compile()
 
 
+def build_persistent_specialist_child_graph(*, wait_on_first_visit: bool = False):
+    def specialist_step(state, config, runtime):
+        session_id = str(state.get("session_id", "unknown"))
+        query = str(state.get("query", ""))
+        resume_attempt = int(state.get("resume_attempt", 0))
+        if wait_on_first_visit and resume_attempt == 0:
+            return Command(update={"resume_attempt": 1}, wait=True)
+
+        visits = int(state.get("visits", 0)) + 1
+        memory = list(state.get("memory", []))
+        prior_memory = len(memory)
+        memory.append(query)
+        memoized = runtime.record_once(
+            f"python-specialist::{session_id}::memo",
+            {"session_id": session_id},
+            lambda: {"memo": f"memo::{session_id}"},
+        )
+        return {
+            "visits": visits,
+            "prior_memory": prior_memory,
+            "memory": memory,
+            "memo": memoized["memo"],
+            "answer": f"{session_id}::{query}::visit-{visits}",
+        }
+
+    child_graph = StateGraph(
+        dict,
+        name="python_persistent_specialist_child",
+        worker_count=2,
+    )
+    child_graph.add_node("specialist_step", specialist_step)
+    child_graph.add_edge(START, "specialist_step")
+    child_graph.add_edge("specialist_step", END)
+    return child_graph
+
+
+def build_persistent_specialist_parent(*, wait_on_first_visit: bool = False):
+    child_graph = build_persistent_specialist_child_graph(wait_on_first_visit=wait_on_first_visit)
+
+    def revisit_or_finish(state, config):
+        round_index = int(state.get("round", 0))
+        if round_index == 0:
+            return Command(
+                update={
+                    "round": 1,
+                    "query": "followup-brief",
+                },
+                goto="specialist_session",
+            )
+        return Command(update={"complete": True}, goto=END)
+
+    parent_graph = StateGraph(
+        dict,
+        name="python_persistent_specialist_parent",
+        worker_count=4,
+    )
+    parent_graph.add_subgraph(
+        "specialist_session",
+        child_graph,
+        namespace="specialist_session",
+        inputs={
+            "session_id": "session_id",
+            "query": "query",
+        },
+        outputs={
+            "answer": "answer",
+            "visits": "visits",
+            "prior_memory": "prior_memory",
+            "memory": "memory",
+            "memo": "memo",
+            "resume_attempt": "resume_attempt",
+        },
+        session_mode="persistent",
+        session_id_from="session_id",
+    )
+    parent_graph.add_node("revisit_or_finish", revisit_or_finish)
+    parent_graph.add_edge(START, "specialist_session")
+    parent_graph.add_edge("specialist_session", "revisit_or_finish")
+    parent_graph.add_edge("revisit_or_finish", END)
+    return parent_graph.compile()
+
+
+def build_parallel_specialist_graph():
+    child_graph = build_persistent_specialist_child_graph()
+
+    def left_prepare(state, config):
+        return {
+            "left_session_id": "planner",
+            "left_query": "analyze-system",
+        }
+
+    def right_prepare(state, config):
+        return {
+            "right_session_id": "reviewer",
+            "right_query": "review-plan",
+        }
+
+    def join_branches(state, config):
+        return {
+            "combined": f"{state['left_answer']}|{state['right_answer']}",
+            "joined": True,
+        }
+
+    graph = StateGraph(dict, name="python_parallel_specialists", worker_count=4)
+    graph.add_fanout("fanout")
+    graph.add_node("left_prepare", left_prepare)
+    graph.add_node("right_prepare", right_prepare)
+    graph.add_subgraph(
+        "left_specialist",
+        child_graph,
+        namespace="left_specialist",
+        inputs={
+            "left_session_id": "session_id",
+            "left_query": "query",
+        },
+        outputs={
+            "left_answer": "answer",
+            "left_visits": "visits",
+        },
+        session_mode="persistent",
+        session_id_from="left_session_id",
+    )
+    graph.add_subgraph(
+        "right_specialist",
+        child_graph,
+        namespace="right_specialist",
+        inputs={
+            "right_session_id": "session_id",
+            "right_query": "query",
+        },
+        outputs={
+            "right_answer": "answer",
+            "right_visits": "visits",
+        },
+        session_mode="persistent",
+        session_id_from="right_session_id",
+    )
+    graph.add_join("join", join_branches)
+    graph.add_edge(START, "fanout")
+    graph.add_edge("fanout", "left_prepare")
+    graph.add_edge("fanout", "right_prepare")
+    graph.add_edge("left_prepare", "left_specialist")
+    graph.add_edge("right_prepare", "right_specialist")
+    graph.add_edge("left_specialist", "join")
+    graph.add_edge("right_specialist", "join")
+    graph.add_edge("join", END)
+    return graph.compile()
+
+
 def build_fanout_join_graph():
     def left_branch(state, config):
         return {
@@ -240,6 +389,108 @@ def exercise_subgraph_composition():
     assert streamed_subgraph_events[0]["graph_name"] == "python_embedded_child_graph"
     assert streamed_subgraph_events[0]["node_name"] == "child_step"
     assert streamed_subgraph_events[0]["namespaces"][0]["node_name"] == "planner_subgraph"
+
+
+def exercise_persistent_specialist_session():
+    compiled = build_persistent_specialist_parent()
+    details = compiled.invoke_with_metadata(
+        {
+            "session_id": "specialist-alpha",
+            "query": "initial-brief",
+            "round": 0,
+        },
+        config={"tags": ["persistent-session"]},
+    )
+
+    assert details["summary"]["status"] == "completed"
+    assert details["state"]["visits"] == 2
+    assert details["state"]["prior_memory"] == 1
+    assert details["state"]["memory"] == ["initial-brief", "followup-brief"]
+    assert details["state"]["memo"] == "memo::specialist-alpha"
+    assert details["state"]["answer"] == "specialist-alpha::followup-brief::visit-2"
+
+    session_events = [event for event in details["trace"] if event["session_id"] == "specialist-alpha"]
+    namespaced_session_events = [event for event in session_events if event["namespaces"]]
+    assert len(session_events) >= 2
+    assert {event["session_revision"] for event in session_events} == {1, 2}
+    assert namespaced_session_events
+    assert all(
+        event["namespaces"][0]["node_name"] == "specialist_session"
+        for event in namespaced_session_events
+    )
+
+    streamed_events = list(
+        compiled.stream(
+            {
+                "session_id": "specialist-alpha",
+                "query": "initial-brief",
+                "round": 0,
+            },
+            config={"tags": ["persistent-session", "stream"]},
+        )
+    )
+    streamed_session_events = [
+        event for event in streamed_events if event["session_id"] == "specialist-alpha"
+    ]
+    streamed_namespaced_session_events = [
+        event for event in streamed_session_events if event["namespaces"]
+    ]
+    assert {event["session_revision"] for event in streamed_session_events} == {1, 2}
+    assert streamed_namespaced_session_events
+    assert all(
+        event["namespaces"][0]["session_id"] == "specialist-alpha"
+        for event in streamed_namespaced_session_events
+    )
+
+
+def exercise_parallel_specialists():
+    compiled = build_parallel_specialist_graph()
+    details = compiled.invoke_with_metadata({}, config={"tags": ["parallel-specialists"]})
+
+    assert details["summary"]["status"] == "completed"
+    assert details["state"]["left_answer"] == "planner::analyze-system::visit-1"
+    assert details["state"]["right_answer"] == "reviewer::review-plan::visit-1"
+    assert details["state"]["combined"] == (
+        "planner::analyze-system::visit-1|reviewer::review-plan::visit-1"
+    )
+    assert details["state"]["joined"] is True
+
+    subgraph_events = [event for event in details["trace"] if event["namespaces"]]
+    seen_sessions = {event["session_id"] for event in subgraph_events}
+    assert seen_sessions == {"planner", "reviewer"}
+    assert {
+        event["namespaces"][0]["node_name"]
+        for event in subgraph_events
+    } == {"left_specialist", "right_specialist"}
+
+
+def exercise_persistent_specialist_resume():
+    compiled = build_persistent_specialist_parent(wait_on_first_visit=True)
+    paused = compiled.invoke_until_pause_with_metadata(
+        {
+            "session_id": "resume-specialist",
+            "query": "initial-brief",
+            "round": 0,
+        },
+        config={"tags": ["persistent-session", "pause"]},
+    )
+
+    assert paused["summary"]["status"] == "paused"
+    assert paused["summary"]["checkpoint_id"] > 0
+
+    resumed = compiled.resume_with_metadata(paused["summary"]["checkpoint_id"])
+    assert resumed["summary"]["status"] == "completed"
+    assert resumed["state"]["visits"] == 2
+    assert resumed["state"]["prior_memory"] == 1
+    assert resumed["state"]["memory"] == ["initial-brief", "followup-brief"]
+    assert resumed["state"]["resume_attempt"] == 1
+    assert resumed["state"]["memo"] == "memo::resume-specialist"
+
+    resumed_session_events = [
+        event for event in resumed["trace"] if event["session_id"] == "resume-specialist"
+    ]
+    assert resumed_session_events
+    assert max(event["session_revision"] for event in resumed_session_events) == 2
 
 
 async def exercise_subgraph_parallel():
@@ -354,6 +605,9 @@ async def exercise_multi_agent():
 
 exercise_single_agent()
 exercise_subgraph_composition()
+exercise_persistent_specialist_session()
+exercise_parallel_specialists()
+exercise_persistent_specialist_resume()
 exercise_fanout_join()
 asyncio.run(exercise_subgraph_parallel())
 asyncio.run(exercise_multi_agent())

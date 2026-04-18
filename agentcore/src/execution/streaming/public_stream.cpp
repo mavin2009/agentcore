@@ -33,6 +33,8 @@ std::vector<StreamNamespaceFrame> expand_namespace_frames(
             frame.graph_name = graph->name;
             frame.node_name = namespace_node_name(*graph, ref.node_id);
         }
+        frame.session_id = ref.session_id;
+        frame.session_revision = ref.session_revision;
         namespaces.push_back(std::move(frame));
     }
     return namespaces;
@@ -70,6 +72,8 @@ std::vector<StreamEvent> build_public_stream_events(
         stream_event.confidence = event.confidence;
         stream_event.patch_count = event.patch_count;
         stream_event.flags = event.flags;
+        stream_event.session_id = event.session_id;
+        stream_event.session_revision = event.session_revision;
         stream_event.namespaces = expand_namespace_frames(event.namespace_path, graph_lookup);
         stream_events.push_back(std::move(stream_event));
     }

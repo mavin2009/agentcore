@@ -94,6 +94,18 @@ Tool and model integrations are registered on the engine rather than embedded in
 
 The built example [`../../agentcore/examples/planner_executor_graph.cpp`](../../agentcore/examples/planner_executor_graph.cpp) shows a planner model node feeding a tool node through blob-backed state.
 
+## Recorded Once-Only Effects
+
+For native nodes, restart-safe synchronous work lives on `ExecutionContext` rather than in ad hoc callback-side caches.
+
+Current helpers include:
+
+- `find_recorded_effect(...)`
+- `record_blob_effect_once(...)`
+- `record_text_effect_once(...)`
+
+Use these when a node needs a keyed once-only effect whose committed output should survive checkpoint restore and replay. The recorded outcome is committed through the same patch/checkpoint machinery as ordinary state changes, which keeps the replay boundary explicit.
+
 ## Knowledge-Graph State
 
 Knowledge-graph data is part of runtime state, not a sidecar service. The example [`../../agentcore/examples/knowledge_graph_workflow.cpp`](../../agentcore/examples/knowledge_graph_workflow.cpp) demonstrates:

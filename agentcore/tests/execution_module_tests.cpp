@@ -120,6 +120,30 @@ int main() {
 
     std::remove(persistence_path.c_str());
 
+#if defined(AGENTCORE_HAVE_SQLITE3)
+    const std::string sqlite_persistence_path = "agentcore-execution-module-checkpoints.sqlite";
+    std::remove(sqlite_persistence_path.c_str());
+
+    ExecutionEngine sqlite_engine(2);
+    sqlite_engine.enable_sqlite_checkpoint_persistence(sqlite_persistence_path);
+    const RunId sqlite_run_id = sqlite_engine.start(graph, InputEnvelope{4U});
+    const RunResult sqlite_result = sqlite_engine.run_to_completion(sqlite_run_id);
+    assert(sqlite_result.status == ExecutionStatus::Completed);
+    assert(sqlite_engine.checkpoints().storage_kind() == "sqlite");
+
+    ExecutionEngine restored_sqlite_engine(1);
+    restored_sqlite_engine.register_graph(graph);
+    restored_sqlite_engine.enable_sqlite_checkpoint_persistence(sqlite_persistence_path);
+    const std::size_t sqlite_loaded_records = restored_sqlite_engine.load_persisted_checkpoints();
+    assert(sqlite_loaded_records == sqlite_engine.checkpoints().size());
+
+    const auto restored_sqlite_record = restored_sqlite_engine.checkpoints().get(sqlite_result.last_checkpoint_id);
+    assert(restored_sqlite_record.has_value());
+    assert(restored_sqlite_record->resumable());
+
+    std::remove(sqlite_persistence_path.c_str());
+#endif
+
     std::cout << "execution module tests passed" << std::endl;
     return 0;
 }

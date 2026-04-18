@@ -5,7 +5,11 @@
 #include "agentcore/state/state_store.h"
 #include <algorithm>
 #include <cstddef>
+#include <functional>
 #include <optional>
+#include <stdexcept>
+#include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -109,6 +113,13 @@ struct NodeResult {
     }
 };
 
+struct RecordedEffectResult {
+    BlobRef request{};
+    BlobRef output{};
+    uint32_t flags{0};
+    bool replayed{false};
+};
+
 struct ExecutionContext {
     const WorkflowState& state;
     RunId run_id;
@@ -120,12 +131,109 @@ struct ExecutionContext {
     BlobStore& blobs;
     StringInterner& strings;
     const KnowledgeGraphStore& knowledge_graph;
+    const TaskJournal& task_journal;
     ToolRegistry& tools;
     ModelRegistry& models;
     TraceSink& trace;
     Deadline deadline;
     CancellationToken& cancel;
     std::optional<PendingAsyncOperation> pending_async;
+    std::vector<TaskRecord>* recorded_effects;
+
+    [[nodiscard]] std::optional<RecordedEffectResult> find_recorded_effect(std::string_view key) const {
+        if (key.empty()) {
+            return std::nullopt;
+        }
+        const InternedStringId key_id = strings.intern(key);
+        if (recorded_effects != nullptr) {
+            const auto pending_iterator = std::find_if(
+                recorded_effects->begin(),
+                recorded_effects->end(),
+                [key_id](const TaskRecord& record) {
+                    return record.key == key_id;
+                }
+            );
+            if (pending_iterator != recorded_effects->end()) {
+                return RecordedEffectResult{
+                    pending_iterator->request,
+                    pending_iterator->output,
+                    pending_iterator->flags,
+                    true
+                };
+            }
+        }
+
+        if (const TaskRecord* record = task_journal.find(key_id); record != nullptr) {
+            return RecordedEffectResult{record->request, record->output, record->flags, true};
+        }
+        return std::nullopt;
+    }
+
+    template <typename ProducerFn>
+    RecordedEffectResult record_blob_effect_once(
+        std::string_view key,
+        BlobRef request,
+        ProducerFn&& producer,
+        uint32_t flags = 0U
+    ) {
+        if (key.empty()) {
+            throw std::invalid_argument("recorded effect key must not be empty");
+        }
+        if (recorded_effects == nullptr) {
+            throw std::runtime_error("recorded effect recorder is unavailable");
+        }
+
+        auto blob_equal = [this](BlobRef left, BlobRef right) {
+            if (left == right) {
+                return true;
+            }
+            if (left.empty() || right.empty()) {
+                return left.empty() && right.empty();
+            }
+            return blobs.read_bytes(left) == blobs.read_bytes(right);
+        };
+
+        if (const auto existing = find_recorded_effect(key); existing.has_value()) {
+            if (!blob_equal(existing->request, request)) {
+                throw std::runtime_error("recorded effect request mismatch for key");
+            }
+            return *existing;
+        }
+
+        BlobRef output = std::invoke(std::forward<ProducerFn>(producer));
+        const InternedStringId key_id = strings.intern(key);
+        recorded_effects->push_back(TaskRecord{key_id, request, output, flags});
+        return RecordedEffectResult{request, output, flags, false};
+    }
+
+    template <typename ProducerFn>
+    RecordedEffectResult record_text_effect_once(
+        std::string_view key,
+        std::string_view request_text,
+        ProducerFn&& producer,
+        uint32_t flags = 0U
+    ) {
+        if (const auto existing = find_recorded_effect(key); existing.has_value()) {
+            const std::string_view existing_request = existing->request.empty()
+                ? std::string_view{}
+                : blobs.read_string(existing->request);
+            if (existing_request != request_text) {
+                throw std::runtime_error("recorded effect request mismatch for key");
+            }
+            return *existing;
+        }
+
+        const BlobRef request = request_text.empty() ? BlobRef{} : blobs.append_string(request_text);
+        return record_blob_effect_once(
+            key,
+            request,
+            [&]() -> BlobRef {
+                auto output = std::invoke(std::forward<ProducerFn>(producer));
+                return blobs.append_string(std::string_view(output));
+            },
+            flags
+        );
+    }
 };
 
 } // namespace agentcore

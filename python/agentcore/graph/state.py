@@ -10,6 +10,7 @@ from .. import _agentcore_native as _native
 
 START = "__start__"
 END = "__end__"
+_RUNTIME_CONFIG_KEY = getattr(_native, "_INTERNAL_RUNTIME_CONFIG_KEY", "__agentcore_runtime__")
 
 _VALID_NODE_KINDS = {
     "compute",
@@ -36,6 +37,7 @@ _VALID_MERGE_STRATEGIES = {
 class Command:
     update: dict[str, Any] | None = None
     goto: str | None = None
+    wait: bool = False
 
 
 @dataclass
@@ -45,6 +47,8 @@ class _SubgraphSpec:
     inputs: dict[str, str] = field(default_factory=dict)
     outputs: dict[str, str] = field(default_factory=dict)
     propagate_knowledge_graph: bool = False
+    session_mode: str = "ephemeral"
+    session_id_from: str | None = None
 
 
 @dataclass
@@ -79,36 +83,36 @@ def _normalize_update(value: Any) -> dict[str, Any]:
     raise TypeError("node updates must be mappings or None")
 
 
-def _normalize_result(result: Any) -> tuple[dict[str, Any], str | None]:
+def _normalize_result(result: Any) -> tuple[dict[str, Any], str | None, bool]:
     if isinstance(result, Command):
-        return _normalize_update(result.update), result.goto
+        return _normalize_update(result.update), result.goto, bool(result.wait)
     if result is None:
-        return {}, None
+        return {}, None, False
     if isinstance(result, str):
-        return {}, result
+        return {}, result, False
     if isinstance(result, (tuple, list)):
         if len(result) != 2:
             raise TypeError("tuple/list node results must contain exactly two elements")
-        return _normalize_update(result[0]), None if result[1] is None else str(result[1])
-    return _normalize_update(result), None
+        return _normalize_update(result[0]), None if result[1] is None else str(result[1]), False
+    return _normalize_update(result), None, False
 
 
-def _accepts_config(function: Any) -> bool:
+def _positional_arity(function: Any) -> int | None:
     try:
         signature = inspect.signature(function)
     except (TypeError, ValueError):
-        return True
+        return 2
 
     positional_count = 0
     for parameter in signature.parameters.values():
         if parameter.kind == inspect.Parameter.VAR_POSITIONAL:
-            return True
+            return None
         if parameter.kind in (
             inspect.Parameter.POSITIONAL_ONLY,
             inspect.Parameter.POSITIONAL_OR_KEYWORD,
         ):
             positional_count += 1
-    return positional_count >= 2
+    return positional_count
 
 
 def _run_awaitable_blocking(awaitable: Any) -> Any:
@@ -127,8 +131,50 @@ def _resolve_maybe_awaitable(value: Any) -> Any:
     return value
 
 
-def _call_with_optional_config(function: Any, accepts_config: bool, state: dict[str, Any], config: dict[str, Any]) -> Any:
-    if accepts_config:
+class RuntimeContext:
+    def __init__(self, native_runtime: Any | None):
+        self._native_runtime = native_runtime
+
+    @property
+    def available(self) -> bool:
+        return self._native_runtime is not None
+
+    def record_once_with_metadata(self, key: str, request: Any, producer: Any) -> dict[str, Any]:
+        if not self.available:
+            raise RuntimeError("runtime context is not available for this callback")
+        if not isinstance(key, str) or not key:
+            raise ValueError("recorded effect key must be a non-empty string")
+        if not callable(producer):
+            raise TypeError("producer must be callable")
+        details = _native._runtime_record_once(
+            self._native_runtime,
+            key,
+            request,
+            producer,
+        )
+        if not isinstance(details, dict):
+            raise TypeError("native runtime returned an invalid recorded-effect payload")
+        return details
+
+    def record_once(self, key: str, request: Any, producer: Any) -> Any:
+        return self.record_once_with_metadata(key, request, producer)["value"]
+
+
+def _extract_runtime_and_config(config: Any) -> tuple[dict[str, Any], RuntimeContext]:
+    normalized = _normalize_config(config)
+    return normalized, RuntimeContext(normalized.pop(_RUNTIME_CONFIG_KEY, None))
+
+
+def _call_with_optional_runtime(
+    function: Any,
+    state: dict[str, Any],
+    config: dict[str, Any],
+    runtime: RuntimeContext,
+) -> Any:
+    positional_arity = _positional_arity(function)
+    if positional_arity is None or positional_arity >= 3:
+        return function(state, config, runtime)
+    if positional_arity >= 2:
         return function(state, config)
     return function(state)
 
@@ -260,11 +306,21 @@ class StateGraph:
         outputs: dict[str, str] | None = None,
         namespace: str | None = None,
         propagate_knowledge_graph: bool = False,
+        session_mode: str = "ephemeral",
+        session_id_from: str | None = None,
     ) -> "StateGraph":
         if not isinstance(graph, (StateGraph, CompiledStateGraph)):
             raise TypeError("subgraph must be a StateGraph or CompiledStateGraph instance")
         if graph is self:
             raise ValueError("a graph cannot include itself as a subgraph")
+        normalized_session_mode = str(session_mode).strip().lower()
+        if normalized_session_mode not in {"ephemeral", "persistent"}:
+            raise ValueError("session_mode must be either 'ephemeral' or 'persistent'")
+        if normalized_session_mode == "persistent":
+            if not isinstance(session_id_from, str) or not session_id_from:
+                raise ValueError("persistent subgraphs require session_id_from")
+        elif session_id_from is not None:
+            raise ValueError("ephemeral subgraphs must not declare session_id_from")
 
         self._nodes[name] = _NodeSpec(
             action=None,
@@ -275,6 +331,8 @@ class StateGraph:
                 inputs=_normalize_string_mapping(inputs, field_name="inputs"),
                 outputs=_normalize_string_mapping(outputs, field_name="outputs"),
                 propagate_knowledge_graph=bool(propagate_knowledge_graph),
+                session_mode=normalized_session_mode,
+                session_id_from=session_id_from,
             ),
         )
         if self._entry_point is None:
@@ -355,6 +413,8 @@ class StateGraph:
                         input_bindings=node_spec.subgraph.inputs,
                         output_bindings=node_spec.subgraph.outputs,
                         propagate_knowledge_graph=node_spec.subgraph.propagate_knowledge_graph,
+                        session_mode=node_spec.subgraph.session_mode,
+                        session_id_from=node_spec.subgraph.session_id_from,
                     )
                     continue
 
@@ -420,22 +480,24 @@ class StateGraph:
         node_spec = self._nodes[node_name]
         node_action = node_spec.action
         routing_spec = self._conditional_edges.get(node_name)
-        node_accepts_config = _accepts_config(node_action) if node_action is not None else False
-        route_accepts_config = _accepts_config(routing_spec[0]) if routing_spec is not None else False
 
         def wrapped(state: dict[str, Any], config: dict[str, Any] | None = None) -> Any:
-            normalized_config = _normalize_config(config)
+            normalized_config, runtime = _extract_runtime_and_config(config)
             updates: dict[str, Any] = {}
             explicit_goto: str | None = None
 
             if node_action is not None:
-                node_result = _call_with_optional_config(
+                node_result = _call_with_optional_runtime(
                     node_action,
-                    node_accepts_config,
                     dict(state),
                     normalized_config,
+                    runtime,
                 )
-                updates, explicit_goto = _normalize_result(_resolve_maybe_awaitable(node_result))
+                updates, explicit_goto, should_wait = _normalize_result(
+                    _resolve_maybe_awaitable(node_result)
+                )
+                if should_wait:
+                    return updates, None, True
                 if explicit_goto is not None:
                     return updates, self._map_target_name(explicit_goto)
 
@@ -445,11 +507,11 @@ class StateGraph:
             route_fn, route_map = routing_spec
             merged_state = dict(state)
             merged_state.update(updates)
-            route_result = _call_with_optional_config(
+            route_result = _call_with_optional_runtime(
                 route_fn,
-                route_accepts_config,
                 merged_state,
                 normalized_config,
+                runtime,
             )
             route_value = _resolve_maybe_awaitable(route_result)
             if route_map:
@@ -504,6 +566,33 @@ class CompiledStateGraph:
             self._native_graph,
             initial_state,
             _normalize_config(config),
+            include_subgraphs=include_subgraphs,
+        )
+
+    def invoke_until_pause_with_metadata(
+        self,
+        input_state: dict[str, Any] | None = None,
+        *,
+        config: dict[str, Any] | None = None,
+        include_subgraphs: bool = True,
+    ) -> dict[str, Any]:
+        initial_state = {} if input_state is None else dict(input_state)
+        return _native._invoke_until_pause_with_details(
+            self._native_graph,
+            initial_state,
+            _normalize_config(config),
+            include_subgraphs=include_subgraphs,
+        )
+
+    def resume_with_metadata(
+        self,
+        checkpoint_id: int,
+        *,
+        include_subgraphs: bool = True,
+    ) -> dict[str, Any]:
+        return _native._resume_with_details(
+            self._native_graph,
+            int(checkpoint_id),
             include_subgraphs=include_subgraphs,
         )
 

@@ -199,6 +199,14 @@ void write_state_patch(std::ostream& output, const StatePatch& patch) {
         write_blob_ref(output, blob);
     }
 
+    write_pod<uint64_t>(output, static_cast<uint64_t>(patch.task_records.size()));
+    for (const TaskRecord& record : patch.task_records) {
+        write_pod(output, record.key);
+        write_blob_ref(output, record.request);
+        write_blob_ref(output, record.output);
+        write_pod(output, record.flags);
+    }
+
     write_knowledge_graph_patch(output, patch.knowledge_graph);
     write_pod(output, patch.flags);
 }
@@ -219,6 +227,17 @@ StatePatch read_state_patch(std::istream& input) {
     patch.new_blobs.reserve(static_cast<std::size_t>(blob_count));
     for (uint64_t index = 0; index < blob_count; ++index) {
         patch.new_blobs.push_back(read_blob_ref(input));
+    }
+
+    const uint64_t task_record_count = read_pod<uint64_t>(input);
+    patch.task_records.reserve(static_cast<std::size_t>(task_record_count));
+    for (uint64_t index = 0; index < task_record_count; ++index) {
+        patch.task_records.push_back(TaskRecord{
+            read_pod<InternedStringId>(input),
+            read_blob_ref(input),
+            read_blob_ref(input),
+            read_pod<uint32_t>(input)
+        });
     }
 
     patch.knowledge_graph = read_knowledge_graph_patch(input);
@@ -464,6 +483,7 @@ void StateStore::reset(std::size_t initial_field_count) {
     patch_log_ = PatchLog{};
     string_interner_ = StringInterner{};
     knowledge_graph_ = KnowledgeGraphStore{};
+    task_journal_.clear();
 }
 
 void StateStore::ensure_field_capacity(std::size_t field_count) {
@@ -619,10 +639,12 @@ StateApplyResult StateStore::apply_with_summary(const StatePatch& patch) {
         knowledge_graph_ = std::move(working_graph);
     }
 
+    const bool task_journal_changed = task_journal_.apply(patch.task_records);
     result.state_changed =
         !patch.updates.empty() ||
         !patch.new_blobs.empty() ||
-        !result.knowledge_graph_delta.empty();
+        !result.knowledge_graph_delta.empty() ||
+        task_journal_changed;
     if (!result.state_changed) {
         return result;
     }
@@ -679,6 +701,14 @@ const KnowledgeGraphStore& StateStore::knowledge_graph() const noexcept {
     return knowledge_graph_;
 }
 
+TaskJournal& StateStore::task_journal() noexcept {
+    return task_journal_;
+}
+
+const TaskJournal& StateStore::task_journal() const noexcept {
+    return task_journal_;
+}
+
 StateStore::SharedBacking StateStore::shared_backing_with(const StateStore& other) const noexcept {
     return SharedBacking{
         blob_store_.shares_storage_with(other.blob_store_),
@@ -693,6 +723,7 @@ void StateStore::serialize(std::ostream& output) const {
     patch_log_.serialize(output);
     string_interner_.serialize(output);
     knowledge_graph_.serialize(output);
+    task_journal_.serialize(output);
 }
 
 StateStore StateStore::deserialize(std::istream& input) {
@@ -702,6 +733,7 @@ StateStore StateStore::deserialize(std::istream& input) {
     store.patch_log_ = PatchLog::deserialize(input);
     store.string_interner_ = StringInterner::deserialize(input);
     store.knowledge_graph_ = KnowledgeGraphStore::deserialize(input);
+    store.task_journal_ = TaskJournal::deserialize(input);
     return store;
 }
 

@@ -104,6 +104,30 @@ int main() {
     assert(store.get_current_state().version == 1U);
     assert(store.patch_log().size() == 1U);
 
+    StatePatch recorded_task_patch;
+    recorded_task_patch.task_records.push_back(TaskRecord{
+        strings.intern("effect:write-once"),
+        blobs.append_string("request::v1"),
+        blobs.append_string("outcome::ok"),
+        7U
+    });
+    const StateApplyResult recorded_task_result = store.apply_with_summary(recorded_task_patch);
+    assert(recorded_task_result.state_changed);
+    assert(store.get_current_state().version == 2U);
+    assert(store.patch_log().size() == 2U);
+    assert(store.task_journal().size() == 1U);
+    const TaskRecord* recorded_task = store.task_journal().find(strings.intern("effect:write-once"));
+    assert(recorded_task != nullptr);
+    assert(store.blobs().read_string(recorded_task->request) == "request::v1");
+    assert(store.blobs().read_string(recorded_task->output) == "outcome::ok");
+    assert(recorded_task->flags == 7U);
+
+    const StateApplyResult duplicate_recorded_task_result = store.apply_with_summary(recorded_task_patch);
+    assert(!duplicate_recorded_task_result.state_changed);
+    assert(duplicate_recorded_task_result.patch_log_offset == 2U);
+    assert(store.get_current_state().version == 2U);
+    assert(store.patch_log().size() == 2U);
+
     StateStore fork = store;
     const StateStore::SharedBacking shared_before = store.shared_backing_with(fork);
     assert(shared_before.blobs);
@@ -133,6 +157,8 @@ int main() {
     assert(fork.knowledge_graph().find_entity_by_label(fork_label) != nullptr);
     assert(store.knowledge_graph().entity_count() == 2U);
     assert(fork.knowledge_graph().entity_count() == 3U);
+    assert(store.task_journal().size() == 1U);
+    assert(fork.task_journal().size() == 1U);
 
     std::cout << "state module tests passed" << std::endl;
     return 0;

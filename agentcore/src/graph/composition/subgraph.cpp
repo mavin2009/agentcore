@@ -38,6 +38,15 @@ bool validate_subgraph_binding(const NodeDefinition& node, std::string* error_me
         return fail("subgraph node requires a stable namespace name: " + node.name);
     }
 
+    if (node.subgraph->session_mode == SubgraphSessionMode::Persistent &&
+        !node.subgraph->session_id_source_key.has_value()) {
+        return fail("persistent subgraph node requires a session id source key: " + node.name);
+    }
+    if (node.subgraph->session_mode == SubgraphSessionMode::Ephemeral &&
+        node.subgraph->session_id_source_key.has_value()) {
+        return fail("ephemeral subgraph node must not declare a session id source key: " + node.name);
+    }
+
     std::vector<StateKey> seen_child_inputs;
     for (const SubgraphStateBinding& binding : node.subgraph->input_bindings) {
         if (std::find(seen_child_inputs.begin(), seen_child_inputs.end(), binding.child_key) != seen_child_inputs.end()) {

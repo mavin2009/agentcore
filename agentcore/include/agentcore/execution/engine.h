@@ -4,6 +4,7 @@
 #include "agentcore/core/types.h"
 #include "agentcore/execution/checkpoint.h"
 #include "agentcore/execution/streaming/public_stream.h"
+#include "agentcore/execution/subgraph/session_runtime.h"
 #include "agentcore/graph/graph_ir.h"
 #include "agentcore/runtime/model_api.h"
 #include "agentcore/runtime/node_runtime.h"
@@ -11,6 +12,8 @@
 #include "agentcore/runtime/tool_api.h"
 #include "agentcore/state/state_store.h"
 #include <cstddef>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 
@@ -52,6 +55,23 @@ struct ResumeResult {
     std::string message;
 };
 
+struct InterruptResult {
+    RunId run_id{0};
+    CheckpointId checkpoint_id{0};
+    ExecutionStatus status{ExecutionStatus::NotStarted};
+    bool interrupted{false};
+    std::string message;
+};
+
+struct StateEditResult {
+    RunId run_id{0};
+    uint32_t branch_id{0};
+    CheckpointId checkpoint_id{0};
+    uint64_t state_version{0};
+    bool applied{false};
+    std::string message;
+};
+
 struct CheckpointPolicy {
     uint64_t snapshot_interval_steps{64U};
     bool snapshot_on_wait{true};
@@ -67,12 +87,18 @@ public:
     void register_graph(const GraphDefinition& graph);
     void set_checkpoint_policy(CheckpointPolicy policy) noexcept;
     [[nodiscard]] const CheckpointPolicy& checkpoint_policy() const noexcept;
+    void set_checkpointer(std::shared_ptr<CheckpointStorageBackend> storage);
     void enable_checkpoint_persistence(std::string path);
+    void enable_sqlite_checkpoint_persistence(std::string path);
     [[nodiscard]] std::size_t load_persisted_checkpoints();
     RunId start(const GraphDefinition&, const InputEnvelope&);
     StepResult step(RunId);
     RunResult run_to_completion(RunId);
     ResumeResult resume(CheckpointId);
+    ResumeResult resume_run(RunId);
+    InterruptResult interrupt(RunId);
+    StateEditResult apply_state_patch(RunId run_id, const StatePatch& patch, uint32_t branch_id = 0U);
+    [[nodiscard]] RunSnapshot inspect(RunId run_id) const;
 
     [[nodiscard]] const WorkflowState& state(RunId run_id, uint32_t branch_id = 0) const;
     [[nodiscard]] const StateStore& state_store(RunId run_id, uint32_t branch_id = 0) const;
@@ -102,6 +128,8 @@ private:
         std::optional<PendingSubgraphExecution> pending_subgraph;
         std::vector<uint32_t> join_stack;
         std::optional<NodeId> reactive_root_node_id;
+        std::string last_subgraph_session_id;
+        uint64_t last_subgraph_session_revision{0};
     };
 
     struct JoinScope {
@@ -133,6 +161,9 @@ private:
         uint32_t next_branch_id{1};
         std::unordered_map<uint32_t, JoinScope> join_scopes;
         std::unordered_map<NodeId, ReactiveFrontierState> reactive_frontiers;
+        SubgraphSessionTable committed_subgraph_sessions;
+        SubgraphSessionLeaseTable active_subgraph_session_leases;
+        std::shared_ptr<std::mutex> subgraph_session_mutex{std::make_shared<std::mutex>()};
         uint32_t next_split_id{1};
     };
 
@@ -151,7 +182,7 @@ private:
     [[nodiscard]] TaskExecutionRecord execute_task(RunRuntime& run, const ScheduledTask& task);
     [[nodiscard]] NodeResult execute_subgraph_node(
         RunId run_id,
-        const RunRuntime& run,
+        RunRuntime& run,
         const NodeDefinition& node,
         BranchRuntime& branch
     );
@@ -206,6 +237,13 @@ private:
         BranchRuntime& branch,
         std::size_t& enqueued_tasks,
         uint32_t& trace_flags
+    );
+    [[nodiscard]] bool branch_is_join_blocked(const RunRuntime& run, const BranchRuntime& branch) const noexcept;
+    void re_register_run_async_waiters(RunId run_id, const RunRuntime& run);
+    std::size_t enqueue_resumable_paused_branches(
+        RunId run_id,
+        RunRuntime& run,
+        uint32_t* trace_flags = nullptr
     );
     [[nodiscard]] const GraphDefinition* registered_graph(GraphId graph_id) const noexcept;
 

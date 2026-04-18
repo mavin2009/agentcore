@@ -9,6 +9,7 @@
 #include "agentcore/runtime/tool_api.h"
 #include "agentcore/state/state_store.h"
 #include <cstddef>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -40,16 +41,27 @@ struct TraceEvent {
     float confidence{0.0F};
     uint32_t patch_count{0};
     uint32_t flags{0};
+    std::string session_id;
+    uint64_t session_revision{0};
     std::vector<ExecutionNamespaceRef> namespace_path;
 };
 
 struct PendingSubgraphExecution {
     RunId child_run_id{0};
     std::vector<std::byte> snapshot_bytes;
+    std::string session_id;
+    uint64_t session_revision{0};
 
     [[nodiscard]] bool valid() const noexcept {
         return child_run_id != 0U && !snapshot_bytes.empty();
     }
+};
+
+struct CommittedSubgraphSessionSnapshot {
+    NodeId parent_node_id{0};
+    std::string session_id;
+    uint64_t session_revision{0};
+    std::vector<std::byte> snapshot_bytes;
 };
 
 struct BranchSnapshot {
@@ -92,6 +104,7 @@ struct RunSnapshot {
     std::vector<BranchSnapshot> branches;
     std::vector<JoinScopeSnapshot> join_scopes;
     std::vector<ReactiveFrontierSnapshot> reactive_frontiers;
+    std::vector<CommittedSubgraphSessionSnapshot> committed_subgraph_sessions;
     std::vector<ScheduledTask> pending_tasks;
     uint32_t next_branch_id{1};
     uint32_t next_split_id{1};
@@ -112,6 +125,19 @@ struct CheckpointRecord {
     }
 };
 
+class CheckpointStorageBackend {
+public:
+    virtual ~CheckpointStorageBackend() = default;
+
+    virtual void replace_all(const std::vector<CheckpointRecord>& records) = 0;
+    [[nodiscard]] virtual std::vector<CheckpointRecord> load_all() const = 0;
+    [[nodiscard]] virtual std::string kind() const = 0;
+    [[nodiscard]] virtual const std::string& location() const noexcept = 0;
+};
+
+[[nodiscard]] std::shared_ptr<CheckpointStorageBackend> make_file_checkpoint_storage(std::string path);
+[[nodiscard]] std::shared_ptr<CheckpointStorageBackend> make_sqlite_checkpoint_storage(std::string path);
+
 class CheckpointManager {
 public:
     CheckpointId append(const Checkpoint& checkpoint, std::optional<RunSnapshot> snapshot);
@@ -124,9 +150,12 @@ public:
         RunId run_id,
         CheckpointId at_or_before
     ) const;
+    void set_storage(std::shared_ptr<CheckpointStorageBackend> storage);
     void enable_persistence(std::string path);
+    void enable_sqlite_persistence(std::string path);
     [[nodiscard]] bool persistence_enabled() const noexcept;
     [[nodiscard]] const std::string& persistence_path() const noexcept;
+    [[nodiscard]] std::string storage_kind() const;
     [[nodiscard]] std::size_t load_persisted_records();
 
 private:
@@ -134,6 +163,7 @@ private:
 
     mutable std::mutex mutex_;
     std::vector<CheckpointRecord> records_;
+    std::shared_ptr<CheckpointStorageBackend> storage_;
     std::string persistence_path_;
 };
 

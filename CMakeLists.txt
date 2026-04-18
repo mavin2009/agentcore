@@ -15,11 +15,23 @@ find_package(Threads REQUIRED)
 option(AGENTCORE_BUILD_EXAMPLES "Build agentcore example executables." ON)
 option(AGENTCORE_BUILD_BENCHMARKS "Build agentcore benchmark executables." ON)
 option(AGENTCORE_BUILD_PYTHON_BINDINGS "Build the CPython bindings for the agentcore graph API." ON)
+option(AGENTCORE_ENABLE_SQLITE_CHECKPOINTS "Enable SQLite-backed checkpoint storage." ON)
+
+set(AGENTCORE_HAVE_SQLITE3 OFF)
+if(AGENTCORE_ENABLE_SQLITE_CHECKPOINTS)
+    find_package(SQLite3 QUIET)
+    if(SQLite3_FOUND)
+        set(AGENTCORE_HAVE_SQLITE3 ON)
+    else()
+        message(STATUS "SQLite3 not found; SQLite checkpoint backend disabled.")
+    endif()
+endif()
 
 set(AGENTCORE_EXECUTION_SOURCES
     agentcore/src/execution/checkpoint.cpp
     agentcore/src/execution/engine.cpp
     agentcore/src/execution/proof.cpp
+    agentcore/src/execution/subgraph/session_runtime.cpp
     agentcore/src/execution/subgraph/subgraph_runtime.cpp
     agentcore/src/execution/streaming/public_stream.cpp
     agentcore/src/execution/trace.cpp
@@ -38,6 +50,7 @@ set(AGENTCORE_RUNTIME_SOURCES
 )
 
 set(AGENTCORE_STATE_SOURCES
+    agentcore/src/state/journal/task_journal.cpp
     agentcore/src/state/knowledge_graph.cpp
     agentcore/src/state/state_store.cpp
 )
@@ -100,6 +113,10 @@ agentcore_source_group(agentcore_runtime)
 add_library(agentcore_execution STATIC ${AGENTCORE_EXECUTION_SOURCES})
 set_target_properties(agentcore_execution PROPERTIES EXPORT_NAME execution)
 target_link_libraries(agentcore_execution PUBLIC agentcore_graph agentcore_runtime agentcore_state)
+if(AGENTCORE_HAVE_SQLITE3)
+    target_link_libraries(agentcore_execution PUBLIC SQLite::SQLite3)
+    target_compile_definitions(agentcore_execution PUBLIC AGENTCORE_HAVE_SQLITE3=1)
+endif()
 agentcore_configure_target(agentcore_execution)
 agentcore_source_group(agentcore_execution)
 
@@ -148,6 +165,15 @@ endif()
 if(AGENTCORE_BUILD_BENCHMARKS)
     add_executable(agentcore_runtime_benchmark agentcore/benchmarks/runtime_benchmark.cpp)
     target_link_libraries(agentcore_runtime_benchmark PRIVATE agentcore::agentcore)
+    add_executable(
+        agentcore_persistent_subgraph_session_benchmark
+        agentcore/benchmarks/persistent_subgraph_session_benchmark.cpp
+    )
+    target_link_libraries(
+        agentcore_persistent_subgraph_session_benchmark
+        PRIVATE
+            agentcore::agentcore
+    )
 endif()
 
 if(AGENTCORE_BUILD_PYTHON_BINDINGS)
@@ -236,6 +262,10 @@ if(BUILD_TESTING)
     add_executable(agentcore_runtime_tests agentcore/tests/runtime_tests.cpp)
     target_link_libraries(agentcore_runtime_tests PRIVATE agentcore::agentcore)
     add_test(NAME agentcore_runtime_tests COMMAND agentcore_runtime_tests)
+
+    add_executable(agentcore_subgraph_session_tests agentcore/tests/subgraph_session_tests.cpp)
+    target_link_libraries(agentcore_subgraph_session_tests PRIVATE agentcore::agentcore)
+    add_test(NAME agentcore_subgraph_session_tests COMMAND agentcore_subgraph_session_tests)
 
     if(TARGET runtime_proof_suite)
         add_test(NAME runtime_proof_suite COMMAND runtime_proof_suite)

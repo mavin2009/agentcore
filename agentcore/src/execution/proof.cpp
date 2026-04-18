@@ -96,6 +96,11 @@ void hash_graph(Fnv1a64& hasher, const GraphDefinition& graph) {
             }
             hasher.update_pod(node.subgraph->propagate_knowledge_graph);
             hasher.update_pod(node.subgraph->initial_field_count);
+            hasher.update_pod(static_cast<uint8_t>(node.subgraph->session_mode));
+            hasher.update_pod(node.subgraph->session_id_source_key.has_value());
+            if (node.subgraph->session_id_source_key.has_value()) {
+                hasher.update_pod(*node.subgraph->session_id_source_key);
+            }
         }
     }
 
@@ -157,6 +162,8 @@ void hash_pending_subgraph(
             pending_subgraph->snapshot_bytes.size()
         );
     }
+    hasher.update_string(pending_subgraph->session_id);
+    hasher.update_pod(pending_subgraph->session_revision);
 }
 
 void hash_tool_snapshot(Fnv1a64& hasher, const std::optional<AsyncToolSnapshot>& snapshot) {
@@ -298,6 +305,20 @@ uint64_t compute_snapshot_digest(const RunSnapshot& snapshot) {
         }
     }
 
+    const uint64_t committed_session_count =
+        static_cast<uint64_t>(snapshot.committed_subgraph_sessions.size());
+    hasher.update_pod(committed_session_count);
+    for (const CommittedSubgraphSessionSnapshot& session : snapshot.committed_subgraph_sessions) {
+        hasher.update_pod(session.parent_node_id);
+        hasher.update_string(session.session_id);
+        hasher.update_pod(session.session_revision);
+        const uint64_t snapshot_size = static_cast<uint64_t>(session.snapshot_bytes.size());
+        hasher.update_pod(snapshot_size);
+        if (!session.snapshot_bytes.empty()) {
+            hasher.update_bytes(session.snapshot_bytes.data(), session.snapshot_bytes.size());
+        }
+    }
+
     const uint64_t task_count = static_cast<uint64_t>(snapshot.pending_tasks.size());
     hasher.update_pod(task_count);
     for (const ScheduledTask& task : snapshot.pending_tasks) {
@@ -324,11 +345,15 @@ uint64_t compute_trace_digest(const std::vector<TraceEvent>& trace_events) {
         hasher.update_pod(event.confidence);
         hasher.update_pod(event.patch_count);
         hasher.update_pod(event.flags);
+        hasher.update_string(event.session_id);
+        hasher.update_pod(event.session_revision);
         const uint64_t namespace_count = static_cast<uint64_t>(event.namespace_path.size());
         hasher.update_pod(namespace_count);
         for (const ExecutionNamespaceRef& namespace_ref : event.namespace_path) {
             hasher.update_pod(namespace_ref.graph_id);
             hasher.update_pod(namespace_ref.node_id);
+            hasher.update_string(namespace_ref.session_id);
+            hasher.update_pod(namespace_ref.session_revision);
         }
     }
     return hasher.value();

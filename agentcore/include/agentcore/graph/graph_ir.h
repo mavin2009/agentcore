@@ -100,6 +100,11 @@ struct SubgraphStateBinding {
     StateKey child_key{0};
 };
 
+enum class SubgraphSessionMode : uint8_t {
+    Ephemeral,
+    Persistent
+};
+
 struct SubgraphBinding {
     GraphId graph_id{0};
     std::string namespace_name;
@@ -107,9 +112,17 @@ struct SubgraphBinding {
     std::vector<SubgraphStateBinding> output_bindings;
     bool propagate_knowledge_graph{false};
     uint32_t initial_field_count{0};
+    SubgraphSessionMode session_mode{SubgraphSessionMode::Ephemeral};
+    std::optional<StateKey> session_id_source_key;
 
     [[nodiscard]] bool valid() const noexcept {
-        return graph_id != 0U;
+        if (graph_id == 0U) {
+            return false;
+        }
+        if (session_mode == SubgraphSessionMode::Persistent) {
+            return session_id_source_key.has_value();
+        }
+        return !session_id_source_key.has_value();
     }
 };
 

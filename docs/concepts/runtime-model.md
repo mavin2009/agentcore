@@ -38,6 +38,8 @@ Nodes do not mutate global workflow state directly. They return a `NodeResult` c
 
 The engine applies that patch at a single commit point. That is what makes trace emission, replay, and checkpoint generation line up cleanly with state mutation.
 
+There is one deliberate operational exception at the node boundary: recorded synchronous effects. A node can ask `ExecutionContext` to run a keyed effect once and persist its outcome. The node still returns an ordinary `NodeResult`, but the effect record is committed by the engine together with the step. That keeps external once-only work inside the same checkpoint and proof model as patch application instead of scattering replay logic across node bodies.
+
 ## Hot State And Blob State
 
 The state layer intentionally separates:
@@ -45,6 +47,7 @@ The state layer intentionally separates:
 - small indexed fields in `WorkflowState`
 - larger payloads in `BlobStore`
 - knowledge-graph state in `KnowledgeGraphStore`
+- recorded synchronous outcomes in `TaskJournal`
 
 This keeps the hot execution path focused on compact control state while still allowing prompts, model outputs, tool payloads, and serialized artifacts to move through the runtime.
 
@@ -89,10 +92,48 @@ Important properties of subgraphs in the current implementation:
 
 - parent-to-child field mappings are explicit through input/output bindings
 - child stream events carry namespace frames so parent and child paths can be distinguished
+- subgraph events and namespace frames carry `session_id` and `session_revision` when a persistent session is in use
 - Python config is propagated into child runs
 - nested subgraphs work as long as the propagated config remains pickle-serializable
 
 That behavior is covered by [`../../python/tests/agent_workflows_smoke.py`](../../python/tests/agent_workflows_smoke.py) and implemented through the subgraph runtime and Python binding seam.
+
+### Persistent Session Lifecycle
+
+Subgraphs support two session modes:
+
+- ephemeral: each invocation gets a fresh child snapshot
+- persistent: a child snapshot is stored and reused by `(subgraph node, session_id)`
+
+For persistent sessions, the lifecycle is:
+
+1. resolve `session_id` from the parent state field configured by `session_id_from`
+2. normalize that value to a canonical string key
+3. restore the last committed child snapshot for that session, or create a fresh child snapshot if none exists
+4. overlay current input bindings onto the child state before execution
+5. run the child graph from its entrypoint
+6. on successful child completion, commit the full child snapshot back into the parent-managed session table
+7. apply declared output bindings from the committed child snapshot back into parent state
+
+Two rules are intentionally strict:
+
+- concurrent reuse of the same `(subgraph node, session_id)` within one run is rejected rather than merged
+- child session snapshots only commit on successful completion; failure, cancellation, and waiting leave the last committed snapshot unchanged
+
+This is why persistent sessions are implemented as isolated child snapshots rather than shared mutable subgraph state. The engine gets deterministic restore/commit behavior, and replay can validate the same committed child revisions after restart.
+
+Checkpoint snapshots persist both pending subgraph work and the committed child-session table, including `session_id` and `session_revision`, so cold restore and in-memory resume follow the same lifecycle.
+
+### Knowledge-Graph Propagation In Subgraphs
+
+Knowledge-graph propagation is explicit:
+
+- ephemeral subgraphs get a per-invocation fork when `propagate_knowledge_graph=True`
+- persistent sessions seed their child-local knowledge graph only when the session is first created
+- later persistent invocations reuse the committed child-local knowledge graph
+- parent and child knowledge graphs do not automatically merge outside explicit state/output bindings
+
+That separation matters for graph-aware workflows because it prevents hidden cross-session mutation. A child session can maintain its own reactive frontier and graph-local memory without silently mutating the parent graph state.
 
 ## Knowledge-Graph State
 
@@ -115,6 +156,23 @@ The runtime records three related but distinct artifacts:
 - proof digests for verifying snapshot and trace sequences
 
 Public stream events are derived from runtime trace data rather than maintained as a second unrelated event pipeline. That keeps the observable surface aligned with the execution record.
+
+Checkpoint persistence is now behind a storage backend seam. The runtime currently supports:
+
+- binary file-backed checkpoint storage
+- SQLite-backed checkpoint storage when SQLite support is enabled at build time
+
+Because `TaskJournal` is serialized as part of the state layer, a restored run can reuse previously committed synchronous outcomes without re-executing the underlying side effect. The runtime tests validate both the success path and the failure path where a resumed node presents a different request for the same recorded-effect key.
+
+Persistent child sessions inherit that same rule. Each committed child snapshot carries its own task journal state, so a resumed persistent session can replay previously committed once-only work while still rejecting mismatched requests for the same recorded-effect key.
+
+On top of that persistence layer, the engine exposes an explicit operational flow for intentional intervention:
+
+- `interrupt(run_id)` pauses a live run and captures a resumable snapshot
+- `inspect(run_id)` returns the current `RunSnapshot`
+- `apply_state_patch(...)` mutates paused state through the same patch model used by nodes
+- `resume_run(run_id)` resumes an already-paused in-memory run
+- `resume(checkpoint_id)` restores from persisted checkpoint state
 
 ## What The Engine Does Not Do
 

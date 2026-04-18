@@ -335,6 +335,8 @@ PyObject* py_add_subgraph_node(PyObject*, PyObject* args, PyObject* kwargs) {
     PyObject* input_bindings_object = Py_None;
     PyObject* output_bindings_object = Py_None;
     int propagate_knowledge_graph = 0;
+    PyObject* session_mode_object = Py_None;
+    PyObject* session_id_from_object = Py_None;
     static const char* keywords[] = {
         "graph",
         "name",
@@ -343,12 +345,14 @@ PyObject* py_add_subgraph_node(PyObject*, PyObject* args, PyObject* kwargs) {
         "input_bindings",
         "output_bindings",
         "propagate_knowledge_graph",
+        "session_mode",
+        "session_id_from",
         nullptr
     };
     if (!PyArg_ParseTupleAndKeywords(
             args,
             kwargs,
-            "OsO|OOOp",
+            "OsO|OOOpOO",
             const_cast<char**>(keywords),
             &capsule,
             &name,
@@ -356,7 +360,9 @@ PyObject* py_add_subgraph_node(PyObject*, PyObject* args, PyObject* kwargs) {
             &namespace_object,
             &input_bindings_object,
             &output_bindings_object,
-            &propagate_knowledge_graph
+            &propagate_knowledge_graph,
+            &session_mode_object,
+            &session_id_from_object
         )) {
         return nullptr;
     }
@@ -389,6 +395,23 @@ PyObject* py_add_subgraph_node(PyObject*, PyObject* args, PyObject* kwargs) {
         return nullptr;
     }
 
+    std::string session_mode = "ephemeral";
+    if (!parse_optional_python_string(session_mode_object, &session_mode, &error_message)) {
+        PyErr_SetString(PyExc_ValueError, error_message.c_str());
+        return nullptr;
+    }
+    if (session_mode.empty()) {
+        session_mode = "ephemeral";
+    }
+
+    std::string session_id_from;
+    if (!parse_optional_python_string(session_id_from_object, &session_id_from, &error_message)) {
+        PyErr_SetString(PyExc_ValueError, error_message.c_str());
+        return nullptr;
+    }
+    const std::optional<std::string> session_id_source_name =
+        session_id_from.empty() ? std::nullopt : std::optional<std::string>{session_id_from};
+
     if (!handle->add_subgraph_node(
             name,
             subgraph_handle,
@@ -396,6 +419,8 @@ PyObject* py_add_subgraph_node(PyObject*, PyObject* args, PyObject* kwargs) {
             input_bindings,
             output_bindings,
             propagate_knowledge_graph != 0,
+            session_mode,
+            session_id_source_name,
             &error_message
         )) {
         PyErr_SetString(PyExc_ValueError, error_message.c_str());
@@ -558,6 +583,81 @@ PyObject* py_invoke_with_details(PyObject*, PyObject* args, PyObject* kwargs) {
     return output_details;
 }
 
+PyObject* py_invoke_until_pause_with_details(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* capsule = nullptr;
+    PyObject* input_state = Py_None;
+    PyObject* config = Py_None;
+    int include_subgraphs = 1;
+    static const char* keywords[] = {"graph", "input_state", "config", "include_subgraphs", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "O|OOp",
+            const_cast<char**>(keywords),
+            &capsule,
+            &input_state,
+            &config,
+            &include_subgraphs
+        )) {
+        return nullptr;
+    }
+
+    GraphHandle* handle = require_graph_handle(capsule);
+    if (handle == nullptr) {
+        return nullptr;
+    }
+
+    PyObject* output_details = nullptr;
+    std::string error_message;
+    if (!handle->invoke_until_pause_with_details(
+            input_state,
+            config,
+            include_subgraphs != 0,
+            &output_details,
+            &error_message
+        )) {
+        PyErr_SetString(PyExc_RuntimeError, error_message.c_str());
+        return nullptr;
+    }
+    return output_details;
+}
+
+PyObject* py_resume_with_details(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* capsule = nullptr;
+    unsigned long long checkpoint_id = 0U;
+    int include_subgraphs = 1;
+    static const char* keywords[] = {"graph", "checkpoint_id", "include_subgraphs", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "OK|p",
+            const_cast<char**>(keywords),
+            &capsule,
+            &checkpoint_id,
+            &include_subgraphs
+        )) {
+        return nullptr;
+    }
+
+    GraphHandle* handle = require_graph_handle(capsule);
+    if (handle == nullptr) {
+        return nullptr;
+    }
+
+    PyObject* output_details = nullptr;
+    std::string error_message;
+    if (!handle->resume_with_details(
+            static_cast<CheckpointId>(checkpoint_id),
+            include_subgraphs != 0,
+            &output_details,
+            &error_message
+        )) {
+        PyErr_SetString(PyExc_RuntimeError, error_message.c_str());
+        return nullptr;
+    }
+    return output_details;
+}
+
 PyObject* py_stream(PyObject*, PyObject* args, PyObject* kwargs) {
     PyObject* capsule = nullptr;
     PyObject* input_state = Py_None;
@@ -589,6 +689,36 @@ PyObject* py_stream(PyObject*, PyObject* args, PyObject* kwargs) {
         return nullptr;
     }
     return output_events;
+}
+
+PyObject* py_runtime_record_once(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* runtime = nullptr;
+    const char* key = nullptr;
+    PyObject* request = Py_None;
+    PyObject* producer = nullptr;
+    static const char* keywords[] = {"runtime", "key", "request", "producer", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "OsOO",
+            const_cast<char**>(keywords),
+            &runtime,
+            &key,
+            &request,
+            &producer
+        )) {
+        return nullptr;
+    }
+
+    std::string error_message;
+    PyObject* result = runtime_record_once(runtime, key, request, producer, &error_message);
+    if (result == nullptr) {
+        if (PyErr_Occurred() == nullptr) {
+            PyErr_SetString(PyExc_RuntimeError, error_message.c_str());
+        }
+        return nullptr;
+    }
+    return result;
 }
 
 PyMethodDef kModuleMethods[] = {
@@ -641,10 +771,28 @@ PyMethodDef kModuleMethods[] = {
         "Run the native graph and return validation metadata."
     },
     {
+        "_invoke_until_pause_with_details",
+        reinterpret_cast<PyCFunction>(py_invoke_until_pause_with_details),
+        METH_VARARGS | METH_KEYWORDS,
+        "Run the native graph until completion or pause and return validation metadata."
+    },
+    {
+        "_resume_with_details",
+        reinterpret_cast<PyCFunction>(py_resume_with_details),
+        METH_VARARGS | METH_KEYWORDS,
+        "Resume a paused native graph checkpoint and return validation metadata."
+    },
+    {
         "_stream",
         reinterpret_cast<PyCFunction>(py_stream),
         METH_VARARGS | METH_KEYWORDS,
         "Run the native graph and return public stream events."
+    },
+    {
+        "_runtime_record_once",
+        reinterpret_cast<PyCFunction>(py_runtime_record_once),
+        METH_VARARGS | METH_KEYWORDS,
+        "Record a once-only synchronous effect for the active Python node callback."
     },
     {nullptr, nullptr, 0, nullptr}
 };
@@ -670,6 +818,10 @@ PyMODINIT_FUNC PyInit__agentcore_native(void) {
     }
 
     if (PyModule_AddStringConstant(module, "_INTERNAL_END_NODE_NAME", kInternalEndNodeName) != 0) {
+        Py_DECREF(module);
+        return nullptr;
+    }
+    if (PyModule_AddStringConstant(module, "_INTERNAL_RUNTIME_CONFIG_KEY", kPythonRuntimeConfigKey) != 0) {
         Py_DECREF(module);
         return nullptr;
     }

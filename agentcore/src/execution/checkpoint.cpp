@@ -5,16 +5,21 @@
 #include <cstdio>
 #include <fstream>
 #include <istream>
+#include <memory>
 #include <ostream>
 #include <sstream>
 #include <stdexcept>
+
+#if defined(AGENTCORE_HAVE_SQLITE3)
+#include <sqlite3.h>
+#endif
 
 namespace agentcore {
 
 namespace {
 
 constexpr uint64_t kCheckpointMagic = 0x41474350434B5054ULL;
-constexpr uint32_t kCheckpointVersion = 9U;
+constexpr uint32_t kCheckpointVersion = 10U;
 
 template <typename T>
 void write_pod(std::ostream& output, const T& value) {
@@ -156,6 +161,8 @@ void write_pending_subgraph(
 
     write_pod(output, pending_subgraph->child_run_id);
     write_bytes(output, pending_subgraph->snapshot_bytes);
+    write_string(output, pending_subgraph->session_id);
+    write_pod(output, pending_subgraph->session_revision);
 }
 
 std::optional<PendingSubgraphExecution> read_pending_subgraph(std::istream& input) {
@@ -166,6 +173,8 @@ std::optional<PendingSubgraphExecution> read_pending_subgraph(std::istream& inpu
     PendingSubgraphExecution pending_subgraph;
     pending_subgraph.child_run_id = read_pod<RunId>(input);
     pending_subgraph.snapshot_bytes = read_bytes(input);
+    pending_subgraph.session_id = read_string(input);
+    pending_subgraph.session_revision = read_pod<uint64_t>(input);
     return pending_subgraph;
 }
 
@@ -391,6 +400,11 @@ void write_graph(std::ostream& output, const GraphDefinition& graph) {
             }
             write_pod(output, node.subgraph->propagate_knowledge_graph);
             write_pod(output, node.subgraph->initial_field_count);
+            write_pod(output, static_cast<uint8_t>(node.subgraph->session_mode));
+            write_pod(output, node.subgraph->session_id_source_key.has_value());
+            if (node.subgraph->session_id_source_key.has_value()) {
+                write_pod(output, *node.subgraph->session_id_source_key);
+            }
         }
     }
 
@@ -473,6 +487,10 @@ GraphDefinition read_graph(std::istream& input) {
             }
             subgraph.propagate_knowledge_graph = read_pod<bool>(input);
             subgraph.initial_field_count = read_pod<uint32_t>(input);
+            subgraph.session_mode = static_cast<SubgraphSessionMode>(read_pod<uint8_t>(input));
+            if (read_pod<bool>(input)) {
+                subgraph.session_id_source_key = read_pod<StateKey>(input);
+            }
             graph.nodes.back().subgraph = std::move(subgraph);
         }
     }
@@ -603,6 +621,25 @@ ReactiveFrontierSnapshot read_reactive_frontier_snapshot(std::istream& input) {
     return frontier;
 }
 
+void write_committed_subgraph_session_snapshot(
+    std::ostream& output,
+    const CommittedSubgraphSessionSnapshot& session
+) {
+    write_pod(output, session.parent_node_id);
+    write_string(output, session.session_id);
+    write_pod(output, session.session_revision);
+    write_bytes(output, session.snapshot_bytes);
+}
+
+CommittedSubgraphSessionSnapshot read_committed_subgraph_session_snapshot(std::istream& input) {
+    CommittedSubgraphSessionSnapshot session;
+    session.parent_node_id = read_pod<NodeId>(input);
+    session.session_id = read_string(input);
+    session.session_revision = read_pod<uint64_t>(input);
+    session.snapshot_bytes = read_bytes(input);
+    return session;
+}
+
 void write_run_snapshot(std::ostream& output, const RunSnapshot& snapshot) {
     write_graph(output, snapshot.graph);
     write_pod(output, static_cast<uint8_t>(snapshot.status));
@@ -621,6 +658,11 @@ void write_run_snapshot(std::ostream& output, const RunSnapshot& snapshot) {
     write_pod<uint64_t>(output, static_cast<uint64_t>(snapshot.reactive_frontiers.size()));
     for (const ReactiveFrontierSnapshot& frontier : snapshot.reactive_frontiers) {
         write_reactive_frontier_snapshot(output, frontier);
+    }
+
+    write_pod<uint64_t>(output, static_cast<uint64_t>(snapshot.committed_subgraph_sessions.size()));
+    for (const CommittedSubgraphSessionSnapshot& session : snapshot.committed_subgraph_sessions) {
+        write_committed_subgraph_session_snapshot(output, session);
     }
 
     write_pod<uint64_t>(output, static_cast<uint64_t>(snapshot.pending_tasks.size()));
@@ -654,6 +696,12 @@ RunSnapshot read_run_snapshot(std::istream& input) {
     snapshot.reactive_frontiers.reserve(static_cast<std::size_t>(frontier_count));
     for (uint64_t index = 0; index < frontier_count; ++index) {
         snapshot.reactive_frontiers.push_back(read_reactive_frontier_snapshot(input));
+    }
+
+    const uint64_t session_count = read_pod<uint64_t>(input);
+    snapshot.committed_subgraph_sessions.reserve(static_cast<std::size_t>(session_count));
+    for (uint64_t index = 0; index < session_count; ++index) {
+        snapshot.committed_subgraph_sessions.push_back(read_committed_subgraph_session_snapshot(input));
     }
 
     const uint64_t task_count = read_pod<uint64_t>(input);
@@ -691,6 +739,287 @@ CheckpointRecord read_checkpoint_record(std::istream& input) {
     return record;
 }
 
+std::vector<std::byte> serialize_checkpoint_records_bytes(const std::vector<CheckpointRecord>& records) {
+    std::ostringstream output;
+    write_pod<uint64_t>(output, kCheckpointMagic);
+    write_pod<uint32_t>(output, kCheckpointVersion);
+    write_pod<uint64_t>(output, static_cast<uint64_t>(records.size()));
+    for (const CheckpointRecord& record : records) {
+        write_checkpoint_record(output, record);
+    }
+
+    const std::string serialized = output.str();
+    std::vector<std::byte> bytes(serialized.size());
+    if (!serialized.empty()) {
+        std::memcpy(bytes.data(), serialized.data(), serialized.size());
+    }
+    return bytes;
+}
+
+std::vector<CheckpointRecord> deserialize_checkpoint_records_bytes(const std::vector<std::byte>& bytes) {
+    std::string serialized(bytes.size(), '\0');
+    if (!bytes.empty()) {
+        std::memcpy(serialized.data(), bytes.data(), bytes.size());
+    }
+
+    std::istringstream input(serialized);
+    const uint64_t magic = read_pod<uint64_t>(input);
+    const uint32_t version = read_pod<uint32_t>(input);
+    if (magic != kCheckpointMagic || version != kCheckpointVersion) {
+        throw std::runtime_error("unsupported checkpoint persistence format");
+    }
+
+    const uint64_t record_count = read_pod<uint64_t>(input);
+    std::vector<CheckpointRecord> records;
+    records.reserve(static_cast<std::size_t>(record_count));
+    for (uint64_t index = 0; index < record_count; ++index) {
+        records.push_back(read_checkpoint_record(input));
+    }
+    return records;
+}
+
+class FileCheckpointStorageBackend final : public CheckpointStorageBackend {
+public:
+    explicit FileCheckpointStorageBackend(std::string path) : path_(std::move(path)) {}
+
+    void replace_all(const std::vector<CheckpointRecord>& records) override {
+        if (path_.empty()) {
+            return;
+        }
+
+        const std::vector<std::byte> bytes = serialize_checkpoint_records_bytes(records);
+        const std::string temp_path = path_ + ".tmp";
+        std::ofstream output(temp_path, std::ios::binary | std::ios::trunc);
+        if (!output) {
+            throw std::runtime_error("failed to open checkpoint temp file");
+        }
+
+        if (!bytes.empty()) {
+            output.write(
+                reinterpret_cast<const char*>(bytes.data()),
+                static_cast<std::streamsize>(bytes.size())
+            );
+        }
+        output.flush();
+        if (!output) {
+            throw std::runtime_error("failed to flush checkpoint temp file");
+        }
+        output.close();
+
+        std::remove(path_.c_str());
+        if (std::rename(temp_path.c_str(), path_.c_str()) != 0) {
+            throw std::runtime_error("failed to install checkpoint persistence file");
+        }
+    }
+
+    [[nodiscard]] std::vector<CheckpointRecord> load_all() const override {
+        if (path_.empty()) {
+            return {};
+        }
+
+        std::ifstream input(path_, std::ios::binary);
+        if (!input) {
+            return {};
+        }
+
+        const std::string serialized{
+            std::istreambuf_iterator<char>(input),
+            std::istreambuf_iterator<char>()
+        };
+        std::vector<std::byte> bytes(serialized.size());
+        if (!serialized.empty()) {
+            std::memcpy(bytes.data(), serialized.data(), serialized.size());
+        }
+        return deserialize_checkpoint_records_bytes(bytes);
+    }
+
+    [[nodiscard]] std::string kind() const override {
+        return "file";
+    }
+
+    [[nodiscard]] const std::string& location() const noexcept override {
+        return path_;
+    }
+
+private:
+    std::string path_;
+};
+
+#if defined(AGENTCORE_HAVE_SQLITE3)
+class SqliteStatement final {
+public:
+    SqliteStatement(sqlite3* db, const char* sql) {
+        if (sqlite3_prepare_v2(db, sql, -1, &statement_, nullptr) != SQLITE_OK) {
+            throw std::runtime_error(sqlite3_errmsg(db));
+        }
+    }
+
+    ~SqliteStatement() {
+        if (statement_ != nullptr) {
+            sqlite3_finalize(statement_);
+        }
+    }
+
+    SqliteStatement(const SqliteStatement&) = delete;
+    auto operator=(const SqliteStatement&) -> SqliteStatement& = delete;
+
+    [[nodiscard]] sqlite3_stmt* get() const noexcept { return statement_; }
+
+private:
+    sqlite3_stmt* statement_{nullptr};
+};
+
+class SqliteDatabase final {
+public:
+    explicit SqliteDatabase(const std::string& path) {
+        if (sqlite3_open(path.c_str(), &db_) != SQLITE_OK) {
+            std::string message = db_ == nullptr ? "failed to open sqlite database" : sqlite3_errmsg(db_);
+            if (db_ != nullptr) {
+                sqlite3_close(db_);
+                db_ = nullptr;
+            }
+            throw std::runtime_error(message);
+        }
+        execute("PRAGMA journal_mode=WAL;");
+        execute("PRAGMA synchronous=FULL;");
+        execute(
+            "CREATE TABLE IF NOT EXISTS checkpoint_records ("
+            " checkpoint_id INTEGER PRIMARY KEY,"
+            " run_id INTEGER NOT NULL,"
+            " payload_kind INTEGER NOT NULL,"
+            " record_blob BLOB NOT NULL"
+            ");"
+        );
+        execute(
+            "CREATE INDEX IF NOT EXISTS idx_checkpoint_records_run_id"
+            " ON checkpoint_records(run_id, checkpoint_id);"
+        );
+    }
+
+    ~SqliteDatabase() {
+        if (db_ != nullptr) {
+            sqlite3_close(db_);
+        }
+    }
+
+    SqliteDatabase(const SqliteDatabase&) = delete;
+    auto operator=(const SqliteDatabase&) -> SqliteDatabase& = delete;
+
+    [[nodiscard]] sqlite3* get() const noexcept { return db_; }
+
+    void execute(const char* sql) {
+        char* error = nullptr;
+        if (sqlite3_exec(db_, sql, nullptr, nullptr, &error) != SQLITE_OK) {
+            const std::string message = error == nullptr ? sqlite3_errmsg(db_) : error;
+            sqlite3_free(error);
+            throw std::runtime_error(message);
+        }
+    }
+
+private:
+    sqlite3* db_{nullptr};
+};
+
+class SqliteCheckpointStorageBackend final : public CheckpointStorageBackend {
+public:
+    explicit SqliteCheckpointStorageBackend(std::string path) : path_(std::move(path)) {}
+
+    void replace_all(const std::vector<CheckpointRecord>& records) override {
+        if (path_.empty()) {
+            return;
+        }
+
+        SqliteDatabase database(path_);
+        database.execute("BEGIN IMMEDIATE TRANSACTION;");
+        try {
+            database.execute("DELETE FROM checkpoint_records;");
+            SqliteStatement insert(
+                database.get(),
+                "INSERT INTO checkpoint_records"
+                " (checkpoint_id, run_id, payload_kind, record_blob)"
+                " VALUES (?1, ?2, ?3, ?4);"
+            );
+
+            for (const CheckpointRecord& record : records) {
+                const std::vector<std::byte> record_bytes =
+                    serialize_checkpoint_records_bytes(std::vector<CheckpointRecord>{record});
+                sqlite3_reset(insert.get());
+                sqlite3_clear_bindings(insert.get());
+                if (sqlite3_bind_int64(insert.get(), 1, static_cast<sqlite3_int64>(record.checkpoint.checkpoint_id)) != SQLITE_OK ||
+                    sqlite3_bind_int64(insert.get(), 2, static_cast<sqlite3_int64>(record.checkpoint.run_id)) != SQLITE_OK ||
+                    sqlite3_bind_int(insert.get(), 3, static_cast<int>(record.payload_kind)) != SQLITE_OK ||
+                    sqlite3_bind_blob(
+                        insert.get(),
+                        4,
+                        record_bytes.data(),
+                        static_cast<int>(record_bytes.size()),
+                        SQLITE_TRANSIENT
+                    ) != SQLITE_OK) {
+                    throw std::runtime_error(sqlite3_errmsg(database.get()));
+                }
+                if (sqlite3_step(insert.get()) != SQLITE_DONE) {
+                    throw std::runtime_error(sqlite3_errmsg(database.get()));
+                }
+            }
+            database.execute("COMMIT;");
+        } catch (...) {
+            try {
+                database.execute("ROLLBACK;");
+            } catch (...) {
+            }
+            throw;
+        }
+    }
+
+    [[nodiscard]] std::vector<CheckpointRecord> load_all() const override {
+        if (path_.empty()) {
+            return {};
+        }
+
+        SqliteDatabase database(path_);
+        SqliteStatement query(
+            database.get(),
+            "SELECT record_blob FROM checkpoint_records ORDER BY checkpoint_id ASC;"
+        );
+
+        std::vector<CheckpointRecord> records;
+        while (true) {
+            const int step = sqlite3_step(query.get());
+            if (step == SQLITE_DONE) {
+                break;
+            }
+            if (step != SQLITE_ROW) {
+                throw std::runtime_error(sqlite3_errmsg(database.get()));
+            }
+
+            const void* blob = sqlite3_column_blob(query.get(), 0);
+            const int size = sqlite3_column_bytes(query.get(), 0);
+            std::vector<std::byte> bytes(static_cast<std::size_t>(size));
+            if (size > 0 && blob != nullptr) {
+                std::memcpy(bytes.data(), blob, static_cast<std::size_t>(size));
+            }
+            std::vector<CheckpointRecord> decoded = deserialize_checkpoint_records_bytes(bytes);
+            if (decoded.size() != 1U) {
+                throw std::runtime_error("sqlite checkpoint row did not decode to exactly one record");
+            }
+            records.push_back(std::move(decoded.front()));
+        }
+        return records;
+    }
+
+    [[nodiscard]] std::string kind() const override {
+        return "sqlite";
+    }
+
+    [[nodiscard]] const std::string& location() const noexcept override {
+        return path_;
+    }
+
+private:
+    std::string path_;
+};
+#endif
+
 } // namespace
 
 std::vector<std::byte> serialize_run_snapshot_bytes(const RunSnapshot& snapshot) {
@@ -711,6 +1040,19 @@ RunSnapshot deserialize_run_snapshot_bytes(const std::vector<std::byte>& bytes) 
     }
     std::istringstream input(serialized);
     return read_run_snapshot(input);
+}
+
+std::shared_ptr<CheckpointStorageBackend> make_file_checkpoint_storage(std::string path) {
+    return std::make_shared<FileCheckpointStorageBackend>(std::move(path));
+}
+
+std::shared_ptr<CheckpointStorageBackend> make_sqlite_checkpoint_storage(std::string path) {
+#if defined(AGENTCORE_HAVE_SQLITE3)
+    return std::make_shared<SqliteCheckpointStorageBackend>(std::move(path));
+#else
+    (void)path;
+    throw std::runtime_error("sqlite checkpoint storage is not available in this build");
+#endif
 }
 
 CheckpointId CheckpointManager::append(const Checkpoint& checkpoint, std::optional<RunSnapshot> snapshot) {
@@ -781,76 +1123,52 @@ std::optional<Checkpoint> CheckpointManager::latest_resumable_for_run(
     return std::nullopt;
 }
 
-void CheckpointManager::enable_persistence(std::string path) {
+void CheckpointManager::set_storage(std::shared_ptr<CheckpointStorageBackend> storage) {
     std::lock_guard<std::mutex> lock(mutex_);
-    persistence_path_ = std::move(path);
-    if (!records_.empty()) {
+    storage_ = std::move(storage);
+    persistence_path_ = storage_ == nullptr ? std::string{} : storage_->location();
+    if (storage_ != nullptr && !records_.empty()) {
         persist_locked();
     }
 }
 
+void CheckpointManager::enable_persistence(std::string path) {
+    set_storage(make_file_checkpoint_storage(std::move(path)));
+}
+
+void CheckpointManager::enable_sqlite_persistence(std::string path) {
+    set_storage(make_sqlite_checkpoint_storage(std::move(path)));
+}
+
 bool CheckpointManager::persistence_enabled() const noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
-    return !persistence_path_.empty();
+    return storage_ != nullptr && !storage_->location().empty();
 }
 
 const std::string& CheckpointManager::persistence_path() const noexcept {
     return persistence_path_;
 }
 
+std::string CheckpointManager::storage_kind() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return storage_ == nullptr ? std::string{} : storage_->kind();
+}
+
 std::size_t CheckpointManager::load_persisted_records() {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (persistence_path_.empty()) {
+    if (storage_ == nullptr) {
         return 0U;
     }
 
-    std::ifstream input(persistence_path_, std::ios::binary);
-    if (!input) {
-        return 0U;
-    }
-
-    const uint64_t magic = read_pod<uint64_t>(input);
-    const uint32_t version = read_pod<uint32_t>(input);
-    if (magic != kCheckpointMagic || version != kCheckpointVersion) {
-        throw std::runtime_error("unsupported checkpoint persistence format");
-    }
-
-    const uint64_t record_count = read_pod<uint64_t>(input);
-    records_.clear();
-    records_.reserve(static_cast<std::size_t>(record_count));
-    for (uint64_t index = 0; index < record_count; ++index) {
-        records_.push_back(read_checkpoint_record(input));
-    }
+    records_ = storage_->load_all();
     return records_.size();
 }
 
 void CheckpointManager::persist_locked() const {
-    if (persistence_path_.empty()) {
+    if (storage_ == nullptr) {
         return;
     }
-
-    const std::string temp_path = persistence_path_ + ".tmp";
-    std::ofstream output(temp_path, std::ios::binary | std::ios::trunc);
-    if (!output) {
-        throw std::runtime_error("failed to open checkpoint temp file");
-    }
-
-    write_pod<uint64_t>(output, kCheckpointMagic);
-    write_pod<uint32_t>(output, kCheckpointVersion);
-    write_pod<uint64_t>(output, static_cast<uint64_t>(records_.size()));
-    for (const CheckpointRecord& record : records_) {
-        write_checkpoint_record(output, record);
-    }
-    output.flush();
-    if (!output) {
-        throw std::runtime_error("failed to flush checkpoint temp file");
-    }
-    output.close();
-
-    std::remove(persistence_path_.c_str());
-    if (std::rename(temp_path.c_str(), persistence_path_.c_str()) != 0) {
-        throw std::runtime_error("failed to install checkpoint persistence file");
-    }
+    storage_->replace_all(records_);
 }
 
 } // namespace agentcore

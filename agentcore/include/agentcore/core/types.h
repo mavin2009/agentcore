@@ -20,6 +20,8 @@ using CheckpointId = uint64_t;
 struct ExecutionNamespaceRef {
     GraphId graph_id{0};
     NodeId node_id{0};
+    std::string session_id;
+    uint64_t session_revision{0};
 };
 
 struct BlobRef {

@@ -2,6 +2,7 @@
 #define AGENTCORE_STATE_STORE_H
 
 #include "agentcore/core/types.h"
+#include "agentcore/state/journal/task_journal.h"
 #include "agentcore/state/knowledge_graph.h"
 #include <cstddef>
 #include <iosfwd>
@@ -26,11 +27,12 @@ struct FieldUpdate {
 struct StatePatch {
     std::vector<FieldUpdate> updates;
     std::vector<BlobRef> new_blobs;
+    std::vector<TaskRecord> task_records;
     KnowledgeGraphPatch knowledge_graph;
     uint32_t flags{0};
 
     [[nodiscard]] bool empty() const {
-        return updates.empty() && new_blobs.empty() && knowledge_graph.empty();
+        return updates.empty() && new_blobs.empty() && task_records.empty() && knowledge_graph.empty();
     }
 };
 
@@ -118,6 +120,8 @@ public:
     [[nodiscard]] const StringInterner& strings() const noexcept;
     [[nodiscard]] KnowledgeGraphStore& knowledge_graph() noexcept;
     [[nodiscard]] const KnowledgeGraphStore& knowledge_graph() const noexcept;
+    [[nodiscard]] TaskJournal& task_journal() noexcept;
+    [[nodiscard]] const TaskJournal& task_journal() const noexcept;
     struct SharedBacking {
         bool blobs{false};
         bool strings{false};
@@ -133,6 +137,7 @@ private:
     PatchLog patch_log_;
     StringInterner string_interner_;
     KnowledgeGraphStore knowledge_graph_;
+    TaskJournal task_journal_;
 };
 
 } // namespace agentcore

@@ -13,6 +13,7 @@ namespace {
 
 constexpr std::byte kJsonBlobTag{static_cast<std::byte>(0x7BU)};
 constexpr std::byte kBytesBlobTag{static_cast<std::byte>(0x42U)};
+constexpr std::byte kPickleBlobTag{static_cast<std::byte>(0x50U)};
 
 class GraphHandleRegistry {
 public:
@@ -47,8 +48,21 @@ private:
     return next_graph_id.fetch_add(1U);
 }
 
+struct CallbackRuntimeHandle {
+    ExecutionContext* context{nullptr};
+};
+
 void destroy_graph_capsule(PyObject* capsule) {
     auto* handle = static_cast<GraphHandle*>(PyCapsule_GetPointer(capsule, kGraphCapsuleName));
+    if (handle == nullptr) {
+        PyErr_Clear();
+        return;
+    }
+    delete handle;
+}
+
+void destroy_runtime_capsule(PyObject* capsule) {
+    auto* handle = static_cast<CallbackRuntimeHandle*>(PyCapsule_GetPointer(capsule, kRuntimeCapsuleName));
     if (handle == nullptr) {
         PyErr_Clear();
         return;
@@ -243,6 +257,57 @@ PyObject* load_object_from_pickle_bytes(
     return decoded;
 }
 
+ExecutionContext* runtime_context_from_capsule(PyObject* capsule, std::string* error_message) {
+    auto* handle = static_cast<CallbackRuntimeHandle*>(
+        PyCapsule_GetPointer(capsule, kRuntimeCapsuleName)
+    );
+    if (handle == nullptr) {
+        if (PyErr_Occurred() != nullptr) {
+            *error_message = GraphHandle::fetch_python_error();
+            PyErr_Clear();
+        } else {
+            *error_message = "invalid runtime context capsule";
+        }
+        return nullptr;
+    }
+    if (handle->context == nullptr) {
+        *error_message = "runtime context is not available";
+        return nullptr;
+    }
+    return handle->context;
+}
+
+bool pickle_blob_payload_matches(
+    const BlobStore& blobs,
+    BlobRef ref,
+    const std::vector<std::byte>& expected_payload
+) {
+    const std::vector<std::byte> tagged = blobs.read_bytes(ref);
+    if (!tagged_blob_has_payload(tagged, kPickleBlobTag)) {
+        return false;
+    }
+    if (tagged.size() != expected_payload.size() + 1U) {
+        return false;
+    }
+    return std::equal(expected_payload.begin(), expected_payload.end(), tagged.begin() + 1);
+}
+
+PyObject* load_pickled_blob_value(
+    const BlobStore& blobs,
+    BlobRef ref,
+    std::string* error_message
+) {
+    const std::vector<std::byte> tagged = blobs.read_bytes(ref);
+    if (!tagged_blob_has_payload(tagged, kPickleBlobTag)) {
+        *error_message = "recorded effect payload is not pickle-encoded";
+        return nullptr;
+    }
+    return load_object_from_pickle_bytes(
+        std::vector<std::byte>(tagged.begin() + 1, tagged.end()),
+        error_message
+    );
+}
+
 PyObject* event_to_python(
     const GraphHandle& handle,
     const StreamEvent& event,
@@ -278,6 +343,12 @@ PyObject* event_to_python(
         !set_dict_item(event_dict, "confidence", PyFloat_FromDouble(event.confidence)) ||
         !set_dict_item(event_dict, "patch_count", PyLong_FromUnsignedLong(event.patch_count)) ||
         !set_dict_item(event_dict, "flags", PyLong_FromUnsignedLong(event.flags)) ||
+        !set_dict_item(event_dict, "session_id", unicode_from_utf8(event.session_id)) ||
+        !set_dict_item(
+            event_dict,
+            "session_revision",
+            PyLong_FromUnsignedLongLong(event.session_revision)
+        ) ||
         !set_dict_item(event_dict, "graph_name", unicode_from_utf8(event_handle->graph().name)) ||
         !set_dict_item(event_dict, "node_name", unicode_from_utf8(event_handle->node_name(event.node_id)))) {
         Py_DECREF(event_dict);
@@ -303,7 +374,13 @@ PyObject* event_to_python(
             set_dict_item(frame_dict, "graph_id", PyLong_FromUnsignedLong(frame.graph_id)) &&
             set_dict_item(frame_dict, "node_id", PyLong_FromUnsignedLong(frame.node_id)) &&
             set_dict_item(frame_dict, "graph_name", unicode_from_utf8(frame.graph_name)) &&
-            set_dict_item(frame_dict, "node_name", unicode_from_utf8(frame.node_name));
+            set_dict_item(frame_dict, "node_name", unicode_from_utf8(frame.node_name)) &&
+            set_dict_item(frame_dict, "session_id", unicode_from_utf8(frame.session_id)) &&
+            set_dict_item(
+                frame_dict,
+                "session_revision",
+                PyLong_FromUnsignedLongLong(frame.session_revision)
+            );
         if (!frame_ok || PyList_Append(namespaces, frame_dict) != 0) {
             Py_DECREF(frame_dict);
             Py_DECREF(namespaces);
@@ -447,6 +524,8 @@ bool GraphHandle::add_subgraph_node(
     const std::vector<std::pair<std::string, std::string>>& input_bindings,
     const std::vector<std::pair<std::string, std::string>>& output_bindings,
     bool propagate_knowledge_graph,
+    std::string_view session_mode_name,
+    const std::optional<std::string>& session_id_source_name,
     std::string* error_message
 ) {
     if (subgraph_handle == nullptr) {
@@ -483,6 +562,22 @@ bool GraphHandle::add_subgraph_node(
         return false;
     }
 
+    SubgraphSessionMode session_mode = SubgraphSessionMode::Ephemeral;
+    if (session_mode_name == "persistent") {
+        session_mode = SubgraphSessionMode::Persistent;
+    } else if (session_mode_name != "ephemeral") {
+        *error_message = "subgraph session mode must be either 'ephemeral' or 'persistent'";
+        return false;
+    }
+    if (session_mode == SubgraphSessionMode::Persistent && !session_id_source_name.has_value()) {
+        *error_message = "persistent subgraph nodes require a session id source field";
+        return false;
+    }
+    if (session_mode == SubgraphSessionMode::Ephemeral && session_id_source_name.has_value()) {
+        *error_message = "ephemeral subgraph nodes must not declare a session id source field";
+        return false;
+    }
+
     const NodeId node_id = next_node_id_++;
     node_ids_by_name_.emplace(std::string(name), node_id);
 
@@ -509,6 +604,10 @@ bool GraphHandle::add_subgraph_node(
         std::lock_guard<std::mutex> child_lock(subgraph_handle->mutex_);
         initial_field_count = static_cast<uint32_t>(subgraph_handle->state_names_.size());
     }
+    std::optional<StateKey> session_id_source_key;
+    if (session_id_source_name.has_value()) {
+        session_id_source_key = ensure_state_key_locked(*session_id_source_name);
+    }
 
     node_bindings_.push_back(NodeBinding{
         node_id,
@@ -523,7 +622,9 @@ bool GraphHandle::add_subgraph_node(
             std::move(resolved_input_bindings),
             std::move(resolved_output_bindings),
             propagate_knowledge_graph,
-            initial_field_count
+            initial_field_count,
+            session_mode,
+            session_id_source_key
         },
         subgraph_handle
     });
@@ -591,7 +692,7 @@ bool GraphHandle::invoke(
     std::string* error_message
 ) {
     RunArtifacts artifacts;
-    if (!execute_run(input_state, config, true, &artifacts, error_message)) {
+    if (!execute_run(input_state, config, true, false, &artifacts, error_message)) {
         return false;
     }
 
@@ -608,8 +709,73 @@ bool GraphHandle::invoke_with_details(
     std::string* error_message
 ) {
     RunArtifacts artifacts;
-    if (!execute_run(input_state, config, include_subgraphs, &artifacts, error_message)) {
+    if (!execute_run(input_state, config, include_subgraphs, false, &artifacts, error_message)) {
         return false;
+    }
+
+    *output_details = build_details_dict(artifacts, error_message);
+    Py_XDECREF(artifacts.state);
+    Py_XDECREF(artifacts.trace);
+    return *output_details != nullptr;
+}
+
+bool GraphHandle::invoke_until_pause_with_details(
+    PyObject* input_state,
+    PyObject* config,
+    bool include_subgraphs,
+    PyObject** output_details,
+    std::string* error_message
+) {
+    RunArtifacts artifacts;
+    if (!execute_run(input_state, config, include_subgraphs, true, &artifacts, error_message)) {
+        return false;
+    }
+
+    *output_details = build_details_dict(artifacts, error_message);
+    Py_XDECREF(artifacts.state);
+    Py_XDECREF(artifacts.trace);
+    return *output_details != nullptr;
+}
+
+bool GraphHandle::resume_with_details(
+    CheckpointId checkpoint_id,
+    bool include_subgraphs,
+    PyObject** output_details,
+    std::string* error_message
+) {
+    if (!ensure_finalized(error_message)) {
+        return false;
+    }
+
+    PyThreadState* released_thread_state = PyEval_SaveThread();
+    const ResumeResult resume_result = engine_.resume(checkpoint_id);
+    PyEval_RestoreThread(released_thread_state);
+    if (!resume_result.resumed) {
+        *error_message = resume_result.message.empty()
+            ? "failed to resume checkpoint"
+            : resume_result.message;
+        return false;
+    }
+
+    released_thread_state = PyEval_SaveThread();
+    const RunResult run_result = engine_.run_to_completion(resume_result.run_id);
+    PyEval_RestoreThread(released_thread_state);
+
+    RunArtifacts artifacts;
+    if (!populate_run_artifacts(
+            resume_result.run_id,
+            run_result,
+            include_subgraphs,
+            &artifacts,
+            error_message
+        )) {
+        return false;
+    }
+
+    if (run_result.status == ExecutionStatus::Completed ||
+        run_result.status == ExecutionStatus::Failed ||
+        run_result.status == ExecutionStatus::Cancelled) {
+        release_run_context(resume_result.run_id);
     }
 
     *output_details = build_details_dict(artifacts, error_message);
@@ -626,7 +792,7 @@ bool GraphHandle::stream(
     std::string* error_message
 ) {
     RunArtifacts artifacts;
-    if (!execute_run(input_state, config, include_subgraphs, &artifacts, error_message)) {
+    if (!execute_run(input_state, config, include_subgraphs, false, &artifacts, error_message)) {
         return false;
     }
 
@@ -727,6 +893,7 @@ bool GraphHandle::execute_run(
     PyObject* input_state,
     PyObject* config,
     bool include_subgraphs,
+    bool allow_paused,
     RunArtifacts* artifacts,
     std::string* error_message
 ) {
@@ -740,37 +907,37 @@ bool GraphHandle::execute_run(
     }
 
     const RunId run_id = engine_.start(graph_, input);
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        PyObject* captured_input = input_state == nullptr ? Py_None : input_state;
-        Py_INCREF(captured_input);
-        pending_initial_inputs_[run_id] = captured_input;
-        PyObject* captured_config = config == nullptr ? Py_None : config;
-        Py_INCREF(captured_config);
-        pending_configs_[run_id] = captured_config;
-    }
+    capture_run_context(run_id, input_state, config);
     PyThreadState* released_thread_state = PyEval_SaveThread();
     const RunResult run_result = engine_.run_to_completion(run_id);
     PyEval_RestoreThread(released_thread_state);
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        const auto iterator = pending_initial_inputs_.find(run_id);
-        if (iterator != pending_initial_inputs_.end()) {
-            Py_DECREF(iterator->second);
-            pending_initial_inputs_.erase(iterator);
-        }
-        const auto config_iterator = pending_configs_.find(run_id);
-        if (config_iterator != pending_configs_.end()) {
-            Py_DECREF(config_iterator->second);
-            pending_configs_.erase(config_iterator);
-        }
+
+    if (run_result.status == ExecutionStatus::Completed ||
+        run_result.status == ExecutionStatus::Failed ||
+        run_result.status == ExecutionStatus::Cancelled) {
+        release_run_context(run_id);
     }
-    if (run_result.status != ExecutionStatus::Completed) {
-        *error_message = "graph execution did not complete successfully: " +
+
+    if (run_result.status != ExecutionStatus::Completed &&
+        !(allow_paused && run_result.status == ExecutionStatus::Paused)) {
+        if (run_result.status == ExecutionStatus::Paused) {
+            release_run_context(run_id);
+        }
+        *error_message = "graph execution did not reach an allowed terminal status: " +
             execution_status_name(run_result.status);
         return false;
     }
 
+    return populate_run_artifacts(run_id, run_result, include_subgraphs, artifacts, error_message);
+}
+
+bool GraphHandle::populate_run_artifacts(
+    RunId run_id,
+    const RunResult& run_result,
+    bool include_subgraphs,
+    RunArtifacts* artifacts,
+    std::string* error_message
+) {
     const StateStore& state_store = engine_.state_store(run_id);
     artifacts->state = state_to_python_dict(
         engine_.state(run_id),
@@ -801,6 +968,30 @@ bool GraphHandle::execute_run(
         }
     }
     return true;
+}
+
+void GraphHandle::capture_run_context(RunId run_id, PyObject* input_state, PyObject* config) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    PyObject* captured_input = input_state == nullptr ? Py_None : input_state;
+    Py_INCREF(captured_input);
+    pending_initial_inputs_[run_id] = captured_input;
+    PyObject* captured_config = config == nullptr ? Py_None : config;
+    Py_INCREF(captured_config);
+    pending_configs_[run_id] = captured_config;
+}
+
+void GraphHandle::release_run_context(RunId run_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto iterator = pending_initial_inputs_.find(run_id);
+    if (iterator != pending_initial_inputs_.end()) {
+        Py_DECREF(iterator->second);
+        pending_initial_inputs_.erase(iterator);
+    }
+    const auto config_iterator = pending_configs_.find(run_id);
+    if (config_iterator != pending_configs_.end()) {
+        Py_DECREF(config_iterator->second);
+        pending_configs_.erase(config_iterator);
+    }
 }
 
 bool GraphHandle::build_initial_envelope(
@@ -907,8 +1098,13 @@ bool GraphHandle::parse_callback_result(
     StringInterner& strings,
     StatePatch* patch,
     std::optional<NodeId>* next_override,
+    bool* should_wait,
     std::string* error_message
 ) {
+    if (should_wait != nullptr) {
+        *should_wait = false;
+    }
+
     if (result == Py_None) {
         return true;
     }
@@ -945,18 +1141,33 @@ bool GraphHandle::parse_callback_result(
             *error_message = fetch_python_error();
             return false;
         }
-        if (PySequence_Fast_GET_SIZE(sequence) != 2) {
+        const Py_ssize_t size = PySequence_Fast_GET_SIZE(sequence);
+        if (size != 2 && size != 3) {
             Py_DECREF(sequence);
-            *error_message = "tuple/list callback result must contain exactly two elements";
+            *error_message = "tuple/list callback result must contain exactly two or three elements";
             return false;
         }
         PyObject* updates = PySequence_Fast_GET_ITEM(sequence, 0);
         PyObject* goto_target = PySequence_Fast_GET_ITEM(sequence, 1);
+        PyObject* wait_object = size == 3 ? PySequence_Fast_GET_ITEM(sequence, 2) : Py_False;
         const bool updates_ok = (updates == Py_None) ||
             convert_mapping_to_patch(updates, blobs, strings, patch, error_message);
         if (!updates_ok) {
             Py_DECREF(sequence);
             return false;
+        }
+        if (!PyBool_Check(wait_object)) {
+            Py_DECREF(sequence);
+            *error_message = "optional wait flag must be a bool";
+            return false;
+        }
+        if (wait_object == Py_True && goto_target != Py_None) {
+            Py_DECREF(sequence);
+            *error_message = "waiting callback results must not specify goto targets";
+            return false;
+        }
+        if (should_wait != nullptr) {
+            *should_wait = wait_object == Py_True;
         }
         const bool goto_ok = parse_goto(goto_target);
         Py_DECREF(sequence);
@@ -1398,6 +1609,133 @@ GraphHandle* graph_handle_from_capsule(PyObject* capsule) {
     return static_cast<GraphHandle*>(PyCapsule_GetPointer(capsule, kGraphCapsuleName));
 }
 
+PyObject* create_runtime_capsule(ExecutionContext& context) {
+    auto* handle = new CallbackRuntimeHandle{&context};
+    return PyCapsule_New(handle, kRuntimeCapsuleName, destroy_runtime_capsule);
+}
+
+PyObject* runtime_record_once(
+    PyObject* runtime_capsule,
+    std::string_view key,
+    PyObject* request,
+    PyObject* producer,
+    std::string* error_message
+) {
+    ExecutionContext* context = runtime_context_from_capsule(runtime_capsule, error_message);
+    if (context == nullptr) {
+        return nullptr;
+    }
+    if (request == nullptr) {
+        request = Py_None;
+    }
+    if (producer == nullptr || !PyCallable_Check(producer)) {
+        *error_message = "producer must be callable";
+        return nullptr;
+    }
+
+    std::vector<std::byte> request_bytes;
+    if (!dump_object_as_pickle_bytes(request, &request_bytes, error_message)) {
+        return nullptr;
+    }
+
+    if (const auto existing = context->find_recorded_effect(key); existing.has_value()) {
+        if (!pickle_blob_payload_matches(context->blobs, existing->request, request_bytes)) {
+            *error_message = "recorded effect request mismatch for key";
+            return nullptr;
+        }
+
+        PyObject* value = load_pickled_blob_value(context->blobs, existing->output, error_message);
+        if (value == nullptr) {
+            return nullptr;
+        }
+
+        PyObject* result = PyDict_New();
+        if (result == nullptr) {
+            Py_DECREF(value);
+            *error_message = GraphHandle::fetch_python_error();
+            return nullptr;
+        }
+        const bool ok =
+            set_dict_item(result, "value", value) &&
+            set_dict_item(result, "replayed", PyBool_FromLong(1)) &&
+            set_dict_item(result, "flags", PyLong_FromUnsignedLong(existing->flags));
+        if (!ok) {
+            Py_DECREF(result);
+            *error_message = GraphHandle::fetch_python_error();
+            return nullptr;
+        }
+        return result;
+    }
+
+    const BlobRef request_ref = append_tagged_blob(
+        context->blobs,
+        kPickleBlobTag,
+        request_bytes.data(),
+        request_bytes.size()
+    );
+
+    struct PythonProducerRaised final {};
+
+    try {
+        const RecordedEffectResult effect = context->record_blob_effect_once(
+            key,
+            request_ref,
+            [&]() -> BlobRef {
+                PyObject* produced = PyObject_CallFunctionObjArgs(producer, nullptr);
+                if (produced == nullptr) {
+                    throw PythonProducerRaised{};
+                }
+
+                std::vector<std::byte> output_bytes;
+                std::string producer_error;
+                const bool serialized = dump_object_as_pickle_bytes(
+                    produced,
+                    &output_bytes,
+                    &producer_error
+                );
+                Py_DECREF(produced);
+                if (!serialized) {
+                    throw std::runtime_error(producer_error);
+                }
+
+                return append_tagged_blob(
+                    context->blobs,
+                    kPickleBlobTag,
+                    output_bytes.data(),
+                    output_bytes.size()
+                );
+            }
+        );
+
+        PyObject* value = load_pickled_blob_value(context->blobs, effect.output, error_message);
+        if (value == nullptr) {
+            return nullptr;
+        }
+
+        PyObject* result = PyDict_New();
+        if (result == nullptr) {
+            Py_DECREF(value);
+            *error_message = GraphHandle::fetch_python_error();
+            return nullptr;
+        }
+        const bool ok =
+            set_dict_item(result, "value", value) &&
+            set_dict_item(result, "replayed", PyBool_FromLong(effect.replayed ? 1 : 0)) &&
+            set_dict_item(result, "flags", PyLong_FromUnsignedLong(effect.flags));
+        if (!ok) {
+            Py_DECREF(result);
+            *error_message = GraphHandle::fetch_python_error();
+            return nullptr;
+        }
+        return result;
+    } catch (const PythonProducerRaised&) {
+        return nullptr;
+    } catch (const std::exception& error) {
+        *error_message = error.what();
+        return nullptr;
+    }
+}
+
 NodeResult python_bootstrap_executor(ExecutionContext& context) {
     GraphHandle* handle = GraphHandleRegistry::instance().find(context.graph_id);
     if (handle == nullptr) {
@@ -1519,9 +1857,47 @@ NodeResult python_node_executor(ExecutionContext& context) {
         return result;
     }
 
-    PyObject* callback_result = PyObject_CallFunctionObjArgs(callback, state_dict, config, nullptr);
+    PyObject* callback_config = config;
+    Py_INCREF(callback_config);
+    if (PyDict_Check(config)) {
+        PyObject* runtime_capsule = create_runtime_capsule(context);
+        if (runtime_capsule == nullptr) {
+            Py_DECREF(state_dict);
+            Py_DECREF(callback);
+            Py_DECREF(callback_config);
+            Py_DECREF(config);
+            PyGILState_Release(gil_state);
+            NodeResult result;
+            result.status = NodeResult::HardFail;
+            result.flags = kToolFlagHandlerException;
+            return result;
+        }
+
+        PyObject* config_with_runtime = PyDict_Copy(config);
+        if (config_with_runtime == nullptr ||
+            PyDict_SetItemString(config_with_runtime, kPythonRuntimeConfigKey, runtime_capsule) != 0) {
+            Py_XDECREF(config_with_runtime);
+            Py_DECREF(runtime_capsule);
+            Py_DECREF(state_dict);
+            Py_DECREF(callback);
+            Py_DECREF(callback_config);
+            Py_DECREF(config);
+            PyGILState_Release(gil_state);
+            NodeResult result;
+            result.status = NodeResult::HardFail;
+            result.flags = kToolFlagHandlerException;
+            return result;
+        }
+
+        Py_DECREF(callback_config);
+        callback_config = config_with_runtime;
+        Py_DECREF(runtime_capsule);
+    }
+
+    PyObject* callback_result = PyObject_CallFunctionObjArgs(callback, state_dict, callback_config, nullptr);
     Py_DECREF(state_dict);
     Py_DECREF(callback);
+    Py_DECREF(callback_config);
     Py_DECREF(config);
     if (callback_result == nullptr) {
         error_message = GraphHandle::fetch_python_error();
@@ -1534,12 +1910,14 @@ NodeResult python_node_executor(ExecutionContext& context) {
 
     StatePatch patch;
     std::optional<NodeId> next_override;
+    bool should_wait = false;
     const bool parsed = handle->parse_callback_result(
         callback_result,
         context.blobs,
         context.strings,
         &patch,
         &next_override,
+        &should_wait,
         &error_message
     );
     Py_DECREF(callback_result);
@@ -1552,7 +1930,9 @@ NodeResult python_node_executor(ExecutionContext& context) {
         return result;
     }
 
-    NodeResult result = NodeResult::success(std::move(patch), 1.0F);
+    NodeResult result = should_wait
+        ? NodeResult::waiting(std::move(patch), 1.0F)
+        : NodeResult::success(std::move(patch), 1.0F);
     result.next_override = next_override;
     return result;
 }

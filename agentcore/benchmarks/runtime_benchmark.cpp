@@ -76,6 +76,7 @@ constexpr std::size_t kForkBenchmarkBlobBytes = 256U * 1024U;
 constexpr int kForkBenchmarkEntityCount = 1024;
 constexpr int kForkBenchmarkTripleCount = 2048;
 constexpr std::size_t kSubgraphBenchmarkRuns = 64U;
+constexpr std::size_t kRecordedEffectBenchmarkIterations = 4096U;
 
 NodeResult stop_node(ExecutionContext&) {
     return NodeResult::success();
@@ -1433,6 +1434,14 @@ struct AsyncMultiWaitSubgraphBenchmarkRun {
     RunProofDigest proof{};
 };
 
+struct RecordedEffectBenchmarkRun {
+    uint64_t miss_elapsed_ns{0};
+    uint64_t hit_elapsed_ns{0};
+    uint64_t miss_producer_calls{0};
+    uint64_t hit_producer_calls{0};
+    uint64_t journal_records{0};
+};
+
 BenchmarkRun run_parallel_benchmark_once(const GraphDefinition& graph, std::size_t worker_count) {
     ExecutionEngine engine(worker_count);
     const RunId run_id = engine.start(graph, InputEnvelope{2U});
@@ -1602,6 +1611,152 @@ QueueStatusBenchmarkRun run_queue_status_benchmark_once() {
             std::chrono::duration_cast<std::chrono::nanoseconds>(indexed_ended_at - indexed_started_at).count()
         ),
         legacy_hits == indexed_hits
+    };
+}
+
+RecordedEffectBenchmarkRun run_recorded_effect_benchmark_once() {
+    std::vector<std::byte> runtime_config_payload;
+    ToolRegistry tools;
+    ModelRegistry models;
+    TraceSink trace;
+    CancellationToken cancel;
+
+    StateStore miss_store(1U);
+    ScratchArena miss_scratch;
+    uint64_t miss_producer_calls = 0U;
+    const auto miss_started_at = std::chrono::steady_clock::now();
+    for (std::size_t iteration = 0; iteration < kRecordedEffectBenchmarkIterations; ++iteration) {
+        std::vector<TaskRecord> staged_records;
+        ExecutionContext context{
+            miss_store.get_current_state(),
+            1U,
+            1U,
+            1U,
+            1U,
+            runtime_config_payload,
+            miss_scratch,
+            miss_store.blobs(),
+            miss_store.strings(),
+            miss_store.knowledge_graph(),
+            miss_store.task_journal(),
+            tools,
+            models,
+            trace,
+            Deadline{},
+            cancel,
+            std::nullopt,
+            &staged_records
+        };
+
+        const std::string key = "recorded-effect::miss::" + std::to_string(iteration);
+        const std::string request = "request::" + std::to_string(iteration);
+        const std::string output = "output::" + std::to_string(iteration);
+        const RecordedEffectResult effect = context.record_text_effect_once(
+            key,
+            request,
+            [&]() {
+                ++miss_producer_calls;
+                return output;
+            }
+        );
+        assert(!effect.replayed);
+        assert(staged_records.size() == 1U);
+
+        StatePatch patch;
+        patch.task_records = std::move(staged_records);
+        static_cast<void>(miss_store.apply(patch));
+        miss_scratch.reset();
+    }
+    const auto miss_ended_at = std::chrono::steady_clock::now();
+
+    StateStore hit_store(1U);
+    ScratchArena hit_scratch;
+    uint64_t hit_producer_calls = 0U;
+    {
+        std::vector<TaskRecord> staged_records;
+        ExecutionContext context{
+            hit_store.get_current_state(),
+            2U,
+            1U,
+            1U,
+            1U,
+            runtime_config_payload,
+            hit_scratch,
+            hit_store.blobs(),
+            hit_store.strings(),
+            hit_store.knowledge_graph(),
+            hit_store.task_journal(),
+            tools,
+            models,
+            trace,
+            Deadline{},
+            cancel,
+            std::nullopt,
+            &staged_records
+        };
+        const RecordedEffectResult primed = context.record_text_effect_once(
+            "recorded-effect::hit::shared",
+            "request::steady",
+            [&]() {
+                ++hit_producer_calls;
+                return std::string("output::steady");
+            }
+        );
+        assert(!primed.replayed);
+        StatePatch patch;
+        patch.task_records = std::move(staged_records);
+        static_cast<void>(hit_store.apply(patch));
+        hit_scratch.reset();
+    }
+
+    const auto hit_started_at = std::chrono::steady_clock::now();
+    for (std::size_t iteration = 0; iteration < kRecordedEffectBenchmarkIterations; ++iteration) {
+        std::vector<TaskRecord> staged_records;
+        ExecutionContext context{
+            hit_store.get_current_state(),
+            2U,
+            1U,
+            1U,
+            1U,
+            runtime_config_payload,
+            hit_scratch,
+            hit_store.blobs(),
+            hit_store.strings(),
+            hit_store.knowledge_graph(),
+            hit_store.task_journal(),
+            tools,
+            models,
+            trace,
+            Deadline{},
+            cancel,
+            std::nullopt,
+            &staged_records
+        };
+        const RecordedEffectResult effect = context.record_text_effect_once(
+            "recorded-effect::hit::shared",
+            "request::steady",
+            [&]() {
+                ++hit_producer_calls;
+                return std::string("output::steady");
+            }
+        );
+        assert(effect.replayed);
+        assert(staged_records.empty());
+        hit_scratch.reset();
+    }
+    const auto hit_ended_at = std::chrono::steady_clock::now();
+
+    assert(hit_producer_calls == 1U);
+    return RecordedEffectBenchmarkRun{
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(miss_ended_at - miss_started_at).count()
+        ),
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(hit_ended_at - hit_started_at).count()
+        ),
+        miss_producer_calls,
+        hit_producer_calls,
+        static_cast<uint64_t>(miss_store.task_journal().size())
     };
 }
 
@@ -2011,6 +2166,14 @@ int main() {
         ? 0.0
         : static_cast<double>(queue_status.legacy_probe_ns) /
             static_cast<double>(queue_status.indexed_probe_ns);
+    const RecordedEffectBenchmarkRun recorded_effect_benchmark = run_recorded_effect_benchmark_once();
+    assert(recorded_effect_benchmark.miss_producer_calls == kRecordedEffectBenchmarkIterations);
+    assert(recorded_effect_benchmark.hit_producer_calls == 1U);
+    assert(recorded_effect_benchmark.journal_records == kRecordedEffectBenchmarkIterations);
+    const double recorded_effect_hit_speedup = recorded_effect_benchmark.hit_elapsed_ns == 0U
+        ? 0.0
+        : static_cast<double>(recorded_effect_benchmark.miss_elapsed_ns) /
+            static_cast<double>(recorded_effect_benchmark.hit_elapsed_ns);
 
     const SubgraphBenchmarkRun subgraph_benchmark =
         run_subgraph_benchmark_once(subgraph_parent_graph, subgraph_child_graph);
@@ -2082,6 +2245,13 @@ int main() {
               << "queue_status_probe_legacy_ns=" << queue_status.legacy_probe_ns << '\n'
               << "queue_status_probe_indexed_ns=" << queue_status.indexed_probe_ns << '\n'
               << "queue_status_probe_speedup_x=" << queue_status_speedup << '\n'
+              << "recorded_effect_iterations=" << kRecordedEffectBenchmarkIterations << '\n'
+              << "recorded_effect_miss_ns=" << recorded_effect_benchmark.miss_elapsed_ns << '\n'
+              << "recorded_effect_hit_ns=" << recorded_effect_benchmark.hit_elapsed_ns << '\n'
+              << "recorded_effect_hit_speedup_x=" << recorded_effect_hit_speedup << '\n'
+              << "recorded_effect_miss_producer_calls=" << recorded_effect_benchmark.miss_producer_calls << '\n'
+              << "recorded_effect_hit_producer_calls=" << recorded_effect_benchmark.hit_producer_calls << '\n'
+              << "recorded_effect_journal_records=" << recorded_effect_benchmark.journal_records << '\n'
               << "subgraph_benchmark_runs=" << kSubgraphBenchmarkRuns << '\n'
               << "subgraph_benchmark_ns=" << subgraph_benchmark.elapsed_ns << '\n'
               << "subgraph_stream_read_ns=" << subgraph_benchmark.stream_read_ns << '\n'

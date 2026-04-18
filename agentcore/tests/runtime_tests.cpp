@@ -35,7 +35,27 @@ enum CheckpointCadenceStateKey : StateKey {
 constexpr int kCadenceRouteCount = 8;
 constexpr int64_t kCadenceIterations = 24;
 
+enum RecordedEffectStateKey : StateKey {
+    kRecordedEffectOutput = 0,
+    kRecordedEffectVisit = 1,
+    kRecordedEffectDone = 2
+};
+
+std::atomic<int> g_recorded_effect_invocations{0};
+
 int64_t read_int_field(const WorkflowState& state, StateKey key);
+
+void configure_checkpoint_storage(ExecutionEngine& engine, const std::string& path, bool use_sqlite) {
+#if defined(AGENTCORE_HAVE_SQLITE3)
+    if (use_sqlite) {
+        engine.enable_sqlite_checkpoint_persistence(path);
+        return;
+    }
+#else
+    (void)use_sqlite;
+#endif
+    engine.enable_checkpoint_persistence(path);
+}
 
 NodeResult wait_then_continue_node(ExecutionContext& context) {
     const Value* attempts_value = context.state.fields.size() > kResumeAttempt
@@ -57,6 +77,51 @@ NodeResult wait_then_continue_node(ExecutionContext& context) {
 
 NodeResult stop_node(ExecutionContext&) {
     return NodeResult::success();
+}
+
+NodeResult recorded_effect_wait_node(ExecutionContext& context) {
+    const int64_t visit = read_int_field(context.state, kRecordedEffectVisit);
+    const RecordedEffectResult effect = context.record_text_effect_once(
+        "sync-effect::write-once",
+        "request::write-once",
+        []() {
+            g_recorded_effect_invocations.fetch_add(1);
+            return std::string("outcome::write-once");
+        }
+    );
+
+    StatePatch patch;
+    patch.updates.push_back(FieldUpdate{kRecordedEffectOutput, effect.output});
+    patch.updates.push_back(FieldUpdate{kRecordedEffectVisit, visit + 1});
+    if (visit == 0) {
+        return NodeResult::waiting(std::move(patch), 0.93F);
+    }
+
+    patch.updates.push_back(FieldUpdate{kRecordedEffectDone, true});
+    return NodeResult::success(std::move(patch), 0.99F);
+}
+
+NodeResult recorded_effect_request_mismatch_node(ExecutionContext& context) {
+    const int64_t visit = read_int_field(context.state, kRecordedEffectVisit);
+    const std::string request = visit == 0 ? "request::first" : "request::second";
+    const RecordedEffectResult effect = context.record_text_effect_once(
+        "sync-effect::mismatch",
+        request,
+        []() {
+            g_recorded_effect_invocations.fetch_add(1);
+            return std::string("outcome::mismatch");
+        }
+    );
+
+    StatePatch patch;
+    patch.updates.push_back(FieldUpdate{kRecordedEffectOutput, effect.output});
+    patch.updates.push_back(FieldUpdate{kRecordedEffectVisit, visit + 1});
+    if (visit == 0) {
+        return NodeResult::waiting(std::move(patch), 0.90F);
+    }
+
+    patch.updates.push_back(FieldUpdate{kRecordedEffectDone, true});
+    return NodeResult::success(std::move(patch), 0.99F);
 }
 
 NodeResult cadence_router_node(ExecutionContext& context) {
@@ -647,6 +712,18 @@ GraphDefinition make_resume_graph() {
         EdgeDefinition{1, 1, 2, EdgeKind::OnSuccess, nullptr, 100U}
     };
     graph.bind_outgoing_edges(1, std::vector<EdgeId>{1});
+    graph.sort_edges_by_priority();
+    return graph;
+}
+
+GraphDefinition make_recorded_effect_graph(NodeExecutorFn executor = recorded_effect_wait_node) {
+    GraphDefinition graph;
+    graph.id = 13U;
+    graph.name = "recorded_effect_graph";
+    graph.entry = 1U;
+    graph.nodes = {
+        NodeDefinition{1U, NodeKind::Human, "record_effect", 0U, 0U, 0U, executor, {}}
+    };
     graph.sort_edges_by_priority();
     return graph;
 }
@@ -1891,11 +1968,7 @@ void test_subgraph_composition_and_public_streaming() {
 
     const std::vector<const KnowledgeTriple*> propagated =
         engine.knowledge_graph(run_id).match(std::nullopt, std::nullopt, std::nullopt);
-    assert(propagated.size() == 1U);
-    const KnowledgeEntity* propagated_subject = engine.knowledge_graph(run_id).find_entity(propagated.front()->subject);
-    assert(propagated_subject != nullptr);
-    assert(engine.state_store(run_id).strings().resolve(propagated_subject->label) == "subgraph");
-    assert(engine.state_store(run_id).strings().resolve(propagated.front()->relation) == "computed");
+    assert(propagated.empty());
 
     StreamCursor cursor;
     const std::vector<StreamEvent> stream_events = engine.stream_events(run_id, cursor, StreamReadOptions{true});
@@ -3015,6 +3088,221 @@ void test_durable_checkpoint_reload() {
     std::remove(checkpoint_path.c_str());
 }
 
+void exercise_interrupt_edit_resume_flow(bool use_sqlite) {
+    const std::string checkpoint_path = use_sqlite
+        ? "/tmp/agentcore_interrupt_resume.sqlite"
+        : "/tmp/agentcore_interrupt_resume.bin";
+    std::remove(checkpoint_path.c_str());
+
+    ExecutionEngine engine(1);
+    configure_checkpoint_storage(engine, checkpoint_path, use_sqlite);
+
+    InputEnvelope input;
+    input.initial_field_count = 2;
+
+    const RunId run_id = engine.start(make_resume_graph(), input);
+    const InterruptResult interrupt_result = engine.interrupt(run_id);
+    assert(interrupt_result.interrupted);
+    assert(interrupt_result.status == ExecutionStatus::Paused);
+    assert(interrupt_result.checkpoint_id != 0U);
+
+    const RunSnapshot inspected = engine.inspect(run_id);
+    assert(inspected.status == ExecutionStatus::Paused);
+    assert(inspected.pending_tasks.empty());
+    assert(inspected.branches.size() == 1U);
+    assert(inspected.branches.front().frame.status == ExecutionStatus::Paused);
+
+    StatePatch manual_patch;
+    manual_patch.updates.push_back(FieldUpdate{kResumeAttempt, int64_t{1}});
+    const StateEditResult edit_result = engine.apply_state_patch(run_id, manual_patch);
+    assert(edit_result.applied);
+    assert(edit_result.branch_id == 0U);
+    assert(edit_result.checkpoint_id > interrupt_result.checkpoint_id);
+
+    const ResumeResult live_resume = engine.resume_run(run_id);
+    assert(live_resume.resumed);
+    const RunResult live_result = engine.run_to_completion(run_id);
+    assert(live_result.status == ExecutionStatus::Completed);
+    assert(std::get<bool>(engine.state(run_id).fields[kResumeDone]));
+
+    ExecutionEngine restored_engine(1);
+    restored_engine.register_graph(make_resume_graph());
+    configure_checkpoint_storage(restored_engine, checkpoint_path, use_sqlite);
+    assert(restored_engine.load_persisted_checkpoints() >= 2U);
+
+    const ResumeResult restart_resume = restored_engine.resume(edit_result.checkpoint_id);
+    assert(restart_resume.resumed);
+    assert(restart_resume.run_id == run_id);
+    const RunResult restart_result = restored_engine.run_to_completion(run_id);
+    assert(restart_result.status == ExecutionStatus::Completed);
+    assert(std::get<bool>(restored_engine.state(run_id).fields[kResumeDone]));
+
+    std::remove(checkpoint_path.c_str());
+}
+
+void exercise_recorded_effect_restart_equivalence(bool use_sqlite) {
+    const GraphDefinition graph = make_recorded_effect_graph();
+    const CheckpointPolicy policy{1U, true, true, true, true};
+
+    auto run_direct = [&](const std::string& checkpoint_path) {
+        std::remove(checkpoint_path.c_str());
+        g_recorded_effect_invocations.store(0);
+
+        ExecutionEngine engine(1);
+        engine.register_graph(graph);
+        engine.set_checkpoint_policy(policy);
+        configure_checkpoint_storage(engine, checkpoint_path, use_sqlite);
+
+        InputEnvelope input;
+        input.initial_field_count = 3;
+
+        const RunId run_id = engine.start(graph, input);
+        const StepResult first_step = engine.step(run_id);
+        assert(first_step.progressed);
+        assert(first_step.node_status == NodeResult::Waiting);
+        assert(g_recorded_effect_invocations.load() == 1);
+
+        const RunSnapshot paused = engine.inspect(run_id);
+        assert(paused.branches.size() == 1U);
+        assert(paused.branches.front().state_store.task_journal().size() == 1U);
+
+        const ResumeResult live_resume = engine.resume_run(run_id);
+        assert(live_resume.resumed);
+        const RunResult run_result = engine.run_to_completion(run_id);
+        assert(run_result.status == ExecutionStatus::Completed);
+        assert(g_recorded_effect_invocations.load() == 1);
+
+        const WorkflowState& final_state = engine.state(run_id);
+        assert(std::get<bool>(final_state.fields[kRecordedEffectDone]));
+        assert(
+            engine.state_store(run_id).blobs().read_string(
+                std::get<BlobRef>(final_state.fields[kRecordedEffectOutput])
+            ) == "outcome::write-once"
+        );
+        assert(engine.state_store(run_id).task_journal().size() == 1U);
+
+        const auto record = engine.checkpoints().get(run_result.last_checkpoint_id);
+        assert(record.has_value());
+        assert(record->resumable());
+        const RunProofDigest digest = compute_run_proof_digest(
+            *record,
+            engine.trace().events_for_run(run_id)
+        );
+        std::remove(checkpoint_path.c_str());
+        return digest;
+    };
+
+    auto run_restarted = [&](const std::string& checkpoint_path) {
+        std::remove(checkpoint_path.c_str());
+        g_recorded_effect_invocations.store(0);
+
+        ExecutionEngine engine(1);
+        engine.register_graph(graph);
+        engine.set_checkpoint_policy(policy);
+        configure_checkpoint_storage(engine, checkpoint_path, use_sqlite);
+
+        InputEnvelope input;
+        input.initial_field_count = 3;
+
+        const RunId run_id = engine.start(graph, input);
+        const StepResult first_step = engine.step(run_id);
+        assert(first_step.progressed);
+        assert(first_step.node_status == NodeResult::Waiting);
+        assert(g_recorded_effect_invocations.load() == 1);
+
+        const std::vector<TraceEvent> restart_prefix_trace = engine.trace().events_for_run(run_id);
+
+        ExecutionEngine restored_engine(1);
+        restored_engine.register_graph(graph);
+        restored_engine.set_checkpoint_policy(policy);
+        configure_checkpoint_storage(restored_engine, checkpoint_path, use_sqlite);
+        assert(restored_engine.load_persisted_checkpoints() >= 1U);
+
+        const ResumeResult resume_result = restored_engine.resume(first_step.checkpoint_id);
+        assert(resume_result.resumed);
+        const RunResult resumed_result = restored_engine.run_to_completion(run_id);
+        assert(resumed_result.status == ExecutionStatus::Completed);
+        assert(g_recorded_effect_invocations.load() == 1);
+
+        const WorkflowState& final_state = restored_engine.state(run_id);
+        assert(std::get<bool>(final_state.fields[kRecordedEffectDone]));
+        assert(
+            restored_engine.state_store(run_id).blobs().read_string(
+                std::get<BlobRef>(final_state.fields[kRecordedEffectOutput])
+            ) == "outcome::write-once"
+        );
+        assert(restored_engine.state_store(run_id).task_journal().size() == 1U);
+
+        const auto record = restored_engine.checkpoints().get(resumed_result.last_checkpoint_id);
+        assert(record.has_value());
+        assert(record->resumable());
+        const RunProofDigest digest = compute_run_proof_digest(
+            *record,
+            append_trace_events(
+                restart_prefix_trace,
+                restored_engine.trace().events_for_run(run_id)
+            )
+        );
+        std::remove(checkpoint_path.c_str());
+        return digest;
+    };
+
+    const std::string direct_checkpoint_path = use_sqlite
+        ? "/tmp/agentcore_recorded_effect_direct.sqlite"
+        : "/tmp/agentcore_recorded_effect_direct.bin";
+    const std::string restart_checkpoint_path = use_sqlite
+        ? "/tmp/agentcore_recorded_effect_restart.sqlite"
+        : "/tmp/agentcore_recorded_effect_restart.bin";
+
+    const RunProofDigest direct_digest = run_direct(direct_checkpoint_path);
+    const RunProofDigest restarted_digest = run_restarted(restart_checkpoint_path);
+    assert(direct_digest.snapshot_digest == restarted_digest.snapshot_digest);
+    assert(direct_digest.trace_digest == restarted_digest.trace_digest);
+    assert(direct_digest.combined_digest == restarted_digest.combined_digest);
+}
+
+void test_recorded_effect_checkpoint_restart_equivalence_with_file_checkpointer() {
+    exercise_recorded_effect_restart_equivalence(false);
+}
+
+#if defined(AGENTCORE_HAVE_SQLITE3)
+void test_recorded_effect_checkpoint_restart_equivalence_with_sqlite_checkpointer() {
+    exercise_recorded_effect_restart_equivalence(true);
+}
+#endif
+
+void test_recorded_effect_request_mismatch_fails_fast() {
+    g_recorded_effect_invocations.store(0);
+    ExecutionEngine engine(1);
+    const GraphDefinition graph = make_recorded_effect_graph(recorded_effect_request_mismatch_node);
+    engine.register_graph(graph);
+
+    InputEnvelope input;
+    input.initial_field_count = 3;
+
+    const RunId run_id = engine.start(graph, input);
+    const StepResult first_step = engine.step(run_id);
+    assert(first_step.progressed);
+    assert(first_step.node_status == NodeResult::Waiting);
+    assert(g_recorded_effect_invocations.load() == 1);
+
+    const ResumeResult resume_result = engine.resume_run(run_id);
+    assert(resume_result.resumed);
+    const RunResult final_result = engine.run_to_completion(run_id);
+    assert(final_result.status == ExecutionStatus::Failed);
+    assert(g_recorded_effect_invocations.load() == 1);
+}
+
+void test_interrupt_edit_resume_with_file_checkpointer() {
+    exercise_interrupt_edit_resume_flow(false);
+}
+
+#if defined(AGENTCORE_HAVE_SQLITE3)
+void test_interrupt_edit_resume_with_sqlite_checkpointer() {
+    exercise_interrupt_edit_resume_flow(true);
+}
+#endif
+
 } // namespace
 
 } // namespace agentcore
@@ -3042,6 +3330,15 @@ int main() {
     agentcore::test_proof_digest_determinism_across_parallelism();
     agentcore::test_proof_digest_restart_equivalence();
     agentcore::test_checkpoint_cadence_preserves_resumable_restore();
+    agentcore::test_recorded_effect_checkpoint_restart_equivalence_with_file_checkpointer();
+#if defined(AGENTCORE_HAVE_SQLITE3)
+    agentcore::test_recorded_effect_checkpoint_restart_equivalence_with_sqlite_checkpointer();
+#endif
+    agentcore::test_recorded_effect_request_mismatch_fails_fast();
+    agentcore::test_interrupt_edit_resume_with_file_checkpointer();
+#if defined(AGENTCORE_HAVE_SQLITE3)
+    agentcore::test_interrupt_edit_resume_with_sqlite_checkpointer();
+#endif
     std::cout << "runtime tests passed\n";
     return 0;
 }

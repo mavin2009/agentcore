@@ -19,8 +19,10 @@
 namespace agentcore::python_binding {
 
 inline constexpr const char* kGraphCapsuleName = "agentcore.python_graph";
+inline constexpr const char* kRuntimeCapsuleName = "agentcore.python_runtime";
 inline constexpr const char* kInternalEndNodeName = "__agentcore_internal_end__";
 inline constexpr const char* kInternalBootstrapNodeName = "__agentcore_internal_bootstrap__";
+inline constexpr const char* kPythonRuntimeConfigKey = "__agentcore_runtime__";
 
 class GraphHandle {
 public:
@@ -45,6 +47,8 @@ public:
         const std::vector<std::pair<std::string, std::string>>& input_bindings,
         const std::vector<std::pair<std::string, std::string>>& output_bindings,
         bool propagate_knowledge_graph,
+        std::string_view session_mode_name,
+        const std::optional<std::string>& session_id_source_name,
         std::string* error_message
     );
     bool add_edge(std::string_view from_name, std::string_view to_name, std::string* error_message);
@@ -59,6 +63,19 @@ public:
     bool invoke_with_details(
         PyObject* input_state,
         PyObject* config,
+        bool include_subgraphs,
+        PyObject** output_details,
+        std::string* error_message
+    );
+    bool invoke_until_pause_with_details(
+        PyObject* input_state,
+        PyObject* config,
+        bool include_subgraphs,
+        PyObject** output_details,
+        std::string* error_message
+    );
+    bool resume_with_details(
+        CheckpointId checkpoint_id,
         bool include_subgraphs,
         PyObject** output_details,
         std::string* error_message
@@ -107,6 +124,14 @@ private:
         PyObject* input_state,
         PyObject* config,
         bool include_subgraphs,
+        bool allow_paused,
+        RunArtifacts* artifacts,
+        std::string* error_message
+    );
+    bool populate_run_artifacts(
+        RunId run_id,
+        const RunResult& run_result,
+        bool include_subgraphs,
         RunArtifacts* artifacts,
         std::string* error_message
     );
@@ -129,6 +154,7 @@ private:
         StringInterner& strings,
         StatePatch* patch,
         std::optional<NodeId>* next_override,
+        bool* should_wait,
         std::string* error_message
     );
     bool convert_python_value(
@@ -161,6 +187,8 @@ private:
     [[nodiscard]] bool is_internal_node(NodeId node_id) const;
     [[nodiscard]] StateKey ensure_state_key(std::string_view state_name);
     [[nodiscard]] StateKey ensure_state_key_locked(std::string_view state_name);
+    void capture_run_context(RunId run_id, PyObject* input_state, PyObject* config);
+    void release_run_context(RunId run_id);
     void register_graphs_recursive(
         ExecutionEngine& engine,
         std::unordered_set<GraphId>* visited = nullptr
@@ -190,6 +218,14 @@ private:
 );
 [[nodiscard]] PyObject* create_graph_capsule(std::unique_ptr<GraphHandle> handle);
 [[nodiscard]] GraphHandle* graph_handle_from_capsule(PyObject* capsule);
+[[nodiscard]] PyObject* create_runtime_capsule(ExecutionContext& context);
+[[nodiscard]] PyObject* runtime_record_once(
+    PyObject* runtime_capsule,
+    std::string_view key,
+    PyObject* request,
+    PyObject* producer,
+    std::string* error_message
+);
 
 NodeResult python_bootstrap_executor(ExecutionContext& context);
 NodeResult python_node_executor(ExecutionContext& context);

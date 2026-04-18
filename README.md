@@ -1,6 +1,6 @@
 # AgentCore
 
-AgentCore is a native agent-graph runtime written in C++20. It is organized around a compact execution kernel, typed workflow state, explicit state patches, a multi-worker scheduler, append-only traces, resumable checkpoints, tool/model registries, public stream events, subgraph composition, and knowledge-graph state.
+AgentCore is a native agent-graph runtime written in C++20. It is organized around a compact execution kernel, typed workflow state, explicit state patches, a multi-worker scheduler, append-only traces, resumable checkpoints, tool/model registries, public stream events, persistent subgraph sessions, subgraph composition, and knowledge-graph state.
 
 The project is split into a small number of subsystems with clear boundaries:
 
@@ -14,11 +14,11 @@ The project is split into a small number of subsystems with clear boundaries:
 
 The root README is the landing page. The task-oriented guides live under [`./docs/README.md`](./docs/README.md):
 
-- [`./docs/quickstarts/python.md`](./docs/quickstarts/python.md): build the Python bindings, define a graph, invoke it, stream events, and use subgraphs
+- [`./docs/quickstarts/python.md`](./docs/quickstarts/python.md): build the Python bindings, define a graph, invoke it, stream events, and use persistent subgraph sessions
 - [`./docs/quickstarts/cpp.md`](./docs/quickstarts/cpp.md): build and embed the C++ runtime, construct graphs, and run the native examples
-- [`./docs/concepts/runtime-model.md`](./docs/concepts/runtime-model.md): execution model, state patches, joins, subgraphs, knowledge graph state, checkpoints, and streaming
+- [`./docs/concepts/runtime-model.md`](./docs/concepts/runtime-model.md): execution model, state patches, joins, persistent subgraph sessions, knowledge graph state, checkpoints, and streaming
 - [`./docs/reference/api.md`](./docs/reference/api.md): Python surface summary and the key C++ headers and types
-- [`./docs/operations/validation.md`](./docs/operations/validation.md): test, smoke, and benchmark entry points
+- [`./docs/operations/validation.md`](./docs/operations/validation.md): test, smoke, persistent-session benchmark, and replay validation entry points
 
 ## Why This Shape
 
@@ -42,6 +42,7 @@ Several other design decisions follow from the same goal:
 - Typed hot state plus blob references: durable state lives in `WorkflowState::fields`, while larger payloads live in the `BlobStore`. The intent is to keep frequently-read execution state small while still allowing larger artifacts to flow through the graph.
 - Scheduler separated from execution: the scheduler owns task queues, worker threads, and async waiter promotion, while the engine owns semantics. This lets concurrency policy evolve without turning the execution loop into a thread-management subsystem.
 - Knowledge graph in the state layer: graph memory is treated as first-class runtime state, not as an external sidecar. That keeps graph-aware workflows, subscriptions, and replay under the same state and checkpoint model as ordinary field updates.
+- Persistent child sessions are stored as isolated child snapshots plus explicit input/output bindings. This keeps concurrent distinct sessions safe, makes same-session conflicts reject cleanly, and prevents hidden mutable state from leaking across parent runs.
 
 ## Implemented Architecture
 
@@ -67,7 +68,7 @@ Node policies include flags for:
 - join-scope creation
 - knowledge-graph-reactive execution
 
-Subgraph composition is part of the graph layer through `SubgraphBinding`, and the helper surface for validating and namespacing subgraphs lives in [`./agentcore/include/agentcore/graph/composition/subgraph.h`](./agentcore/include/agentcore/graph/composition/subgraph.h).
+Subgraph composition is part of the graph layer through `SubgraphBinding`, and the helper surface for validating and namespacing subgraphs lives in [`./agentcore/include/agentcore/graph/composition/subgraph.h`](./agentcore/include/agentcore/graph/composition/subgraph.h). `SubgraphBinding` also carries persistent-session metadata through `session_mode` and `session_id_source_key`, which is what lets one child graph definition be reused across many isolated child sessions.
 
 ### State
 
@@ -78,6 +79,7 @@ The state layer is defined in [`./agentcore/include/agentcore/state/state_store.
 - `PatchLog` for incremental mutation history
 - `StringInterner` for stable interned string identifiers
 - `KnowledgeGraphStore` for entity/triple storage
+- `TaskJournal` for persisted once-only side-effect outcomes
 
 `Value` is a small tagged union defined in [`./agentcore/include/agentcore/core/types.h`](./agentcore/include/agentcore/core/types.h), and supports:
 
@@ -97,6 +99,8 @@ This split exists because graph execution tends to mix two very different data p
 
 Keeping those categories separate allows the engine to move small typed state through the step loop without repeatedly copying larger buffers.
 
+The task journal exists for a narrower operational reason: some workflows need to perform synchronous external work inside a node body and still remain restart-safe. Rather than pushing idempotency policy into every node, the runtime exposes recorded-effect helpers on `ExecutionContext` and persists those outcomes in the state layer. That keeps effect commitment under the engine’s checkpoint/proof model instead of making replay behavior an ad hoc application concern.
+
 ### Execution
 
 The execution layer is centered on `ExecutionEngine` in [`./agentcore/include/agentcore/execution/engine.h`](./agentcore/include/agentcore/execution/engine.h). The public surface includes:
@@ -105,9 +109,13 @@ The execution layer is centered on `ExecutionEngine` in [`./agentcore/include/ag
 - `step()`
 - `run_to_completion()`
 - `resume()`
+- `resume_run()`
+- `interrupt()`
+- `apply_state_patch()`
+- `inspect()`
 - `register_graph()`
 - checkpoint-policy configuration
-- checkpoint persistence loading
+- checkpoint storage selection and loading
 - stream event reads
 
 Checkpoints and traces are defined in [`./agentcore/include/agentcore/execution/checkpoint.h`](./agentcore/include/agentcore/execution/checkpoint.h). The implementation stores:
@@ -115,7 +123,12 @@ Checkpoints and traces are defined in [`./agentcore/include/agentcore/execution/
 - lightweight checkpoint metadata for every recorded checkpoint
 - optional full `RunSnapshot` payloads for resumable checkpoints
 - append-only trace events
-- optional persisted checkpoint records on disk
+- optional persisted checkpoint records through pluggable storage backends
+
+The current storage backends are:
+
+- binary file persistence
+- SQLite-backed persistence when the build is configured with SQLite support
 
 Proof digests are available in [`./agentcore/include/agentcore/execution/proof.h`](./agentcore/include/agentcore/execution/proof.h). The current proof surface computes digests over snapshots and trace sequences.
 
@@ -125,8 +138,22 @@ Public streaming is defined in [`./agentcore/include/agentcore/execution/streami
 - node status and confidence
 - patch counts and flags
 - namespace frames for subgraph-aware event paths
+- `session_id` and `session_revision` for persistent child sessions
 
 This shape is deliberate: traces are append-only for observability, checkpoints are resumable when snapshot payloads are present, and public stream events are derived from trace data rather than maintained as a second independent event system.
+
+### Persistent Subgraph Sessions
+
+Persistent subgraph sessions are implemented in the dedicated subgraph execution seam under [`./agentcore/include/agentcore/execution/subgraph/session_runtime.h`](./agentcore/include/agentcore/execution/subgraph/session_runtime.h) and [`./agentcore/src/execution/subgraph/session_runtime.cpp`](./agentcore/src/execution/subgraph/session_runtime.cpp).
+
+The runtime uses isolated committed child snapshots rather than shared mutable child state. The reason is practical:
+
+- a persistent session can be restored deterministically from its last committed child snapshot
+- current parent inputs can be overlaid onto that child state before execution
+- successful child completion can commit one full child snapshot revision
+- failure, cancellation, or waiting can leave the last committed child snapshot untouched
+
+This is also how the runtime keeps knowledge-graph behavior explicit. Ephemeral subgraphs can receive a per-invocation knowledge-graph fork when propagation is enabled. Persistent sessions seed their child-local knowledge graph once on creation and then continue from their committed child-local graph on later invocations. Parent and child knowledge graphs do not auto-merge outside explicit bindings.
 
 ### Runtime And Scheduling
 
@@ -165,6 +192,12 @@ Those implementations live under `./agentcore/adapters/`.
 
 The adapter boundary is intentionally narrow so that model/tool payloads can move as `BlobRef` values through the state system and execution engine without introducing engine-specific logic for individual external systems.
 
+### Python Binding Surface
+
+The Python package under `./python/agentcore` is a thin builder and orchestration layer over the native runtime. Python callbacks may opt into a third `runtime` argument when they need access to native execution services that should stay coupled to the engine rather than reimplemented in Python.
+
+The first exposed service in that seam is recorded once-only synchronous work through `RuntimeContext.record_once(...)` and `RuntimeContext.record_once_with_metadata(...)`. The motivation is operational rather than stylistic: if a callback performs synchronous work that must remain restart-safe, the outcome should be committed through the same native patch/checkpoint path as the rest of the run state. That keeps replay behavior explicit and verifiable instead of depending on ad hoc Python-side memoization.
+
 ## Repository Layout
 
 All directories below are relative to the repository root (`./`).
@@ -174,12 +207,15 @@ The repository is organized by subsystem rather than by executable:
 - `./agentcore/include/agentcore/core`: common runtime types
 - `./agentcore/include/agentcore/graph`: graph IR and subgraph composition metadata
 - `./agentcore/include/agentcore/state`: workflow state, blobs, patch logs, knowledge graph
+- `./agentcore/include/agentcore/state/journal`: persisted task/outcome journal types
 - `./agentcore/include/agentcore/runtime`: scheduler, node runtime, async APIs, adapter registries
 - `./agentcore/include/agentcore/execution`: engine, checkpoints, proofs, streaming
+- `./agentcore/include/agentcore/execution/subgraph`: subgraph execution and session-lifecycle helpers
 - `./agentcore/src/graph`: graph compilation and subgraph helpers
 - `./agentcore/src/state`: state and knowledge-graph implementations
 - `./agentcore/src/runtime`: scheduler, registries, async executor
-- `./agentcore/src/execution`: engine, checkpointing, proof, streaming, subgraph runtime
+- `./agentcore/src/execution`: engine, checkpointing, proof, streaming, and higher-level execution seams
+- `./agentcore/src/execution/subgraph`: subgraph runtime and persistent-session orchestration
 - `./agentcore/src/bindings/python`: CPython bridge and module surface
 - `./agentcore/adapters`: concrete tool/model adapters
 - `./agentcore/benchmarks`: native benchmark entry points
@@ -291,6 +327,7 @@ The current Python surface is implemented in [`./python/agentcore/graph/state.py
 - `START`
 - `END`
 - `Command`
+- `RuntimeContext`
 
 The graph builder currently provides:
 
@@ -307,12 +344,20 @@ The compiled graph object provides:
 
 - `invoke()`
 - `invoke_with_metadata()`
+- `invoke_until_pause_with_metadata()`
+- `resume_with_metadata()`
 - `stream()`
 - `ainvoke()`
 - `ainvoke_with_metadata()`
 - `astream()`
 - `batch()`
 - `abatch()`
+
+Python callbacks may currently accept:
+
+- `state`
+- `(state, config)`
+- `(state, config, runtime)`
 
 Example:
 
@@ -341,10 +386,21 @@ metadata = compiled.invoke_with_metadata({"count": 0})
 
 The Python layer focuses on a compact builder surface backed by the native runtime rather than mirroring the entire internal C++ API. The reason is to keep the Python entry point predictable while execution, scheduling, checkpointing, streaming, joins, and subgraph behavior stay in native code.
 
+When a callback accepts a third positional argument, the runtime passes a `RuntimeContext`. The current Python-facing helper surface is intentionally small:
+
+- `runtime.available`
+- `runtime.record_once(key, request, producer)`
+- `runtime.record_once_with_metadata(key, request, producer)`
+
+That seam exists for restart-safe synchronous work. If a Python node needs to compute or fetch a value once and then replay the committed outcome on later visits within the same run, the runtime helper routes that through the native task journal rather than asking application code to invent its own replay policy.
+
 Subgraph notes:
 
 - Python-defined subgraphs are compiled into native `Subgraph` nodes rather than being interpreted in Python.
 - Subgraph stream events carry namespace frames so parent and child execution paths can be distinguished in one trace.
+- `add_subgraph(..., session_mode="persistent", session_id_from="field_name")` enables persistent child-session reuse keyed by a parent field.
+- Stream and metadata events expose `session_id` and `session_revision` for persistent child sessions.
+- `Command(wait=True)` together with `invoke_until_pause_with_metadata(...)` and `resume_with_metadata(...)` exposes a minimal Python pause/resume seam over the native checkpoint model.
 - If a graph uses `add_subgraph(...)`, the supplied `config` must be pickle-serializable so the runtime can propagate it into child runs and nested subgraphs.
 
 ## Validation And Benchmarks
@@ -352,12 +408,15 @@ Subgraph notes:
 The repository contains both module tests and end-to-end runtime checks. The default validation path is:
 
 ```bash
+cmake -S . -B build -DAGENTCORE_BUILD_PYTHON_BINDINGS=ON -DAGENTCORE_BUILD_BENCHMARKS=ON
+cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
 Additional runnable entry points include:
 
 - `./build/agentcore_runtime_benchmark`
+- `./build/agentcore_persistent_subgraph_session_benchmark`
 - `PYTHONPATH=./build/python python3 ./python/tests/state_graph_api_smoke.py`
 - `PYTHONPATH=./build/python python3 ./python/tests/agent_workflows_smoke.py`
 - `PYTHONPATH=./build/python python3 ./python/benchmarks/state_graph_api_benchmark.py`
@@ -369,10 +428,36 @@ The native benchmark currently exercises:
 - shared-state fork behavior
 - reactive knowledge-graph frontier behavior
 - queue indexing behavior
+- recorded-effect hit/miss cost through the task journal
 - subgraph and resumable-subgraph execution
+- async multi-wait subgraph execution
+- persistent-session fan-out across distinct child sessions
+- direct-versus-resumed persistent-session replay validation
 
-These programs are useful both as measurement tools and as regression checks for changes in the scheduling, routing, streaming, and resume seams.
+The Python benchmark currently exercises:
+
+- synchronous invoke cost
+- async invoke cost
+- recorded-effect replay cost through the binding layer
+- recorded-effect miss cost through the binding layer
+- persistent-session fan-out with namespaced and session-tagged events
+- pause/resume specialist flows with child-local memory and once-only effects
+
+The persistent-session native benchmark is also the replay-validation gate for this feature: it checks direct-versus-resumed output equality, proof-digest equality, committed-session counts, once-only producer counts, and namespaced/session-tagged event coverage. The Python benchmark mirrors those workloads through the binding layer, asserts final-state and session invariants, and emits the corresponding digests for inspection.
+
+## Acknowledgements
+
+AgentCore is an independent project. It is not affiliated with or endorsed by LangChain Inc.
+
+I am grateful to several projects and ideas that helped clarify the design space for graph-based runtime systems:
+
+- [LangGraph](https://github.com/langchain-ai/langgraph) and its [documentation](https://docs.langchain.com/langgraph) for helping make graph-oriented agent orchestration more concrete and widely accessible.
+- [NetworkX](https://networkx.org/) for its clean graph-oriented modeling surface and for helping normalize graph-first APIs for developers.
+- [Pregel](https://research.google/pubs/pregel-a-system-for-large-scale-graph-processing/) for the larger body of graph-processing ideas around deterministic superstep-style execution.
+- [Apache Beam](https://beam.apache.org/) for durable dataflow concepts that continue to influence how many engineers think about structured execution, replay, and checkpointing.
+
+The project also benefits from the broader systems community working on workflow runtimes, replayable execution, state machines, and graph processing.
 
 ## License
 
-This repository includes a root [`./LICENSE`](./LICENSE) and [`./NOTICE`](./NOTICE). The project is licensed under `CPAL-1.0` with filled attribution information naming Michael Avina as the Initial Developer and requiring preserved attribution as specified in Exhibit B.
+This repository includes a root [`./LICENSE`](./LICENSE) and [`./NOTICE`](./NOTICE). 

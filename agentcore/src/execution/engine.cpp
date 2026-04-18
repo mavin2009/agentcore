@@ -18,6 +18,9 @@ namespace {
 constexpr uint32_t kTraceFlagJoinBarrier = 1U << 30;
 constexpr uint32_t kTraceFlagJoinMerged = 1U << 29;
 constexpr uint32_t kTraceFlagKnowledgeReactive = 1U << 28;
+constexpr uint32_t kTraceFlagManualInterrupt = 1U << 27;
+constexpr uint32_t kTraceFlagManualStateEdit = 1U << 26;
+constexpr uint32_t kTraceFlagRecordedEffect = 1U << 25;
 
 struct BranchFieldWrite {
     uint32_t branch_id{0};
@@ -66,6 +69,33 @@ void append_unique_pending_async(
     if (existing == pending_asyncs.end()) {
         pending_asyncs.push_back(pending_async);
     }
+}
+
+const BranchSnapshot* primary_branch_snapshot(const RunSnapshot& snapshot) {
+    if (snapshot.branches.empty()) {
+        return nullptr;
+    }
+
+    const auto explicit_root = std::find_if(
+        snapshot.branches.begin(),
+        snapshot.branches.end(),
+        [](const BranchSnapshot& branch) {
+            return branch.frame.active_branch_id == 0U;
+        }
+    );
+    if (explicit_root != snapshot.branches.end()) {
+        return std::addressof(*explicit_root);
+    }
+
+    return std::addressof(
+        *std::min_element(
+            snapshot.branches.begin(),
+            snapshot.branches.end(),
+            [](const BranchSnapshot& left, const BranchSnapshot& right) {
+                return left.frame.active_branch_id < right.frame.active_branch_id;
+            }
+        )
+    );
 }
 
 std::vector<PendingAsyncOperation> collect_pending_async_operations(const BranchSnapshot& branch) {
@@ -949,8 +979,16 @@ const CheckpointPolicy& ExecutionEngine::checkpoint_policy() const noexcept {
     return checkpoint_policy_;
 }
 
+void ExecutionEngine::set_checkpointer(std::shared_ptr<CheckpointStorageBackend> storage) {
+    checkpoint_manager_.set_storage(std::move(storage));
+}
+
 void ExecutionEngine::enable_checkpoint_persistence(std::string path) {
     checkpoint_manager_.enable_persistence(std::move(path));
+}
+
+void ExecutionEngine::enable_sqlite_checkpoint_persistence(std::string path) {
+    checkpoint_manager_.enable_sqlite_persistence(std::move(path));
 }
 
 std::size_t ExecutionEngine::load_persisted_checkpoints() {
@@ -1149,6 +1187,236 @@ ResumeResult ExecutionEngine::resume(CheckpointId checkpoint_id) {
     return result;
 }
 
+ResumeResult ExecutionEngine::resume_run(RunId run_id) {
+    ResumeResult result;
+    result.run_id = run_id;
+
+    auto run_iterator = runs_.find(run_id);
+    if (run_iterator == runs_.end()) {
+        result.status = ExecutionStatus::Failed;
+        result.message = "run not found";
+        return result;
+    }
+
+    RunRuntime& run = run_iterator->second;
+    if (run.status != ExecutionStatus::Paused) {
+        result.status = run.status;
+        result.message = "run is not paused";
+        return result;
+    }
+
+    scheduler_.remove_run(run_id);
+    re_register_run_async_waiters(run_id, run);
+    const std::size_t enqueued_tasks = enqueue_resumable_paused_branches(run_id, run);
+    update_run_status(run, run_id);
+
+    result.status = run.status;
+    result.resumed = enqueued_tasks != 0U || scheduler_.has_async_waiters_for_run(run_id);
+    if (result.resumed) {
+        result.message = "paused run resumed";
+    } else if (run.status == ExecutionStatus::Paused) {
+        result.message = "paused run has no resumable branches";
+    } else {
+        result.message = "run status refreshed";
+    }
+    return result;
+}
+
+InterruptResult ExecutionEngine::interrupt(RunId run_id) {
+    InterruptResult result;
+    result.run_id = run_id;
+
+    auto run_iterator = runs_.find(run_id);
+    if (run_iterator == runs_.end()) {
+        result.status = ExecutionStatus::Failed;
+        result.message = "run not found";
+        return result;
+    }
+
+    RunRuntime& run = run_iterator->second;
+    if (run.branches.empty()) {
+        result.status = ExecutionStatus::Failed;
+        result.message = "run has no branches";
+        return result;
+    }
+
+    if (run.status == ExecutionStatus::Completed ||
+        run.status == ExecutionStatus::Cancelled ||
+        run.status == ExecutionStatus::Failed) {
+        result.status = run.status;
+        result.message = "run is already terminal";
+        return result;
+    }
+
+    scheduler_.remove_run(run_id);
+    for (auto& [_, branch] : run.branches) {
+        if (branch.frame.status == ExecutionStatus::Running ||
+            branch.frame.status == ExecutionStatus::NotStarted) {
+            branch.frame.status = ExecutionStatus::Paused;
+        }
+    }
+    update_run_status(run, run_id);
+
+    auto checkpoint_branch_iterator = run.branches.find(0U);
+    if (checkpoint_branch_iterator == run.branches.end()) {
+        checkpoint_branch_iterator = std::min_element(
+            run.branches.begin(),
+            run.branches.end(),
+            [](const auto& left, const auto& right) {
+                return left.first < right.first;
+            }
+        );
+    }
+
+    BranchRuntime& checkpoint_branch = checkpoint_branch_iterator->second;
+    const CheckpointId checkpoint_id = static_cast<CheckpointId>(checkpoint_manager_.size() + 1U);
+    checkpoint_branch.frame.checkpoint_id = checkpoint_id;
+    const uint64_t patch_log_offset = static_cast<uint64_t>(checkpoint_branch.state_store.patch_log().size());
+    checkpoint_manager_.append(
+        Checkpoint{
+            run_id,
+            checkpoint_id,
+            checkpoint_branch.frame.current_node,
+            checkpoint_branch.state_store.get_current_state().version,
+            patch_log_offset,
+            run.status,
+            checkpoint_branch.frame.active_branch_id,
+            checkpoint_branch.frame.step_index
+        },
+        snapshot_run(run_id, run)
+    );
+
+    const uint64_t now = now_ns();
+    trace_sink_.emit(TraceEvent{
+        0U,
+        now,
+        now,
+        run_id,
+        run.graph.id,
+        checkpoint_branch.frame.current_node,
+        checkpoint_branch.frame.active_branch_id,
+        checkpoint_id,
+        NodeResult::Waiting,
+        1.0F,
+        0U,
+        kTraceFlagManualInterrupt,
+        {},
+        0U,
+        {}
+    });
+
+    result.checkpoint_id = checkpoint_id;
+    result.status = run.status;
+    result.interrupted = (run.status == ExecutionStatus::Paused);
+    result.message = result.interrupted ? "run interrupted" : "run status updated";
+    return result;
+}
+
+StateEditResult ExecutionEngine::apply_state_patch(RunId run_id, const StatePatch& patch, uint32_t branch_id) {
+    StateEditResult result;
+    result.run_id = run_id;
+    result.branch_id = branch_id;
+
+    auto run_iterator = runs_.find(run_id);
+    if (run_iterator == runs_.end()) {
+        result.message = "run not found";
+        return result;
+    }
+
+    RunRuntime& run = run_iterator->second;
+    if (run.status != ExecutionStatus::Paused) {
+        result.message = "run must be paused before applying a state patch";
+        return result;
+    }
+    if (patch.empty()) {
+        result.message = "state patch is empty";
+        return result;
+    }
+
+    auto branch_iterator = run.branches.find(branch_id);
+    if (branch_iterator == run.branches.end()) {
+        result.message = "branch not found";
+        return result;
+    }
+
+    BranchRuntime& branch = branch_iterator->second;
+    const StateApplyResult apply_result = branch.state_store.apply_with_summary(patch);
+    uint32_t trace_flags = kTraceFlagManualStateEdit;
+
+    if (!apply_result.knowledge_graph_delta.empty()) {
+        const std::vector<uint32_t> reactive_node_indices = collect_reactive_node_indices(
+            run.graph,
+            branch.state_store.strings(),
+            apply_result.knowledge_graph_delta,
+            branch.frame.current_node
+        );
+        for (uint32_t reactive_node_index : reactive_node_indices) {
+            if (reactive_node_index >= run.graph.nodes.size()) {
+                continue;
+            }
+
+            ReactiveFrontierState& frontier = run.reactive_frontiers[run.graph.nodes[reactive_node_index].id];
+            frontier.node_id = run.graph.nodes[reactive_node_index].id;
+            frontier.pending_rerun = true;
+            frontier.pending_rerun_seed = ReactiveRerunSeed{
+                branch.state_store,
+                branch.frame.step_index
+            };
+            trace_flags |= kTraceFlagKnowledgeReactive;
+        }
+        rebuild_reactive_frontier_state(run);
+    }
+
+    const CheckpointId checkpoint_id = static_cast<CheckpointId>(checkpoint_manager_.size() + 1U);
+    branch.frame.checkpoint_id = checkpoint_id;
+    checkpoint_manager_.append(
+        Checkpoint{
+            run_id,
+            checkpoint_id,
+            branch.frame.current_node,
+            branch.state_store.get_current_state().version,
+            apply_result.patch_log_offset,
+            run.status,
+            branch.frame.active_branch_id,
+            branch.frame.step_index
+        },
+        snapshot_run(run_id, run)
+    );
+
+    const uint64_t now = now_ns();
+    trace_sink_.emit(TraceEvent{
+        0U,
+        now,
+        now,
+        run_id,
+        run.graph.id,
+        branch.frame.current_node,
+        branch.frame.active_branch_id,
+        checkpoint_id,
+        NodeResult::Success,
+        1.0F,
+        static_cast<uint32_t>(patch.updates.size()),
+        trace_flags,
+        {},
+        0U,
+        {}
+    });
+
+    result.checkpoint_id = checkpoint_id;
+    result.state_version = branch.state_store.get_current_state().version;
+    result.applied = true;
+    result.message = "state patch applied";
+    return result;
+}
+
+RunSnapshot ExecutionEngine::inspect(RunId run_id) const {
+    const auto run_iterator = runs_.find(run_id);
+    if (run_iterator == runs_.end()) {
+        throw std::out_of_range("run not found");
+    }
+    return snapshot_run(run_id, run_iterator->second);
+}
+
 const WorkflowState& ExecutionEngine::state(RunId run_id, uint32_t branch_id) const {
     return state_store(run_id, branch_id).get_current_state();
 }
@@ -1235,6 +1503,130 @@ std::vector<StreamEvent> ExecutionEngine::stream_events(
             return registered_graph(graph_id);
         }
     );
+}
+
+bool ExecutionEngine::branch_is_join_blocked(const RunRuntime& run, const BranchRuntime& branch) const noexcept {
+    if (branch.join_stack.empty()) {
+        return false;
+    }
+
+    const uint32_t split_id = branch.join_stack.back();
+    const auto scope_iterator = run.join_scopes.find(split_id);
+    if (scope_iterator == run.join_scopes.end()) {
+        return false;
+    }
+
+    if (scope_iterator->second.join_node_id != 0U &&
+        branch.frame.current_node != scope_iterator->second.join_node_id) {
+        return false;
+    }
+
+    return contains_branch_id(
+        scope_iterator->second.arrived_branch_ids,
+        branch.frame.active_branch_id
+    );
+}
+
+void ExecutionEngine::re_register_run_async_waiters(RunId run_id, const RunRuntime& run) {
+    for (const auto& [branch_id, branch] : run.branches) {
+        std::vector<PendingAsyncOperation> pending_asyncs;
+        if (branch.pending_async.has_value()) {
+            append_unique_pending_async(pending_asyncs, *branch.pending_async);
+        }
+        for (const PendingAsyncOperation& pending_async : branch.pending_async_group) {
+            append_unique_pending_async(pending_asyncs, pending_async);
+        }
+        for (const PendingAsyncOperation& pending_async : pending_asyncs) {
+            re_register_async_waiter(run_id, branch_id, pending_async);
+        }
+    }
+}
+
+std::size_t ExecutionEngine::enqueue_resumable_paused_branches(
+    RunId run_id,
+    RunRuntime& run,
+    uint32_t* trace_flags
+) {
+    std::size_t enqueued_tasks = 0U;
+    uint32_t local_trace_flags = 0U;
+
+    rebuild_reactive_frontier_state(run);
+    std::vector<NodeId> reactive_root_ids;
+    reactive_root_ids.reserve(run.reactive_frontiers.size());
+    for (const auto& [node_id, _] : run.reactive_frontiers) {
+        reactive_root_ids.push_back(node_id);
+    }
+    std::sort(reactive_root_ids.begin(), reactive_root_ids.end());
+
+    for (NodeId reactive_root_id : reactive_root_ids) {
+        auto frontier_iterator = run.reactive_frontiers.find(reactive_root_id);
+        if (frontier_iterator == run.reactive_frontiers.end()) {
+            continue;
+        }
+
+        ReactiveFrontierState& frontier = frontier_iterator->second;
+        if (frontier.active_branch_count != 0U ||
+            !frontier.pending_rerun ||
+            !frontier.pending_rerun_seed.has_value()) {
+            continue;
+        }
+
+        const ReactiveRerunSeed rerun_seed = *frontier.pending_rerun_seed;
+        frontier.pending_rerun = false;
+        frontier.pending_rerun_seed.reset();
+
+        ExecutionFrame rerun_frame{};
+        rerun_frame.graph_id = run.graph.id;
+        rerun_frame.current_node = reactive_root_id;
+        rerun_frame.step_index = rerun_seed.step_index;
+        rerun_frame.status = ExecutionStatus::Paused;
+        spawn_reactive_branch(
+            run_id,
+            run,
+            reactive_root_id,
+            rerun_seed.state_store,
+            rerun_frame,
+            enqueued_tasks,
+            local_trace_flags
+        );
+    }
+
+    rebuild_reactive_frontier_state(run);
+    std::vector<uint32_t> branch_ids;
+    branch_ids.reserve(run.branches.size());
+    for (const auto& [branch_id, _] : run.branches) {
+        branch_ids.push_back(branch_id);
+    }
+    std::sort(branch_ids.begin(), branch_ids.end());
+
+    for (uint32_t branch_id : branch_ids) {
+        auto branch_iterator = run.branches.find(branch_id);
+        if (branch_iterator == run.branches.end()) {
+            continue;
+        }
+
+        BranchRuntime& branch = branch_iterator->second;
+        if (branch.frame.status != ExecutionStatus::Paused ||
+            branch.pending_async.has_value() ||
+            !branch.pending_async_group.empty() ||
+            branch_is_join_blocked(run, branch)) {
+            continue;
+        }
+
+        scheduler_.enqueue_task(ScheduledTask{
+            run_id,
+            branch.frame.current_node,
+            branch_id,
+            now_ns()
+        });
+        branch.frame.status = ExecutionStatus::Running;
+        enqueued_tasks += 1U;
+    }
+
+    if (trace_flags != nullptr) {
+        *trace_flags |= local_trace_flags;
+    }
+    return enqueued_tasks;
 }
 
 RunSnapshot ExecutionEngine::snapshot_run(RunId run_id, const RunRuntime& run) const {
@@ -1343,6 +1735,8 @@ RunSnapshot ExecutionEngine::snapshot_run(RunId run_id, const RunRuntime& run) c
         });
     }
 
+    snapshot.committed_subgraph_sessions = flatten_subgraph_session_table(run.committed_subgraph_sessions);
+
     return snapshot;
 }
 
@@ -1375,6 +1769,7 @@ bool ExecutionEngine::restore_run_from_snapshot(
     runtime.runtime_config_payload = snapshot.runtime_config_payload;
     runtime.next_branch_id = snapshot.next_branch_id;
     runtime.next_split_id = snapshot.next_split_id;
+    restore_subgraph_session_table(runtime.committed_subgraph_sessions, snapshot.committed_subgraph_sessions);
 
     for (const BranchSnapshot& branch_snapshot : snapshot.branches) {
         BranchRuntime branch;
@@ -1386,7 +1781,32 @@ bool ExecutionEngine::restore_run_from_snapshot(
         branch.pending_subgraph = branch_snapshot.pending_subgraph;
         branch.join_stack = branch_snapshot.join_stack;
         branch.reactive_root_node_id = branch_snapshot.reactive_root_node_id;
+        if (branch.pending_subgraph.has_value()) {
+            branch.last_subgraph_session_id = branch.pending_subgraph->session_id;
+            branch.last_subgraph_session_revision = branch.pending_subgraph->session_revision;
+        }
         runtime.branches.emplace(branch.frame.active_branch_id, std::move(branch));
+    }
+
+    for (const auto& [branch_id, branch] : runtime.branches) {
+        if (!branch.pending_subgraph.has_value() || branch.pending_subgraph->session_id.empty()) {
+            continue;
+        }
+        std::string lease_error;
+        if (!acquire_subgraph_session_lease(
+                runtime.active_subgraph_session_leases,
+                branch.frame.current_node,
+                branch.pending_subgraph->session_id,
+                branch_id,
+                &lease_error
+            )) {
+            if (error_message != nullptr) {
+                *error_message = lease_error.empty()
+                    ? "failed to restore persistent subgraph session lease"
+                    : lease_error;
+            }
+            return false;
+        }
     }
 
     for (const JoinScopeSnapshot& join_scope_snapshot : snapshot.join_scopes) {
@@ -1583,6 +2003,7 @@ ExecutionEngine::TaskExecutionRecord ExecutionEngine::execute_task(RunRuntime& r
         if (node->kind == NodeKind::Subgraph) {
             record.node_result = execute_subgraph_node(record.task.run_id, run, *node, branch);
         } else {
+            std::vector<TaskRecord> recorded_effects;
             ExecutionContext context{
                 branch.state_store.get_current_state(),
                 record.task.run_id,
@@ -1594,6 +2015,7 @@ ExecutionEngine::TaskExecutionRecord ExecutionEngine::execute_task(RunRuntime& r
                 branch.state_store.blobs(),
                 branch.state_store.strings(),
                 branch.state_store.knowledge_graph(),
+                branch.state_store.task_journal(),
                 runtime_tools(),
                 runtime_models(),
                 trace_sink_,
@@ -1603,9 +2025,18 @@ ExecutionEngine::TaskExecutionRecord ExecutionEngine::execute_task(RunRuntime& r
                         : now_ns() + (static_cast<uint64_t>(node->timeout_ms) * 1000000ULL)
                 ),
                 branch.cancel,
-                branch.pending_async
+                branch.pending_async,
+                &recorded_effects
             };
             record.node_result = node->executor(context);
+            if (!recorded_effects.empty()) {
+                record.node_result.patch.task_records.insert(
+                    record.node_result.patch.task_records.end(),
+                    std::make_move_iterator(recorded_effects.begin()),
+                    std::make_move_iterator(recorded_effects.end())
+                );
+                record.node_result.flags |= kTraceFlagRecordedEffect;
+            }
         }
     } catch (const std::exception& error) {
         record.node_result.status = NodeResult::HardFail;
@@ -1628,7 +2059,7 @@ ExecutionEngine::TaskExecutionRecord ExecutionEngine::execute_task(RunRuntime& r
 
 NodeResult ExecutionEngine::execute_subgraph_node(
     RunId run_id,
-    const RunRuntime& run,
+    RunRuntime& run,
     const NodeDefinition& node,
     BranchRuntime& branch
 ) {
@@ -1648,6 +2079,65 @@ NodeResult ExecutionEngine::execute_subgraph_node(
         child_engine.register_graph(graph);
     }
 
+    const bool persistent_session = is_persistent_subgraph_binding(*node.subgraph);
+    std::string active_session_id;
+    uint64_t active_session_revision = 0U;
+    const SubgraphSessionRecord* committed_session = nullptr;
+    if (branch.pending_subgraph.has_value()) {
+        active_session_id = branch.pending_subgraph->session_id;
+        active_session_revision = branch.pending_subgraph->session_revision;
+    } else if (persistent_session) {
+        std::string session_error;
+        const std::optional<std::string> resolved_session_id =
+            resolve_subgraph_session_id(branch.state_store, *node.subgraph, &session_error);
+        if (!resolved_session_id.has_value()) {
+            NodeResult result;
+            result.status = NodeResult::HardFail;
+            result.flags = kToolFlagValidationError;
+            return result;
+        }
+        active_session_id = *resolved_session_id;
+        {
+            std::lock_guard<std::mutex> session_guard(*run.subgraph_session_mutex);
+            if (!acquire_subgraph_session_lease(
+                    run.active_subgraph_session_leases,
+                    node.id,
+                    active_session_id,
+                    branch.frame.active_branch_id,
+                    &session_error
+                )) {
+                NodeResult result;
+                result.status = NodeResult::HardFail;
+                result.flags = kToolFlagValidationError;
+                return result;
+            }
+            committed_session = lookup_committed_subgraph_session(
+                run.committed_subgraph_sessions,
+                node.id,
+                active_session_id
+            );
+            active_session_revision = committed_session == nullptr
+                ? 1U
+                : committed_session->session_revision + 1U;
+        }
+    }
+    branch.last_subgraph_session_id = active_session_id;
+    branch.last_subgraph_session_revision = active_session_revision;
+
+    auto release_active_session_lease = [&]() {
+        if (!persistent_session || active_session_id.empty()) {
+            return;
+        }
+        std::lock_guard<std::mutex> session_guard(*run.subgraph_session_mutex);
+        release_subgraph_session_lease(
+            run.active_subgraph_session_leases,
+            node.id,
+            active_session_id,
+            branch.frame.active_branch_id
+        );
+    };
+
+    try {
     RunId child_run_id = 0U;
     if (branch.pending_subgraph.has_value()) {
         if (!branch.pending_subgraph->valid()) {
@@ -1683,8 +2173,30 @@ NodeResult ExecutionEngine::execute_subgraph_node(
 
         child_run_id = child_engine.start(target_graph_iterator->second, child_input);
         BranchRuntime& child_root_branch = child_engine.runs_.at(child_run_id).branches.at(0U);
+        bool seed_knowledge_graph = node.subgraph->propagate_knowledge_graph;
+        if (committed_session != nullptr) {
+            const RunSnapshot committed_snapshot =
+                deserialize_run_snapshot_bytes(committed_session->snapshot_bytes);
+            std::string projection_error;
+            const std::optional<StateStore> committed_projection =
+                project_subgraph_session_state(committed_snapshot, &projection_error);
+            if (!committed_projection.has_value()) {
+                release_active_session_lease();
+                NodeResult result;
+                result.status = NodeResult::HardFail;
+                result.flags = kToolFlagValidationError;
+                return result;
+            }
+            child_root_branch.state_store = *committed_projection;
+            seed_knowledge_graph = false;
+        }
         const StatePatch child_input_patch =
-            build_subgraph_input_patch(branch.state_store, *node.subgraph, child_root_branch.state_store);
+            build_subgraph_input_patch(
+                branch.state_store,
+                *node.subgraph,
+                child_root_branch.state_store,
+                seed_knowledge_graph
+            );
         if (!child_input_patch.empty()) {
             static_cast<void>(child_root_branch.state_store.apply(child_input_patch));
         }
@@ -1734,10 +2246,19 @@ NodeResult ExecutionEngine::execute_subgraph_node(
     };
 
     auto import_child_trace = [&]() -> std::vector<TraceEvent> {
-        const ExecutionNamespaceRef prefix{run.graph.id, node.id};
+        const ExecutionNamespaceRef prefix{
+            run.graph.id,
+            node.id,
+            active_session_id,
+            active_session_revision
+        };
         std::vector<TraceEvent> child_trace = child_engine.trace().events_for_run(child_run_id);
         for (TraceEvent child_event : child_trace) {
             child_event.run_id = run_id;
+            if (child_event.session_id.empty()) {
+                child_event.session_id = active_session_id;
+                child_event.session_revision = active_session_revision;
+            }
             child_event.namespace_path = prefix_namespace_path(prefix, child_event.namespace_path);
             trace_sink_.emit(child_event);
         }
@@ -1751,7 +2272,9 @@ NodeResult ExecutionEngine::execute_subgraph_node(
         const RunSnapshot child_snapshot = child_engine.snapshot_run(child_run_id, child_runtime);
         branch.pending_subgraph = PendingSubgraphExecution{
             child_run_id,
-            serialize_run_snapshot_bytes(child_snapshot)
+            serialize_run_snapshot_bytes(child_snapshot),
+            active_session_id,
+            active_session_revision
         };
         const std::vector<TraceEvent> child_trace = import_child_trace();
         const float confidence = child_trace.empty() ? 1.0F : child_trace.back().confidence;
@@ -1833,12 +2356,14 @@ NodeResult ExecutionEngine::execute_subgraph_node(
     }
 
     const RunRuntime& child_run = child_engine.runs_.at(child_run_id);
+    const RunSnapshot child_snapshot = child_engine.snapshot_run(child_run_id, child_run);
     const std::vector<TraceEvent> child_trace = import_child_trace();
     const float confidence = child_trace.empty() ? 1.0F : child_trace.back().confidence;
     branch.pending_subgraph.reset();
     branch.pending_async_group.clear();
 
     if (child_run.status == ExecutionStatus::Failed) {
+        release_active_session_lease();
         NodeResult result;
         result.status = NodeResult::HardFail;
         result.confidence = confidence;
@@ -1846,6 +2371,7 @@ NodeResult ExecutionEngine::execute_subgraph_node(
         return result;
     }
     if (child_run.status == ExecutionStatus::Cancelled) {
+        release_active_session_lease();
         NodeResult result;
         result.status = NodeResult::Cancelled;
         result.confidence = confidence;
@@ -1855,12 +2381,45 @@ NodeResult ExecutionEngine::execute_subgraph_node(
         throw std::runtime_error("subgraph execution did not reach a terminal state");
     }
 
+    std::string projection_error;
+    const std::optional<StateStore> projected_child_state =
+        project_subgraph_session_state(child_snapshot, &projection_error);
+    if (!projected_child_state.has_value()) {
+        release_active_session_lease();
+        NodeResult result;
+        result.status = NodeResult::HardFail;
+        result.confidence = confidence;
+        result.flags = kToolFlagValidationError;
+        return result;
+    }
+
+    if (persistent_session) {
+        std::lock_guard<std::mutex> session_guard(*run.subgraph_session_mutex);
+        store_committed_subgraph_session(
+            run.committed_subgraph_sessions,
+            node.id,
+            active_session_id,
+            active_session_revision,
+            serialize_run_snapshot_bytes(child_snapshot)
+        );
+        release_subgraph_session_lease(
+            run.active_subgraph_session_leases,
+            node.id,
+            active_session_id,
+            branch.frame.active_branch_id
+        );
+    }
+
     StatePatch patch = build_subgraph_output_patch(
-        child_engine.state_store(child_run_id),
+        *projected_child_state,
         *node.subgraph,
         branch.state_store
     );
     return NodeResult::success(std::move(patch), confidence);
+    } catch (...) {
+        release_active_session_lease();
+        throw;
+    }
 }
 
 StepResult ExecutionEngine::commit_task_execution(RunId run_id, RunRuntime& run, const TaskExecutionRecord& record) {
@@ -2114,7 +2673,11 @@ StepResult ExecutionEngine::commit_task_execution(RunId run_id, RunRuntime& run,
             branch.pending_subgraph.reset();
             branch.retry_count = 0;
 
-            if (has_node_policy(node->policy_flags, NodePolicyFlag::StopAfterNode)) {
+            if (record.node_result.status == NodeResult::HardFail) {
+                branch.frame.status = ExecutionStatus::Failed;
+            } else if (record.node_result.status == NodeResult::Cancelled) {
+                branch.frame.status = ExecutionStatus::Cancelled;
+            } else if (has_node_policy(node->policy_flags, NodePolicyFlag::StopAfterNode)) {
                 branch.frame.status = ExecutionStatus::Completed;
             } else if (record.node_result.next_override.has_value()) {
                 if (run.graph.find_node(*record.node_result.next_override) == nullptr) {
@@ -2181,6 +2744,10 @@ StepResult ExecutionEngine::commit_task_execution(RunId run_id, RunRuntime& run,
                         const uint16_t branch_retry_template = branch.retry_count;
                         const std::vector<uint32_t> branch_join_stack_template = branch.join_stack;
                         const std::optional<NodeId> branch_reactive_root_template = branch.reactive_root_node_id;
+                        const std::string branch_subgraph_session_id_template =
+                            branch.last_subgraph_session_id;
+                        const uint64_t branch_subgraph_session_revision_template =
+                            branch.last_subgraph_session_revision;
                         for (std::size_t index = 1; index < next_edges.size(); ++index) {
                             BranchRuntime cloned_branch;
                             cloned_branch.frame = branch_frame_template;
@@ -2189,6 +2756,9 @@ StepResult ExecutionEngine::commit_task_execution(RunId run_id, RunRuntime& run,
                             cloned_branch.retry_count = branch_retry_template;
                             cloned_branch.join_stack = branch_join_stack_template;
                             cloned_branch.reactive_root_node_id = branch_reactive_root_template;
+                            cloned_branch.last_subgraph_session_id = branch_subgraph_session_id_template;
+                            cloned_branch.last_subgraph_session_revision =
+                                branch_subgraph_session_revision_template;
                             run.branches.emplace(run.next_branch_id, std::move(cloned_branch));
                             scheduler_.enqueue_task(ScheduledTask{
                                 run_id,
@@ -2284,6 +2854,8 @@ StepResult ExecutionEngine::commit_task_execution(RunId run_id, RunRuntime& run,
         record.node_result.confidence,
         static_cast<uint32_t>(record.node_result.patch.updates.size()),
         trace_flags,
+        node->kind == NodeKind::Subgraph ? checkpoint_branch->last_subgraph_session_id : std::string{},
+        node->kind == NodeKind::Subgraph ? checkpoint_branch->last_subgraph_session_revision : 0U,
         {}
     });
 

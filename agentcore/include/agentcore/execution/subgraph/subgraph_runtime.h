@@ -9,7 +9,8 @@ namespace agentcore {
 [[nodiscard]] StatePatch build_subgraph_input_patch(
     const StateStore& parent_state,
     const SubgraphBinding& binding,
-    StateStore& child_state
+    StateStore& child_state,
+    bool seed_knowledge_graph
 );
 
 [[nodiscard]] StatePatch build_subgraph_output_patch(

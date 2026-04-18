@@ -1,6 +1,6 @@
 import asyncio
 
-from agentcore.graph import END, START, StateGraph
+from agentcore.graph import END, START, RuntimeContext, StateGraph
 
 
 async def planner(state, config):
@@ -109,5 +109,71 @@ async def exercise_async_surface():
 
 
 asyncio.run(exercise_async_surface())
+
+
+recorded_effect_calls = {"count": 0}
+recorded_effect_replays: list[bool] = []
+recorded_effect_runtime_available: list[bool] = []
+
+
+def produce_memoized_value():
+    recorded_effect_calls["count"] += 1
+    return {
+        "value": "cached-result",
+        "producer_call": recorded_effect_calls["count"],
+    }
+
+
+def memoized_step(state, config, runtime: RuntimeContext):
+    assert runtime.available is True
+    recorded_effect_runtime_available.append(runtime.available)
+
+    stable_request = {
+        "memo_key": "expensive-lookup",
+        "run_label": dict(config.get("configurable", {})).get("run_label", "unset"),
+    }
+
+    details = runtime.record_once_with_metadata(
+        "python::memoized::expensive-lookup",
+        stable_request,
+        produce_memoized_value,
+    )
+    recorded_effect_replays.append(bool(details["replayed"]))
+
+    visit = int(state.get("visit", 0)) + 1
+    return {
+        "visit": visit,
+        "memoized_value": details["value"]["value"],
+        "producer_call": details["value"]["producer_call"],
+        "replayed": details["replayed"],
+    }
+
+
+def memoized_route(state, config, runtime: RuntimeContext):
+    assert runtime.available is True
+    return END if int(state.get("visit", 0)) >= 2 else "memoized"
+
+
+memo_graph = StateGraph(dict, name="python_record_once_smoke", worker_count=2)
+memo_graph.add_node("memoized", memoized_step)
+memo_graph.add_edge(START, "memoized")
+memo_graph.add_conditional_edges(
+    "memoized",
+    memoized_route,
+    {END: END, "memoized": "memoized"},
+)
+memo_compiled = memo_graph.compile()
+
+memo_result = memo_compiled.invoke(
+    {"visit": 0},
+    config={"configurable": {"run_label": "record-once-smoke"}},
+)
+assert memo_result["visit"] == 2
+assert memo_result["memoized_value"] == "cached-result"
+assert memo_result["producer_call"] == 1
+assert memo_result["replayed"] is True
+assert recorded_effect_calls["count"] == 1
+assert recorded_effect_replays == [False, True]
+assert recorded_effect_runtime_available == [True, True]
 
 print("python state graph api smoke passed")

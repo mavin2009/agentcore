@@ -13,6 +13,8 @@ struct StreamNamespaceFrame {
     NodeId node_id{0};
     std::string graph_name;
     std::string node_name;
+    std::string session_id;
+    uint64_t session_revision{0};
 };
 
 struct StreamEvent {
@@ -26,6 +28,8 @@ struct StreamEvent {
     float confidence{0.0F};
     uint32_t patch_count{0};
     uint32_t flags{0};
+    std::string session_id;
+    uint64_t session_revision{0};
     std::vector<StreamNamespaceFrame> namespaces;
 };
 
