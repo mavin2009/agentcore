@@ -51,6 +51,25 @@ struct OpenAiChatModelAdapterOptions {
     AdapterMetadata metadata{};
 };
 
+struct GrokChatModelAdapterOptions {
+    ModelPolicy policy{};
+    HttpTransportOptions transport{};
+    std::string provider_model_name;
+    std::string endpoint_path{"/chat/completions"};
+    std::string system_prompt;
+    bool include_json_schema{true};
+    AdapterMetadata metadata{};
+};
+
+struct GeminiGenerateContentModelAdapterOptions {
+    ModelPolicy policy{};
+    HttpTransportOptions transport{};
+    std::string provider_model_name;
+    std::string endpoint_path;
+    std::string system_prompt;
+    AdapterMetadata metadata{};
+};
+
 void register_http_tool_adapter(
     ToolRegistry& registry,
     std::string_view tool_name = "http_tool",
@@ -85,6 +104,18 @@ void register_openai_chat_model_adapter(
     ModelRegistry& registry,
     std::string_view model_name = "openai_chat",
     const OpenAiChatModelAdapterOptions& options = {}
+);
+
+void register_grok_chat_model_adapter(
+    ModelRegistry& registry,
+    std::string_view model_name = "grok_chat",
+    const GrokChatModelAdapterOptions& options = {}
+);
+
+void register_gemini_generate_content_model_adapter(
+    ModelRegistry& registry,
+    std::string_view model_name = "gemini",
+    const GeminiGenerateContentModelAdapterOptions& options = {}
 );
 
 } // namespace agentcore

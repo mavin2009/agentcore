@@ -1692,6 +1692,116 @@ PyObject* py_register_openai_chat_model_adapter(PyObject*, PyObject* args, PyObj
     Py_RETURN_NONE;
 }
 
+PyObject* py_register_grok_chat_model_adapter(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* capsule = nullptr;
+    const char* name = "grok_chat";
+    PyObject* policy_object = Py_None;
+    PyObject* transport_object = Py_None;
+    const char* provider_model_name = "";
+    const char* endpoint_path = "/chat/completions";
+    const char* system_prompt = "";
+    int include_json_schema = 1;
+    static const char* keywords[] = {
+        "graph",
+        "name",
+        "policy",
+        "transport",
+        "provider_model_name",
+        "endpoint_path",
+        "system_prompt",
+        "include_json_schema",
+        nullptr
+    };
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "O|sOOsssp",
+            const_cast<char**>(keywords),
+            &capsule,
+            &name,
+            &policy_object,
+            &transport_object,
+            &provider_model_name,
+            &endpoint_path,
+            &system_prompt,
+            &include_json_schema
+        )) {
+        return nullptr;
+    }
+
+    GraphHandle* handle = require_graph_handle(capsule);
+    if (handle == nullptr) {
+        return nullptr;
+    }
+
+    GrokChatModelAdapterOptions options;
+    options.provider_model_name = provider_model_name;
+    options.endpoint_path = endpoint_path;
+    options.system_prompt = system_prompt;
+    options.include_json_schema = include_json_schema != 0;
+    std::string error_message;
+    if (!parse_model_policy(policy_object, &options.policy, &error_message) ||
+        !parse_http_transport_options(transport_object, &options.transport, &error_message)) {
+        PyErr_SetString(PyExc_ValueError, error_message.c_str());
+        return nullptr;
+    }
+    register_grok_chat_model_adapter(handle->models(), name, options);
+    Py_RETURN_NONE;
+}
+
+PyObject* py_register_gemini_generate_content_model_adapter(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* capsule = nullptr;
+    const char* name = "gemini";
+    PyObject* policy_object = Py_None;
+    PyObject* transport_object = Py_None;
+    const char* provider_model_name = "";
+    const char* endpoint_path = "";
+    const char* system_prompt = "";
+    static const char* keywords[] = {
+        "graph",
+        "name",
+        "policy",
+        "transport",
+        "provider_model_name",
+        "endpoint_path",
+        "system_prompt",
+        nullptr
+    };
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "O|sOOsss",
+            const_cast<char**>(keywords),
+            &capsule,
+            &name,
+            &policy_object,
+            &transport_object,
+            &provider_model_name,
+            &endpoint_path,
+            &system_prompt
+        )) {
+        return nullptr;
+    }
+
+    GraphHandle* handle = require_graph_handle(capsule);
+    if (handle == nullptr) {
+        return nullptr;
+    }
+
+    GeminiGenerateContentModelAdapterOptions options;
+    options.provider_model_name = provider_model_name;
+    options.endpoint_path = endpoint_path;
+    options.system_prompt = system_prompt;
+    std::string error_message;
+    if (!parse_model_policy(policy_object, &options.policy, &error_message) ||
+        !parse_http_transport_options(transport_object, &options.transport, &error_message)) {
+        PyErr_SetString(PyExc_ValueError, error_message.c_str());
+        return nullptr;
+    }
+    register_gemini_generate_content_model_adapter(handle->models(), name, options);
+    Py_RETURN_NONE;
+}
+
 PyObject* py_register_python_model_adapter(PyObject*, PyObject* args, PyObject* kwargs) {
     PyObject* capsule = nullptr;
     const char* name = nullptr;
@@ -1984,6 +2094,18 @@ PyMethodDef kModuleMethods[] = {
         reinterpret_cast<PyCFunction>(py_register_openai_chat_model_adapter),
         METH_VARARGS | METH_KEYWORDS,
         "Register the built-in OpenAI-compatible chat model adapter on a compiled graph."
+    },
+    {
+        "_register_grok_chat_model_adapter",
+        reinterpret_cast<PyCFunction>(py_register_grok_chat_model_adapter),
+        METH_VARARGS | METH_KEYWORDS,
+        "Register the built-in xAI Grok chat model adapter on a compiled graph."
+    },
+    {
+        "_register_gemini_generate_content_model_adapter",
+        reinterpret_cast<PyCFunction>(py_register_gemini_generate_content_model_adapter),
+        METH_VARARGS | METH_KEYWORDS,
+        "Register the built-in Gemini generateContent model adapter on a compiled graph."
     },
     {
         "_register_python_model_adapter",

@@ -191,10 +191,12 @@ Built-in adapters currently include:
 - local model adapter
 - HTTP LLM adapter
 - OpenAI-compatible chat model adapter
+- xAI Grok chat model adapter
+- Gemini `generateContent` model adapter
 
 Those implementations live under `./agentcore/adapters/`.
 
-The adapter boundary is intentionally narrow so that model/tool payloads can move as `BlobRef` values through the state system and execution engine without introducing engine-specific logic for individual external systems.
+The adapter boundary is intentionally narrow so that model/tool payloads can move as `BlobRef` values through the state system and execution engine without introducing engine-specific logic for individual external systems. That same constraint is why the current provider adapters split the way they do: Grok reuses the shared chat-completions HTTP seam because the request/response shape is compatible, while Gemini is implemented as a direct `generateContent` adapter so the runtime can expose its API-key auth and JSON-schema response path without pretending every provider speaks the same protocol.
 
 The registries now also carry an explicit adapter contract through `AdapterMetadata`, transport/auth enums, capability flags, and stable error categorization helpers. That means adapters are no longer just callable handlers; they can describe:
 
@@ -454,7 +456,7 @@ When a callback accepts a third positional argument, the runtime passes a `Runti
 
 That seam exists for restart-safe synchronous work. If a Python node needs to compute or fetch a value once and then replay the committed outcome on later visits within the same run, the runtime helper routes that through the native task journal rather than asking application code to invent its own replay policy.
 
-Compiled graphs also expose graph-owned adapter registries directly through `.tools` and `.models`. That lets Python code register built-in adapters such as the SQLite-like tool adapter, the HTTP JSON tool adapter, the local model adapter, and the OpenAI-compatible chat model adapter without dropping into C++. The same registry views now also accept custom Python-backed tool/model handlers through `compiled.tools.register(...)` and `compiled.models.register(...)`, with optional payload decoding and metadata overrides. The important part is where those handlers land: they are still registered into the native graph-owned registries, so direct invocation, `RuntimeContext` invocation, registry inspection, and subgraph inheritance all go through the same runtime-owned adapter path rather than a separate Python-only dispatch layer.
+Compiled graphs also expose graph-owned adapter registries directly through `.tools` and `.models`. That lets Python code register built-in adapters such as the SQLite-like tool adapter, the HTTP JSON tool adapter, the local model adapter, the OpenAI-compatible chat model adapter, the xAI Grok chat model adapter, and the Gemini `generateContent` model adapter without dropping into C++. The same registry views now also accept custom Python-backed tool/model handlers through `compiled.tools.register(...)` and `compiled.models.register(...)`, with optional payload decoding and metadata overrides. The important part is where those handlers land: they are still registered into the native graph-owned registries, so direct invocation, `RuntimeContext` invocation, registry inspection, and subgraph inheritance all go through the same runtime-owned adapter path rather than a separate Python-only dispatch layer.
 
 Subgraph notes:
 

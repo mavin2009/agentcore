@@ -82,6 +82,25 @@ compiled = graph.compile()
 
 compiled.tools.register_sqlite("kv_store", policy={"retry_limit": 1})
 compiled.models.register_local("summarizer", default_max_tokens=32)
+compiled.models.register_grok_chat(
+    "grok_builtin",
+    transport={
+        "base_url": "https://api.x.ai/v1",
+        "bearer_token": "xai-test",
+    },
+    provider_model_name="grok-4",
+    system_prompt="Route deeply.",
+)
+compiled.models.register_gemini_generate_content(
+    "gemini_builtin",
+    transport={
+        "base_url": "https://generativelanguage.googleapis.com/v1beta",
+        "api_key": "gemini-test",
+        "api_key_header": "x-goog-api-key",
+    },
+    provider_model_name="gemini-2.5-flash",
+    system_prompt="Be precise.",
+)
 compiled.tools.register(
     "py_upper",
     custom_tool_handler,
@@ -135,11 +154,25 @@ assert python_tool_spec["metadata"]["request_format"] == "json"
 assert "structured_request" in python_tool_spec["metadata"]["capabilities"]
 
 model_specs = {spec["name"]: spec for spec in compiled.models.list()}
-assert {"summarizer", "py_summarizer"} <= set(model_specs)
+assert {"summarizer", "py_summarizer", "grok_builtin", "gemini_builtin"} <= set(model_specs)
 model_spec = compiled.models.describe("summarizer")
 assert model_spec is not None
 assert model_spec["metadata"]["implementation"] == "local_model"
 assert model_spec["metadata"]["transport"] == "in_process"
+
+grok_spec = compiled.models.describe("grok_builtin")
+assert grok_spec is not None
+assert grok_spec["metadata"]["provider"] == "xai"
+assert grok_spec["metadata"]["implementation"] == "grok_chat"
+assert grok_spec["metadata"]["auth"] == "bearer_token"
+assert "chat_messages" in grok_spec["metadata"]["capabilities"]
+
+gemini_spec = compiled.models.describe("gemini_builtin")
+assert gemini_spec is not None
+assert gemini_spec["metadata"]["provider"] == "google_gemini"
+assert gemini_spec["metadata"]["implementation"] == "gemini_generate_content"
+assert gemini_spec["metadata"]["auth"] == "api_key"
+assert "json_schema" in gemini_spec["metadata"]["capabilities"]
 
 python_model_spec = compiled.models.describe("py_summarizer")
 assert python_model_spec is not None

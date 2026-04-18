@@ -35,6 +35,7 @@ What they cover:
 - metadata and streaming surfaces
 - Python runtime helper injection and recorded-effect replay
 - Python adapter registration, discovery, direct invocation, and runtime invocation
+- built-in native provider registration for OpenAI-compatible chat, xAI Grok chat, and Gemini `generateContent`
 - Python-backed custom tool/model handlers registered into the native registries
 - single-agent and multi-agent flows
 - higher-level pipeline and specialist-team builders
@@ -63,6 +64,7 @@ That path proves the installed wheel, not the build tree, still supports:
 
 - Python graph construction and execution
 - graph-owned adapter registry configuration and invocation
+- built-in provider adapter registration for OpenAI-compatible chat, xAI Grok chat, and Gemini `generateContent`
 - custom Python-backed adapter handlers routed through the native registry seam
 - multi-agent and subgraph flows
 - higher-level pipeline and specialist-team builders

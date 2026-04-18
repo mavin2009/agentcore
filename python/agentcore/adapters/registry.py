@@ -500,6 +500,48 @@ class ModelRegistryView:
             include_json_schema=bool(include_json_schema),
         )
 
+    def register_grok_chat(
+        self,
+        name: str = "grok_chat",
+        *,
+        policy: dict[str, Any] | None = None,
+        transport: dict[str, Any] | None = None,
+        provider_model_name: str = "",
+        endpoint_path: str = "/chat/completions",
+        system_prompt: str = "",
+        include_json_schema: bool = True,
+    ) -> None:
+        _native._register_grok_chat_model_adapter(
+            self._native_graph,
+            name=str(name),
+            policy=policy,
+            transport=transport,
+            provider_model_name=str(provider_model_name),
+            endpoint_path=str(endpoint_path),
+            system_prompt=str(system_prompt),
+            include_json_schema=bool(include_json_schema),
+        )
+
+    def register_gemini_generate_content(
+        self,
+        name: str = "gemini",
+        *,
+        policy: dict[str, Any] | None = None,
+        transport: dict[str, Any] | None = None,
+        provider_model_name: str = "",
+        endpoint_path: str = "",
+        system_prompt: str = "",
+    ) -> None:
+        _native._register_gemini_generate_content_model_adapter(
+            self._native_graph,
+            name=str(name),
+            policy=policy,
+            transport=transport,
+            provider_model_name=str(provider_model_name),
+            endpoint_path=str(endpoint_path),
+            system_prompt=str(system_prompt),
+        )
+
     def invoke_with_metadata(
         self,
         name: str,

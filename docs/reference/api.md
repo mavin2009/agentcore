@@ -184,6 +184,8 @@ The `producer` callable is invoked only when no previously committed recorded ef
 - `register_local(name="local_model", *, policy=None, default_max_tokens=256)`
 - `register_llm_http(name="llm_http", *, policy=None, enable_mock_transport=True)`
 - `register_openai_chat(name="openai_chat", *, policy=None, transport=None, provider_model_name="", endpoint_path="/chat/completions", system_prompt="", include_json_schema=True)`
+- `register_grok_chat(name="grok_chat", *, policy=None, transport=None, provider_model_name="", endpoint_path="/chat/completions", system_prompt="", include_json_schema=True)`
+- `register_gemini_generate_content(name="gemini", *, policy=None, transport=None, provider_model_name="", endpoint_path="", system_prompt="")`
 - `invoke(name, prompt, *, schema=None, max_tokens=0, decode="auto")`
 - `invoke_with_metadata(name, prompt, *, schema=None, max_tokens=0, decode="auto")`
 
@@ -270,7 +272,7 @@ Provider-style HTTP adapters also build on the shared transport seam in [`../../
 - `HttpTransport`
 - `HttpTransportOptions`
 
-That seam is used by the built-in HTTP JSON tool adapter and the OpenAI-compatible chat model adapter so auth, timeout, and header handling stay shared across providers instead of being reimplemented inside each adapter.
+That seam is used by the built-in HTTP JSON tool adapter, the OpenAI-compatible chat adapter, the xAI Grok adapter, and the Gemini adapter so auth, timeout, and header handling stay shared where protocols overlap instead of being reimplemented inside each provider module. Gemini still has its own direct request builder because its `generateContent` API shape is meaningfully different from chat-completions style providers.
 
 ### Adapter Metadata And Capabilities
 

@@ -300,6 +300,13 @@ The built-in registration helpers currently cover:
 - `compiled.models.register_local(...)`
 - `compiled.models.register_llm_http(...)`
 - `compiled.models.register_openai_chat(...)`
+- `compiled.models.register_grok_chat(...)`
+- `compiled.models.register_gemini_generate_content(...)`
+
+Provider notes:
+
+- `compiled.models.register_grok_chat(...)` uses the shared chat-completions HTTP seam and defaults to the xAI base URL plus `XAI_API_KEY` environment lookup when explicit bearer-token settings are not provided.
+- `compiled.models.register_gemini_generate_content(...)` uses Gemini's direct `generateContent` REST surface and defaults to the Gemini API base URL plus `GEMINI_API_KEY` lookup with the `x-goog-api-key` header.
 
 ## Fan-Out, Join, And Subgraphs
 

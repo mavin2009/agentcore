@@ -235,6 +235,87 @@ int main() {
             {}
         }
     );
+    register_grok_chat_model_adapter(
+        models,
+        "grok_chat",
+        GrokChatModelAdapterOptions{
+            {},
+            HttpTransportOptions{
+                [](const HttpRequest& request) {
+                    assert(request.method == "POST");
+                    assert(request.url == "https://api.x.ai/v1/chat/completions");
+                    assert(has_header(request.headers, "Authorization", "Bearer xai-test"));
+                    assert(has_header(request.headers, "Content-Type", "application/json"));
+                    assert(request.body.find("\"model\":\"grok-4\"") != std::string::npos);
+                    assert(request.body.find("\"role\":\"system\"") != std::string::npos);
+                    assert(request.body.find("Route deeply.") != std::string::npos);
+                    assert(request.body.find("\"response_format\"") != std::string::npos);
+                    return HttpResponse{
+                        true,
+                        200L,
+                        {},
+                        "{\"choices\":[{\"message\":{\"content\":\"grok answer\"}}],\"usage\":{\"total_tokens\":77}}",
+                        "",
+                        0U
+                    };
+                },
+                "https://api.x.ai/v1",
+                {},
+                "xai-test"
+            },
+            "grok-4",
+            "/chat/completions",
+            "Route deeply.",
+            true,
+            {}
+        }
+    );
+    register_gemini_generate_content_model_adapter(
+        models,
+        "gemini",
+        GeminiGenerateContentModelAdapterOptions{
+            {},
+            HttpTransportOptions{
+                [](const HttpRequest& request) {
+                    assert(request.method == "POST");
+                    assert(
+                        request.url ==
+                        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+                    );
+                    assert(has_header(request.headers, "x-goog-api-key", "gemini-test"));
+                    assert(has_header(request.headers, "Content-Type", "application/json"));
+                    assert(has_header(request.headers, "Accept", "application/json"));
+                    assert(request.body.find("\"system_instruction\"") != std::string::npos);
+                    assert(request.body.find("Be precise.") != std::string::npos);
+                    assert(request.body.find("\"contents\"") != std::string::npos);
+                    assert(request.body.find("summarize state patches") != std::string::npos);
+                    assert(request.body.find("\"generationConfig\"") != std::string::npos);
+                    assert(request.body.find("\"maxOutputTokens\":96") != std::string::npos);
+                    assert(request.body.find("\"responseMimeType\":\"application/json\"") != std::string::npos);
+                    assert(request.body.find("\"responseJsonSchema\":{\"type\":\"object\"}") != std::string::npos);
+                    return HttpResponse{
+                        true,
+                        200L,
+                        {},
+                        "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"gemini answer\"}]}}],\"usageMetadata\":{\"totalTokenCount\":33}}",
+                        "",
+                        0U
+                    };
+                },
+                "https://generativelanguage.googleapis.com/v1beta",
+                {},
+                "",
+                "",
+                "gemini-test",
+                "",
+                "x-goog-api-key"
+            },
+            "gemini-2.5-flash",
+            "",
+            "Be precise.",
+            {}
+        }
+    );
 
     const auto local_spec = models.describe_model("local");
     assert(local_spec.has_value());
@@ -255,6 +336,19 @@ int main() {
     assert(openai_spec->spec.metadata.provider == "openai_compatible");
     assert(adapter_has_capability(openai_spec->spec.metadata, kAdapterCapabilityChatMessages));
     assert(adapter_has_capability(openai_spec->spec.metadata, kAdapterCapabilityExternalNetwork));
+
+    const auto grok_spec = models.describe_model("grok_chat");
+    assert(grok_spec.has_value());
+    assert(grok_spec->spec.metadata.provider == "xai");
+    assert(grok_spec->spec.metadata.implementation == "grok_chat");
+    assert(adapter_has_capability(grok_spec->spec.metadata, kAdapterCapabilityChatMessages));
+
+    const auto gemini_spec = models.describe_model("gemini");
+    assert(gemini_spec.has_value());
+    assert(gemini_spec->spec.metadata.provider == "google_gemini");
+    assert(gemini_spec->spec.metadata.implementation == "gemini_generate_content");
+    assert(gemini_spec->spec.metadata.auth == AdapterAuthKind::ApiKey);
+    assert(adapter_has_capability(gemini_spec->spec.metadata, kAdapterCapabilityJsonSchema));
 
     const ModelResponse local_response = models.invoke(
         ModelRequest{
@@ -293,6 +387,32 @@ int main() {
     assert(openai_response.ok);
     assert(read_blob_as_string(blobs, openai_response.output) == "adapter answer");
     assert(openai_response.token_usage == 42U);
+
+    const ModelResponse grok_response = models.invoke(
+        ModelRequest{
+            strings.intern("grok_chat"),
+            blobs.append_string("find the best route"),
+            blobs.append_string("{\"type\":\"object\"}"),
+            96U
+        },
+        model_context
+    );
+    assert(grok_response.ok);
+    assert(read_blob_as_string(blobs, grok_response.output) == "grok answer");
+    assert(grok_response.token_usage == 77U);
+
+    const ModelResponse gemini_response = models.invoke(
+        ModelRequest{
+            strings.intern("gemini"),
+            blobs.append_string("summarize state patches"),
+            blobs.append_string("{\"type\":\"object\"}"),
+            96U
+        },
+        model_context
+    );
+    assert(gemini_response.ok);
+    assert(read_blob_as_string(blobs, gemini_response.output) == "gemini answer");
+    assert(gemini_response.token_usage == 33U);
 
     const ModelResponse invalid_model_response = models.invoke(
         ModelRequest{
@@ -343,6 +463,30 @@ int main() {
     );
     assert(!missing_auth_model_response.ok);
     assert(classify_model_response_flags(missing_auth_model_response.flags) == ModelErrorCategory::Validation);
+
+    register_gemini_generate_content_model_adapter(
+        unauthenticated_models,
+        "gemini_missing_auth",
+        GeminiGenerateContentModelAdapterOptions{
+            {},
+            HttpTransportOptions{
+                nullptr,
+                "https://generativelanguage.googleapis.com/v1beta"
+            },
+            "gemini-2.5-flash"
+        }
+    );
+    const ModelResponse missing_gemini_auth_response = unauthenticated_models.invoke(
+        ModelRequest{
+            strings.intern("gemini_missing_auth"),
+            blobs.append_string("prompt"),
+            {},
+            32U
+        },
+        model_context
+    );
+    assert(!missing_gemini_auth_response.ok);
+    assert(classify_model_response_flags(missing_gemini_auth_response.flags) == ModelErrorCategory::Validation);
 
     std::cout << "adapter tests passed" << std::endl;
     return 0;
