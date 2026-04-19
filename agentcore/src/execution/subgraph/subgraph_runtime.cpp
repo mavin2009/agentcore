@@ -46,12 +46,12 @@ StatePatch build_subgraph_input_patch(
     const WorkflowState& parent = parent_state.get_current_state();
     patch.updates.reserve(binding.input_bindings.size());
     for (const SubgraphStateBinding& mapping : binding.input_bindings) {
-        if (mapping.parent_key >= parent.fields.size()) {
+        if (mapping.parent_key >= parent.size()) {
             continue;
         }
         patch.updates.push_back(FieldUpdate{
             mapping.child_key,
-            rebase_value(parent_state, child_state, parent.fields[mapping.parent_key])
+            rebase_value(parent_state, child_state, parent.load(mapping.parent_key))
         });
     }
 
@@ -101,12 +101,12 @@ StatePatch build_subgraph_output_patch(
     const WorkflowState& child = child_state.get_current_state();
     patch.updates.reserve(binding.output_bindings.size());
     for (const SubgraphStateBinding& mapping : binding.output_bindings) {
-        if (mapping.child_key >= child.fields.size()) {
+        if (mapping.child_key >= child.size()) {
             continue;
         }
         patch.updates.push_back(FieldUpdate{
             mapping.parent_key,
-            rebase_value(child_state, parent_state, child.fields[mapping.child_key])
+            rebase_value(child_state, parent_state, child.load(mapping.child_key))
         });
     }
 

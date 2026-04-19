@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <mutex>
 #include <cstring>
 #include <istream>
 #include <memory>
@@ -246,25 +248,73 @@ StatePatch read_state_patch(std::istream& input) {
 }
 
 void write_workflow_state(std::ostream& output, const WorkflowState& state) {
-    write_pod(output, state.version);
-    write_pod<uint64_t>(output, static_cast<uint64_t>(state.fields.size()));
-    for (const Value& value : state.fields) {
-        write_value(output, value);
+    const uint64_t version = state.version.load(std::memory_order_acquire);
+    const uint64_t field_count = state.total_capacity.load(std::memory_order_acquire);
+    write_pod(output, version);
+    write_pod(output, field_count);
+    for (uint64_t index = 0; index < field_count; ++index) {
+        write_value(output, state.load(static_cast<StateKey>(index)));
     }
 }
 
 WorkflowState read_workflow_state(std::istream& input) {
     WorkflowState state;
-    state.version = read_pod<uint64_t>(input);
+    const uint64_t version = read_pod<uint64_t>(input);
     const uint64_t field_count = read_pod<uint64_t>(input);
-    state.fields.reserve(static_cast<std::size_t>(field_count));
+    state.resize(static_cast<std::size_t>(field_count));
+    state.version.store(version, std::memory_order_release);
     for (uint64_t index = 0; index < field_count; ++index) {
-        state.fields.push_back(read_value(input));
+        state.store(static_cast<StateKey>(index), read_value(input));
     }
     return state;
 }
 
 } // namespace
+
+WorkflowState::WorkflowState(const WorkflowState& other)
+    : segments(), total_capacity(0), version(0) {
+    *this = other;
+}
+
+WorkflowState& WorkflowState::operator=(const WorkflowState& other) {
+    if (this == &other) {
+        return *this;
+    }
+    segments = other.segments;
+    total_capacity.store(other.total_capacity.load(std::memory_order_acquire), std::memory_order_release);
+    version.store(other.version.load(std::memory_order_acquire), std::memory_order_release);
+    return *this;
+}
+
+void WorkflowState::resize(std::size_t new_size) {
+    std::size_t current_capacity = total_capacity.load(std::memory_order_acquire);
+    while (current_capacity < new_size) {
+        segments.emplace_back(std::make_shared<Segment>());
+        current_capacity += kSegmentSize;
+    }
+    total_capacity.store(current_capacity, std::memory_order_release);
+}
+
+Value WorkflowState::load(StateKey key) const noexcept {
+    const std::size_t segment_index = key / kSegmentSize;
+    const std::size_t element_index = key % kSegmentSize;
+    if (segment_index >= segments.size()) {
+        return std::monostate{};
+    }
+    return segments[segment_index]->values[element_index];
+}
+
+void WorkflowState::store(StateKey key, Value value) noexcept {
+    const std::size_t segment_index = key / kSegmentSize;
+    const std::size_t element_index = key % kSegmentSize;
+    if (segment_index >= segments.size()) {
+        resize(static_cast<std::size_t>(key) + 1U);
+    }
+    if (!segments[segment_index].unique()) {
+        segments[segment_index] = std::make_shared<Segment>(*segments[segment_index]);
+    }
+    segments[segment_index]->values[element_index] = std::move(value);
+}
 
 struct StringInterner::Storage {
     std::vector<std::string> values;
@@ -376,7 +426,20 @@ std::vector<std::byte> BlobStore::read_bytes(BlobRef ref) const {
     );
 }
 
+std::pair<const std::byte*, std::size_t> BlobStore::read_buffer(BlobRef ref) const {
+    const std::size_t start = ref.offset;
+    const std::size_t end = start + ref.size;
+    if (ref.pool_id != storage_->pool_id || end > storage_->bytes.size()) {
+        return {nullptr, 0};
+    }
+    return {storage_->bytes.data() + start, ref.size};
+}
+
 std::string_view BlobStore::read_string(BlobRef ref) const {
+    return read_string_view(ref);
+}
+
+std::string_view BlobStore::read_string_view(BlobRef ref) const {
     const std::size_t start = ref.offset;
     const std::size_t end = start + ref.size;
     if (ref.pool_id != storage_->pool_id || end > storage_->bytes.size()) {
@@ -427,30 +490,77 @@ BlobStore BlobStore::deserialize(std::istream& input) {
     return store;
 }
 
+struct PatchLog::Storage {
+    mutable std::mutex mutex;
+    std::vector<PatchLogEntry> entries;
+};
+
+PatchLog::PatchLog() : storage_(std::make_shared<Storage>()) {}
+
+PatchLog::PatchLog(const PatchLog& other) : storage_(other.storage_) {}
+
+PatchLog& PatchLog::operator=(const PatchLog& other) {
+    if (this == &other) {
+        return *this;
+    }
+    storage_ = other.storage_;
+    return *this;
+}
+
+void PatchLog::ensure_unique() {
+    if (storage_.unique()) {
+        return;
+    }
+
+    auto cloned = std::make_shared<Storage>();
+    {
+        std::lock_guard<std::mutex> lock(storage_->mutex);
+        cloned->entries = storage_->entries;
+    }
+    storage_ = std::move(cloned);
+}
+
 uint64_t PatchLog::append(uint64_t state_version, const StatePatch& patch) {
-    const auto offset = static_cast<uint64_t>(entries_.size());
-    entries_.push_back(PatchLogEntry{offset, state_version, patch});
+    ensure_unique();
+    std::lock_guard<std::mutex> lock(storage_->mutex);
+    const auto offset = static_cast<uint64_t>(storage_->entries.size());
+    storage_->entries.push_back(PatchLogEntry{offset, state_version, patch});
     return offset;
 }
 
 const PatchLogEntry* PatchLog::find(uint64_t offset) const {
-    if (offset >= entries_.size()) {
+    std::lock_guard<std::mutex> lock(storage_->mutex);
+    if (offset >= storage_->entries.size()) {
         return nullptr;
     }
-    return &entries_[static_cast<std::size_t>(offset)];
+    return &storage_->entries[static_cast<std::size_t>(offset)];
 }
 
-const std::vector<PatchLogEntry>& PatchLog::entries() const noexcept {
-    return entries_;
+std::vector<PatchLogEntry> PatchLog::entries() const {
+    std::lock_guard<std::mutex> lock(storage_->mutex);
+    return storage_->entries;
+}
+
+std::vector<PatchLogEntry> PatchLog::entries_from(uint64_t offset) const {
+    std::lock_guard<std::mutex> lock(storage_->mutex);
+    if (offset >= storage_->entries.size()) {
+        return {};
+    }
+    return std::vector<PatchLogEntry>(
+        storage_->entries.begin() + static_cast<std::ptrdiff_t>(offset),
+        storage_->entries.end()
+    );
 }
 
 std::size_t PatchLog::size() const noexcept {
-    return entries_.size();
+    std::lock_guard<std::mutex> lock(storage_->mutex);
+    return storage_->entries.size();
 }
 
 void PatchLog::serialize(std::ostream& output) const {
-    write_pod<uint64_t>(output, static_cast<uint64_t>(entries_.size()));
-    for (const PatchLogEntry& entry : entries_) {
+    std::lock_guard<std::mutex> lock(storage_->mutex);
+    write_pod<uint64_t>(output, static_cast<uint64_t>(storage_->entries.size()));
+    for (const PatchLogEntry& entry : storage_->entries) {
         write_pod(output, entry.offset);
         write_pod(output, entry.state_version);
         write_state_patch(output, entry.patch);
@@ -459,10 +569,11 @@ void PatchLog::serialize(std::ostream& output) const {
 
 PatchLog PatchLog::deserialize(std::istream& input) {
     PatchLog log;
+    log.storage_ = std::make_shared<Storage>();
     const uint64_t entry_count = read_pod<uint64_t>(input);
-    log.entries_.reserve(static_cast<std::size_t>(entry_count));
+    log.storage_->entries.reserve(static_cast<std::size_t>(entry_count));
     for (uint64_t index = 0; index < entry_count; ++index) {
-        log.entries_.push_back(PatchLogEntry{
+        log.storage_->entries.push_back(PatchLogEntry{
             read_pod<uint64_t>(input),
             read_pod<uint64_t>(input),
             read_state_patch(input)
@@ -477,8 +588,8 @@ StateStore::StateStore(std::size_t initial_field_count) {
 
 void StateStore::reset(std::size_t initial_field_count) {
     current_state_ = WorkflowState{};
-    current_state_.fields.resize(initial_field_count);
-    current_state_.version = 0;
+    current_state_.resize(initial_field_count);
+    current_state_.version.store(0, std::memory_order_release);
     blob_store_ = BlobStore{};
     patch_log_ = PatchLog{};
     string_interner_ = StringInterner{};
@@ -486,9 +597,30 @@ void StateStore::reset(std::size_t initial_field_count) {
     task_journal_.clear();
 }
 
+StateStore::StateStore(const StateStore& other)
+    : current_state_(other.current_state_),
+      blob_store_(other.blob_store_),
+      patch_log_(other.patch_log_),
+      string_interner_(other.string_interner_),
+      knowledge_graph_(other.knowledge_graph_),
+      task_journal_(other.task_journal_) {}
+
+StateStore& StateStore::operator=(const StateStore& other) {
+    if (this == &other) {
+        return *this;
+    }
+    current_state_ = other.current_state_;
+    blob_store_ = other.blob_store_;
+    patch_log_ = other.patch_log_;
+    string_interner_ = other.string_interner_;
+    knowledge_graph_ = other.knowledge_graph_;
+    task_journal_ = other.task_journal_;
+    return *this;
+}
+
 void StateStore::ensure_field_capacity(std::size_t field_count) {
-    if (current_state_.fields.size() < field_count) {
-        current_state_.fields.resize(field_count);
+    if (current_state_.total_capacity.load(std::memory_order_acquire) < field_count) {
+        current_state_.resize(field_count);
     }
 }
 
@@ -504,8 +636,7 @@ StateApplyResult StateStore::apply_with_summary(const StatePatch& patch) {
     }
 
     for (const FieldUpdate& update : patch.updates) {
-        ensure_field_capacity(static_cast<std::size_t>(update.key) + 1U);
-        current_state_.fields[update.key] = update.value;
+        current_state_.store(update.key, update.value);
     }
 
     if (!patch.knowledge_graph.empty()) {
@@ -649,8 +780,8 @@ StateApplyResult StateStore::apply_with_summary(const StatePatch& patch) {
         return result;
     }
 
-    current_state_.version += 1U;
-    result.patch_log_offset = patch_log_.append(current_state_.version, patch);
+    current_state_.version.fetch_add(1U, std::memory_order_acq_rel);
+    result.patch_log_offset = patch_log_.append(current_state_.version.load(std::memory_order_acquire), patch);
     return result;
 }
 
@@ -663,10 +794,12 @@ WorkflowState& StateStore::mutable_state() {
 }
 
 const Value* StateStore::find(StateKey key) const {
-    if (key >= current_state_.fields.size()) {
+    static thread_local Value last_found;
+    last_found = current_state_.load(key);
+    if (std::holds_alternative<std::monostate>(last_found)) {
         return nullptr;
     }
-    return &current_state_.fields[key];
+    return &last_found;
 }
 
 BlobStore& StateStore::blobs() noexcept {

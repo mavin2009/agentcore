@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <iostream>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
@@ -328,21 +329,21 @@ void replay_branch_knowledge_graph_delta(
     uint64_t split_patch_log_offset,
     StateStore& destination_state
 ) {
-    const auto& entries = source_state.patch_log().entries();
-    if (split_patch_log_offset > entries.size()) {
+    if (split_patch_log_offset > source_state.patch_log().size()) {
         throw std::runtime_error("invalid split patch offset during knowledge graph merge");
     }
+    const std::vector<PatchLogEntry> entries = source_state.patch_log().entries_from(split_patch_log_offset);
 
-    for (std::size_t index = static_cast<std::size_t>(split_patch_log_offset); index < entries.size(); ++index) {
+    for (const PatchLogEntry& entry : entries) {
         const KnowledgeGraphPatch rebased_kg =
-            rebase_knowledge_graph_patch(source_state, destination_state, entries[index].patch.knowledge_graph);
+            rebase_knowledge_graph_patch(source_state, destination_state, entry.patch.knowledge_graph);
         if (rebased_kg.empty()) {
             continue;
         }
 
         StatePatch patch;
         patch.knowledge_graph = rebased_kg;
-        patch.flags = entries[index].patch.flags;
+        patch.flags = entry.patch.flags;
         static_cast<void>(destination_state.apply(patch));
     }
 }
@@ -362,13 +363,14 @@ std::unordered_map<StateKey, std::vector<BranchFieldWrite>> collect_branch_field
         }
 
         std::unordered_map<StateKey, Value> last_writes_for_branch;
-        const auto& entries = branch_iterator->second.state_store.patch_log().entries();
-        if (split_patch_log_offset > entries.size()) {
+        if (split_patch_log_offset > branch_iterator->second.state_store.patch_log().size()) {
             throw std::runtime_error("invalid split patch offset while collecting join field writes");
         }
+        const std::vector<PatchLogEntry> entries =
+            branch_iterator->second.state_store.patch_log().entries_from(split_patch_log_offset);
 
-        for (std::size_t index = static_cast<std::size_t>(split_patch_log_offset); index < entries.size(); ++index) {
-            for (const FieldUpdate& update : entries[index].patch.updates) {
+        for (const PatchLogEntry& entry : entries) {
+            for (const FieldUpdate& update : entry.patch.updates) {
                 last_writes_for_branch[update.key] = update.value;
             }
         }
@@ -738,7 +740,85 @@ std::optional<GraphId> missing_subgraph_graph_id(
 
 } // namespace
 
-ExecutionEngine::ExecutionEngine(std::size_t worker_count) : scheduler_(worker_count) {
+ExecutionEngine::BranchRuntime::BranchRuntime(BranchRuntime&& other) noexcept
+    : frame(std::move(other.frame)),
+      state_store(std::move(other.state_store)),
+      scratch(std::move(other.scratch)),
+      deadline(std::move(other.deadline)),
+      cancel(std::move(other.cancel)),
+      retry_count(other.retry_count),
+      pending_async(std::move(other.pending_async)),
+      pending_async_group(std::move(other.pending_async_group)),
+      pending_subgraph(std::move(other.pending_subgraph)),
+      join_stack(std::move(other.join_stack)),
+      reactive_root_node_id(std::move(other.reactive_root_node_id)),
+      last_subgraph_session_id(std::move(other.last_subgraph_session_id)),
+      last_subgraph_session_revision(other.last_subgraph_session_revision) {}
+
+ExecutionEngine::BranchRuntime& ExecutionEngine::BranchRuntime::operator=(BranchRuntime&& other) noexcept {
+    if (this != &other) {
+        frame = std::move(other.frame);
+        state_store = std::move(other.state_store);
+        scratch = std::move(other.scratch);
+        deadline = std::move(other.deadline);
+        cancel = std::move(other.cancel);
+        retry_count = other.retry_count;
+        pending_async = std::move(other.pending_async);
+        pending_async_group = std::move(other.pending_async_group);
+        pending_subgraph = std::move(other.pending_subgraph);
+        join_stack = std::move(other.join_stack);
+        reactive_root_node_id = std::move(other.reactive_root_node_id);
+        last_subgraph_session_id = std::move(other.last_subgraph_session_id);
+        last_subgraph_session_revision = other.last_subgraph_session_revision;
+    }
+    return *this;
+}
+
+ExecutionEngine::RunRuntime::RunRuntime() : mutex(std::make_unique<std::mutex>()) {}
+
+ExecutionEngine::RunRuntime::RunRuntime(RunRuntime&& other) noexcept
+    : graph(std::move(other.graph)),
+      status(other.status),
+      runtime_config_payload(std::move(other.runtime_config_payload)),
+      mutex(std::move(other.mutex)),
+      branches(std::move(other.branches)),
+      next_branch_id(other.next_branch_id),
+      join_scopes(std::move(other.join_scopes)),
+      reactive_frontiers(std::move(other.reactive_frontiers)),
+      committed_subgraph_sessions(std::move(other.committed_subgraph_sessions)),
+      active_subgraph_session_leases(std::move(other.active_subgraph_session_leases)),
+      subgraph_session_mutex(std::move(other.subgraph_session_mutex)),
+      next_split_id(other.next_split_id),
+      in_flight_tasks(other.in_flight_tasks) {
+    if (!mutex) {
+        mutex = std::make_unique<std::mutex>();
+    }
+}
+
+ExecutionEngine::RunRuntime& ExecutionEngine::RunRuntime::operator=(RunRuntime&& other) noexcept {
+    if (this != &other) {
+        graph = std::move(other.graph);
+        status = other.status;
+        runtime_config_payload = std::move(other.runtime_config_payload);
+        mutex = std::move(other.mutex);
+        branches = std::move(other.branches);
+        next_branch_id = other.next_branch_id;
+        join_scopes = std::move(other.join_scopes);
+        reactive_frontiers = std::move(other.reactive_frontiers);
+        committed_subgraph_sessions = std::move(other.committed_subgraph_sessions);
+        active_subgraph_session_leases = std::move(other.active_subgraph_session_leases);
+        subgraph_session_mutex = std::move(other.subgraph_session_mutex);
+        next_split_id = other.next_split_id;
+        in_flight_tasks = other.in_flight_tasks;
+        if (!mutex) {
+            mutex = std::make_unique<std::mutex>();
+        }
+    }
+    return *this;
+}
+
+ExecutionEngine::ExecutionEngine(std::size_t worker_count, bool inline_scheduler)
+ : scheduler_(worker_count, inline_scheduler) {
     tool_registry_.set_async_completion_listener([this](AsyncToolHandle handle) {
         scheduler_.signal_async_completion(AsyncWaitKey{AsyncWaitKind::Tool, handle.id});
     });
@@ -1029,12 +1109,17 @@ RunId ExecutionEngine::start(const GraphDefinition& graph, const InputEnvelope& 
     root_branch.frame.active_branch_id = 0;
     root_branch.frame.status = ExecutionStatus::Running;
     root_branch.state_store = StateStore(input.initial_field_count);
+    root_branch.state_store.blobs() = input.initial_blobs;
+    root_branch.state_store.strings() = input.initial_strings;
     if (!input.initial_patch.empty()) {
         static_cast<void>(root_branch.state_store.apply(input.initial_patch));
     }
 
     runtime.branches.emplace(0U, std::move(root_branch));
-    runs_.emplace(run_id, std::move(runtime));
+    {
+        std::lock_guard<std::mutex> lock(runs_mutex_);
+        runs_.emplace(run_id, std::move(runtime));
+    }
     scheduler_.enqueue_task(ScheduledTask{
         run_id,
         input.entry_override.value_or(runtime_graph.entry),
@@ -1048,20 +1133,28 @@ StepResult ExecutionEngine::step(RunId run_id) {
     StepResult result;
     result.run_id = run_id;
 
-    auto run_iterator = runs_.find(run_id);
-    if (run_iterator == runs_.end()) {
-        result.message = "run not found";
-        result.status = ExecutionStatus::Failed;
-        return result;
+    RunRuntime* run_ptr = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(runs_mutex_);
+        auto run_iterator = runs_.find(run_id);
+        if (run_iterator == runs_.end()) {
+            result.message = "run not found";
+            result.status = ExecutionStatus::Failed;
+            return result;
+        }
+        run_ptr = &run_iterator->second;
     }
+    RunRuntime& run = *run_ptr;
 
-    RunRuntime& run = run_iterator->second;
     static_cast<void>(scheduler_.promote_ready_async_tasks(now_ns()));
     const auto task = scheduler_.dequeue_ready_for_run(run_id, now_ns());
     if (!task.has_value()) {
         update_run_status(run, run_id);
-        result.status = run.status;
-        result.waiting = (run.status == ExecutionStatus::Paused) || scheduler_.has_async_waiters_for_run(run_id);
+        {
+            std::lock_guard<std::mutex> run_lock(*run.mutex);
+            result.status = run.status;
+        }
+        result.waiting = (result.status == ExecutionStatus::Paused) || scheduler_.has_async_waiters_for_run(run_id);
         result.message = scheduler_.has_async_waiters_for_run(run_id)
             ? "waiting on async completion"
             : "no ready task";
@@ -1075,72 +1168,133 @@ RunResult ExecutionEngine::run_to_completion(RunId run_id) {
     RunResult result;
     result.run_id = run_id;
 
-    auto run_iterator = runs_.find(run_id);
-    if (run_iterator == runs_.end()) {
-        result.status = ExecutionStatus::Failed;
-        return result;
+    RunRuntime* run_ptr = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(runs_mutex_);
+        auto run_iterator = runs_.find(run_id);
+        if (run_iterator == runs_.end()) {
+            result.status = ExecutionStatus::Failed;
+            return result;
+        }
+        run_ptr = &run_iterator->second;
     }
+    RunRuntime& run = *run_ptr;
 
-    RunRuntime& run = run_iterator->second;
-    while (true) {
-        static_cast<void>(scheduler_.promote_ready_async_tasks(now_ns()));
-        const std::vector<ScheduledTask> tasks = scheduler_.dequeue_ready_batch_for_run(
+    auto dispatch_ready_tasks = [this, run_id, &run]() -> std::vector<ScheduledTask> {
+        std::vector<ScheduledTask> tasks = scheduler_.dequeue_ready_batch_for_run(
             run_id,
             now_ns(),
             scheduler_.parallelism()
         );
+        for (const ScheduledTask& task : tasks) {
+            {
+                std::lock_guard<std::mutex> run_lock(*run.mutex);
+                run.in_flight_tasks += 1U;
+            }
+            scheduler_.run_async([this, run_id, task]() {
+                RunRuntime* queued_run_ptr = nullptr;
+                {
+                    std::lock_guard<std::mutex> lock(runs_mutex_);
+                    const auto run_iterator = runs_.find(run_id);
+                    if (run_iterator == runs_.end()) {
+                        return;
+                    }
+                    queued_run_ptr = &run_iterator->second;
+                }
+                push_commit(run_id, execute_task(*queued_run_ptr, task));
+            });
+        }
+        return tasks;
+    };
 
-        if (tasks.empty()) {
-            update_run_status(run, run_id);
-            if (scheduler_.has_async_waiters_for_run(run_id)) {
-                scheduler_.wait_for_async_activity(std::chrono::milliseconds(50));
+    auto collect_batch_records = [this, run_id, &run](const std::vector<ScheduledTask>& tasks) {
+        std::vector<TaskExecutionRecord> unordered_records;
+        unordered_records.reserve(tasks.size());
+
+        while (unordered_records.size() < tasks.size()) {
+            std::optional<TaskCommitRecord> commit_record =
+                pop_commit(run_id, std::chrono::milliseconds(50));
+            if (!commit_record.has_value()) {
                 continue;
             }
-            result.status = run.status;
-            break;
+            {
+                std::lock_guard<std::mutex> run_lock(*run.mutex);
+                if (run.in_flight_tasks > 0U) {
+                    run.in_flight_tasks -= 1U;
+                }
+            }
+            unordered_records.push_back(std::move(commit_record->record));
         }
 
-        if (tasks.size() == 1U) {
-            const TaskExecutionRecord record = execute_task(run, tasks.front());
-            const StepResult step_result = commit_task_execution(run_id, run, record);
-            result.status = step_result.status;
-            result.last_checkpoint_id = step_result.checkpoint_id;
-            if (step_result.progressed) {
-                result.steps_executed += 1U;
+        std::vector<TaskExecutionRecord> ordered_records;
+        ordered_records.reserve(tasks.size());
+        for (const ScheduledTask& task : tasks) {
+            const auto record_iterator = std::find_if(
+                unordered_records.begin(),
+                unordered_records.end(),
+                [&task](const TaskExecutionRecord& record) {
+                    return record.task.run_id == task.run_id &&
+                        record.task.node_id == task.node_id &&
+                        record.task.branch_id == task.branch_id;
+                }
+            );
+            if (record_iterator == unordered_records.end()) {
+                throw std::runtime_error("missing task execution record for dispatched batch task");
             }
+            ordered_records.push_back(std::move(*record_iterator));
+            unordered_records.erase(record_iterator);
+        }
+        return ordered_records;
+    };
 
-            update_run_status(run, run_id);
-            if (run.status != ExecutionStatus::Running) {
-                result.status = run.status;
-                break;
+    auto read_run_status = [&run]() {
+        std::lock_guard<std::mutex> run_lock(*run.mutex);
+        return std::pair{run.status, run.in_flight_tasks};
+    };
+
+    while (true) {
+        static_cast<void>(scheduler_.promote_ready_async_tasks(now_ns()));
+        const std::vector<ScheduledTask> dispatched_tasks = dispatch_ready_tasks();
+
+        if (!dispatched_tasks.empty()) {
+            const std::vector<TaskExecutionRecord> ordered_records =
+                collect_batch_records(dispatched_tasks);
+            for (const TaskExecutionRecord& record : ordered_records) {
+                const StepResult step_result = commit_task_execution(run_id, run, record);
+                result.status = step_result.status;
+                result.last_checkpoint_id = step_result.checkpoint_id;
+                if (step_result.progressed) {
+                    result.steps_executed += 1U;
+                }
+            }
+        }
+
+        static_cast<void>(scheduler_.promote_ready_async_tasks(now_ns()));
+        update_run_status(run, run_id);
+        auto [current_status, current_in_flight] = read_run_status();
+        if (current_status == ExecutionStatus::Running) {
+            if (!scheduler_.has_tasks_for_run(run_id)) {
+                if (scheduler_.has_async_waiters_for_run(run_id)) {
+                    scheduler_.wait_for_async_activity(std::chrono::milliseconds(50));
+                } else if (current_in_flight == 0U) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
             }
             continue;
         }
 
-        std::vector<TaskExecutionRecord> records(tasks.size());
-        std::vector<std::function<void()>> jobs;
-        jobs.reserve(tasks.size());
-        for (std::size_t index = 0; index < tasks.size(); ++index) {
-            jobs.push_back([this, &run, &records, task = tasks[index], index]() {
-                records[index] = execute_task(run, task);
-            });
-        }
-        scheduler_.run_batch(jobs);
-
-        for (const TaskExecutionRecord& record : records) {
-            const StepResult step_result = commit_task_execution(run_id, run, record);
-            result.status = step_result.status;
-            result.last_checkpoint_id = step_result.checkpoint_id;
-            if (step_result.progressed) {
-                result.steps_executed += 1U;
-            }
+        if (scheduler_.promote_ready_async_tasks(now_ns()) != 0U) {
+            continue;
         }
 
         update_run_status(run, run_id);
-        if (run.status != ExecutionStatus::Running) {
-            result.status = run.status;
-            break;
+        std::tie(current_status, current_in_flight) = read_run_status();
+        if (current_status == ExecutionStatus::Running) {
+            continue;
         }
+
+        result.status = current_status;
+        break;
     }
 
     return result;
@@ -1179,7 +1333,10 @@ ResumeResult ExecutionEngine::resume(CheckpointId checkpoint_id) {
         return result;
     }
 
-    result.status = runs_.at(run_id).status;
+    {
+        std::lock_guard<std::mutex> lock(runs_mutex_);
+        result.status = runs_.at(run_id).status;
+    }
     result.resumed = true;
     result.message = missing_async_handles == 0U
         ? "checkpoint restored"
@@ -1191,14 +1348,20 @@ ResumeResult ExecutionEngine::resume_run(RunId run_id) {
     ResumeResult result;
     result.run_id = run_id;
 
-    auto run_iterator = runs_.find(run_id);
-    if (run_iterator == runs_.end()) {
-        result.status = ExecutionStatus::Failed;
-        result.message = "run not found";
-        return result;
+    RunRuntime* run_ptr = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(runs_mutex_);
+        auto run_iterator = runs_.find(run_id);
+        if (run_iterator == runs_.end()) {
+            result.status = ExecutionStatus::Failed;
+            result.message = "run not found";
+            return result;
+        }
+        run_ptr = &run_iterator->second;
     }
+    RunRuntime& run = *run_ptr;
 
-    RunRuntime& run = run_iterator->second;
+    std::lock_guard<std::mutex> run_lock(*run.mutex);
     if (run.status != ExecutionStatus::Paused) {
         result.status = run.status;
         result.message = "run is not paused";
@@ -1208,7 +1371,7 @@ ResumeResult ExecutionEngine::resume_run(RunId run_id) {
     scheduler_.remove_run(run_id);
     re_register_run_async_waiters(run_id, run);
     const std::size_t enqueued_tasks = enqueue_resumable_paused_branches(run_id, run);
-    update_run_status(run, run_id);
+    update_run_status_locked(run, run_id);
 
     result.status = run.status;
     result.resumed = enqueued_tasks != 0U || scheduler_.has_async_waiters_for_run(run_id);
@@ -1226,14 +1389,20 @@ InterruptResult ExecutionEngine::interrupt(RunId run_id) {
     InterruptResult result;
     result.run_id = run_id;
 
-    auto run_iterator = runs_.find(run_id);
-    if (run_iterator == runs_.end()) {
-        result.status = ExecutionStatus::Failed;
-        result.message = "run not found";
-        return result;
+    RunRuntime* run_ptr = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(runs_mutex_);
+        auto run_iterator = runs_.find(run_id);
+        if (run_iterator == runs_.end()) {
+            result.status = ExecutionStatus::Failed;
+            result.message = "run not found";
+            return result;
+        }
+        run_ptr = &run_iterator->second;
     }
+    RunRuntime& run = *run_ptr;
+    std::lock_guard<std::mutex> run_lock(*run.mutex);
 
-    RunRuntime& run = run_iterator->second;
     if (run.branches.empty()) {
         result.status = ExecutionStatus::Failed;
         result.message = "run has no branches";
@@ -1255,7 +1424,7 @@ InterruptResult ExecutionEngine::interrupt(RunId run_id) {
             branch.frame.status = ExecutionStatus::Paused;
         }
     }
-    update_run_status(run, run_id);
+    update_run_status_locked(run, run_id);
 
     auto checkpoint_branch_iterator = run.branches.find(0U);
     if (checkpoint_branch_iterator == run.branches.end()) {
@@ -1317,13 +1486,19 @@ StateEditResult ExecutionEngine::apply_state_patch(RunId run_id, const StatePatc
     result.run_id = run_id;
     result.branch_id = branch_id;
 
-    auto run_iterator = runs_.find(run_id);
-    if (run_iterator == runs_.end()) {
-        result.message = "run not found";
-        return result;
+    RunRuntime* run_ptr = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(runs_mutex_);
+        auto run_iterator = runs_.find(run_id);
+        if (run_iterator == runs_.end()) {
+            result.message = "run not found";
+            return result;
+        }
+        run_ptr = &run_iterator->second;
     }
+    RunRuntime& run = *run_ptr;
+    std::lock_guard<std::mutex> run_lock(*run.mutex);
 
-    RunRuntime& run = run_iterator->second;
     if (run.status != ExecutionStatus::Paused) {
         result.message = "run must be paused before applying a state patch";
         return result;
@@ -1410,11 +1585,14 @@ StateEditResult ExecutionEngine::apply_state_patch(RunId run_id, const StatePatc
 }
 
 RunSnapshot ExecutionEngine::inspect(RunId run_id) const {
+    std::lock_guard<std::mutex> lock(runs_mutex_);
     const auto run_iterator = runs_.find(run_id);
     if (run_iterator == runs_.end()) {
         throw std::out_of_range("run not found");
     }
-    return snapshot_run(run_id, run_iterator->second);
+    const RunRuntime& run = run_iterator->second;
+    std::lock_guard<std::mutex> run_lock(*run.mutex);
+    return snapshot_run(run_id, run);
 }
 
 const WorkflowState& ExecutionEngine::state(RunId run_id, uint32_t branch_id) const {
@@ -1422,13 +1600,16 @@ const WorkflowState& ExecutionEngine::state(RunId run_id, uint32_t branch_id) co
 }
 
 const StateStore& ExecutionEngine::state_store(RunId run_id, uint32_t branch_id) const {
+    std::lock_guard<std::mutex> lock(runs_mutex_);
     const auto run_iterator = runs_.find(run_id);
     if (run_iterator == runs_.end()) {
         throw std::out_of_range("run not found");
     }
 
-    const auto branch_iterator = run_iterator->second.branches.find(branch_id);
-    if (branch_iterator == run_iterator->second.branches.end()) {
+    const RunRuntime& run = run_iterator->second;
+    std::lock_guard<std::mutex> run_lock(*run.mutex);
+    const auto branch_iterator = run.branches.find(branch_id);
+    if (branch_iterator == run.branches.end()) {
         throw std::out_of_range("branch not found");
     }
 
@@ -1440,6 +1621,7 @@ const KnowledgeGraphStore& ExecutionEngine::knowledge_graph(RunId run_id, uint32
 }
 
 const GraphDefinition& ExecutionEngine::graph(RunId run_id) const {
+    std::lock_guard<std::mutex> lock(runs_mutex_);
     const auto run_iterator = runs_.find(run_id);
     if (run_iterator == runs_.end()) {
         throw std::out_of_range("run not found");
@@ -1834,7 +2016,10 @@ bool ExecutionEngine::restore_run_from_snapshot(
     }
     rebuild_reactive_frontier_state(runtime);
 
-    runs_[run_id] = std::move(runtime);
+    {
+        std::lock_guard<std::mutex> lock(runs_mutex_);
+        runs_[run_id] = std::move(runtime);
+    }
     next_run_id_ = std::max(next_run_id_, run_id + 1U);
     scheduler_.remove_run(run_id);
     for (ScheduledTask task : snapshot.pending_tasks) {
@@ -1899,7 +2084,12 @@ bool ExecutionEngine::restore_run_from_snapshot(
         }
     }
 
-    update_run_status(runs_.at(run_id), run_id);
+    RunRuntime* final_run_ptr = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(runs_mutex_);
+        final_run_ptr = &runs_.at(run_id);
+    }
+    update_run_status(*final_run_ptr, run_id);
     if (missing_async_handles != nullptr) {
         *missing_async_handles = local_missing_async_handles;
     }
@@ -1949,14 +2139,18 @@ bool ExecutionEngine::should_capture_checkpoint_snapshot(
 }
 
 ExecutionEngine::TaskExecutionRecord ExecutionEngine::execute_task(RunRuntime& run, const ScheduledTask& task) {
+    std::unique_lock<std::mutex> lock(*run.mutex);
+    const NodeDefinition* node_ptr = run.graph.find_node(task.node_id);
     TaskExecutionRecord record;
     record.task = task;
+    record.started_at_ns = now_ns();
 
     auto branch_iterator = run.branches.find(task.branch_id);
     if (branch_iterator == run.branches.end()) {
         record.node_result.status = NodeResult::HardFail;
         record.node_result.flags = kToolFlagValidationError;
         record.error_message = "branch not found";
+        record.ended_at_ns = record.started_at_ns;
         return record;
     }
 
@@ -1967,6 +2161,7 @@ ExecutionEngine::TaskExecutionRecord ExecutionEngine::execute_task(RunRuntime& r
         record.node_result.status = NodeResult::HardFail;
         record.node_result.flags = kToolFlagValidationError;
         record.error_message = "node executor not found";
+        record.ended_at_ns = record.started_at_ns;
         return record;
     }
 
@@ -1977,28 +2172,34 @@ ExecutionEngine::TaskExecutionRecord ExecutionEngine::execute_task(RunRuntime& r
         scheduler_.remove_async_waiters_for_task(task);
     }
 
-    if (has_node_policy(node->policy_flags, NodePolicyFlag::JoinIncomingBranches) &&
-        !branch.join_stack.empty()) {
-        const uint32_t split_id = branch.join_stack.back();
-        if (run.join_scopes.find(split_id) == run.join_scopes.end()) {
-            branch.frame.status = ExecutionStatus::Failed;
-            record.node_result.status = NodeResult::HardFail;
-            record.node_result.flags = kToolFlagValidationError;
-            record.error_message = "join scope not found for branch";
+    if (has_node_policy(node->policy_flags, NodePolicyFlag::JoinIncomingBranches)) {
+        if (!branch.join_stack.empty()) {
+            const uint32_t split_id = branch.join_stack.back();
+            if (run.join_scopes.find(split_id) == run.join_scopes.end()) {
+                branch.frame.status = ExecutionStatus::Failed;
+                record.node_result.status = NodeResult::HardFail;
+                record.node_result.flags = kToolFlagValidationError;
+                record.error_message = "join scope not found for branch";
+                record.ended_at_ns = record.started_at_ns;
+                return record;
+            }
+
+            record.ended_at_ns = now_ns();
+            record.node_result = NodeResult::waiting({}, 1.0F);
+            record.node_result.flags = kTraceFlagJoinBarrier;
+            record.progressed = true;
+            record.blocked_on_join = true;
+            record.blocked_join_scope_id = split_id;
             return record;
         }
-
-        record.started_at_ns = now_ns();
-        record.ended_at_ns = record.started_at_ns;
-        record.node_result = NodeResult::waiting({}, 1.0F);
-        record.node_result.flags = kTraceFlagJoinBarrier;
-        record.progressed = true;
-        record.blocked_on_join = true;
-        record.blocked_join_scope_id = split_id;
-        return record;
     }
 
-    record.started_at_ns = now_ns();
+    // Capture necessary state before releasing the lock
+    const std::vector<std::byte> runtime_config_payload = run.runtime_config_payload;
+    const GraphId graph_id = branch.frame.graph_id;
+
+    lock.unlock();
+
     try {
         if (node->kind == NodeKind::Subgraph) {
             record.node_result = execute_subgraph_node(record.task.run_id, run, *node, branch);
@@ -2007,10 +2208,10 @@ ExecutionEngine::TaskExecutionRecord ExecutionEngine::execute_task(RunRuntime& r
             ExecutionContext context{
                 branch.state_store.get_current_state(),
                 record.task.run_id,
-                branch.frame.graph_id,
+                graph_id,
                 task.node_id,
                 task.branch_id,
-                run.runtime_config_payload,
+                runtime_config_payload,
                 branch.scratch,
                 branch.state_store.blobs(),
                 branch.state_store.strings(),
@@ -2047,6 +2248,8 @@ ExecutionEngine::TaskExecutionRecord ExecutionEngine::execute_task(RunRuntime& r
         record.node_result.flags = kToolFlagHandlerException;
         record.error_message = "unknown execution failure";
     }
+
+    lock.lock();
     record.ended_at_ns = now_ns();
 
     if (branch.cancel.is_cancelled()) {
@@ -2072,17 +2275,17 @@ NodeResult ExecutionEngine::execute_subgraph_node(
         throw std::runtime_error("subgraph target graph is not registered");
     }
 
-    ExecutionEngine child_engine(scheduler_.parallelism());
+    ExecutionEngine child_engine(1U, true);
     child_engine.set_checkpoint_policy(checkpoint_policy_);
     child_engine.borrow_runtime_registries(runtime_tools(), runtime_models());
-    for (const auto& [_, graph] : graph_registry_) {
-        child_engine.register_graph(graph);
-    }
+    child_engine.graph_registry_ = graph_registry_;
 
     const bool persistent_session = is_persistent_subgraph_binding(*node.subgraph);
     std::string active_session_id;
     uint64_t active_session_revision = 0U;
-    const SubgraphSessionRecord* committed_session = nullptr;
+    std::shared_ptr<RunSnapshot> committed_session_snapshot;
+    std::shared_ptr<StateStore> committed_session_projection;
+    std::vector<std::byte> committed_session_snapshot_bytes;
     if (branch.pending_subgraph.has_value()) {
         active_session_id = branch.pending_subgraph->session_id;
         active_session_revision = branch.pending_subgraph->session_revision;
@@ -2111,7 +2314,7 @@ NodeResult ExecutionEngine::execute_subgraph_node(
                 result.flags = kToolFlagValidationError;
                 return result;
             }
-            committed_session = lookup_committed_subgraph_session(
+            const SubgraphSessionRecord* committed_session = lookup_committed_subgraph_session(
                 run.committed_subgraph_sessions,
                 node.id,
                 active_session_id
@@ -2119,6 +2322,15 @@ NodeResult ExecutionEngine::execute_subgraph_node(
             active_session_revision = committed_session == nullptr
                 ? 1U
                 : committed_session->session_revision + 1U;
+            if (committed_session != nullptr) {
+                committed_session_snapshot = committed_session->snapshot;
+                committed_session_projection = committed_session->projected_state;
+                if (!committed_session_snapshot &&
+                    !committed_session_projection &&
+                    !committed_session->snapshot_bytes.empty()) {
+                    committed_session_snapshot_bytes = committed_session->snapshot_bytes;
+                }
+            }
         }
     }
     branch.last_subgraph_session_id = active_session_id;
@@ -2174,20 +2386,24 @@ NodeResult ExecutionEngine::execute_subgraph_node(
         child_run_id = child_engine.start(target_graph_iterator->second, child_input);
         BranchRuntime& child_root_branch = child_engine.runs_.at(child_run_id).branches.at(0U);
         bool seed_knowledge_graph = node.subgraph->propagate_knowledge_graph;
-        if (committed_session != nullptr) {
-            const RunSnapshot committed_snapshot =
-                deserialize_run_snapshot_bytes(committed_session->snapshot_bytes);
-            std::string projection_error;
-            const std::optional<StateStore> committed_projection =
-                project_subgraph_session_state(committed_snapshot, &projection_error);
-            if (!committed_projection.has_value()) {
-                release_active_session_lease();
-                NodeResult result;
-                result.status = NodeResult::HardFail;
-                result.flags = kToolFlagValidationError;
-                return result;
+        if (committed_session_snapshot || committed_session_projection || !committed_session_snapshot_bytes.empty()) {
+            if (!committed_session_projection) {
+                const RunSnapshot committed_snapshot = committed_session_snapshot != nullptr
+                    ? *committed_session_snapshot
+                    : deserialize_run_snapshot_bytes(committed_session_snapshot_bytes);
+                std::string projection_error;
+                const std::optional<StateStore> committed_projection =
+                    project_subgraph_session_state(committed_snapshot, &projection_error);
+                if (!committed_projection.has_value()) {
+                    release_active_session_lease();
+                    NodeResult result;
+                    result.status = NodeResult::HardFail;
+                    result.flags = kToolFlagValidationError;
+                    return result;
+                }
+                committed_session_projection = std::make_shared<StateStore>(*committed_projection);
             }
-            child_root_branch.state_store = *committed_projection;
+            child_root_branch.state_store = *committed_session_projection;
             seed_knowledge_graph = false;
         }
         const StatePatch child_input_patch =
@@ -2400,7 +2616,9 @@ NodeResult ExecutionEngine::execute_subgraph_node(
             node.id,
             active_session_id,
             active_session_revision,
-            serialize_run_snapshot_bytes(child_snapshot)
+            {},
+            std::make_shared<RunSnapshot>(child_snapshot),
+            std::make_shared<StateStore>(*projected_child_state)
         );
         release_subgraph_session_lease(
             run.active_subgraph_session_leases,
@@ -2423,6 +2641,8 @@ NodeResult ExecutionEngine::execute_subgraph_node(
 }
 
 StepResult ExecutionEngine::commit_task_execution(RunId run_id, RunRuntime& run, const TaskExecutionRecord& record) {
+    std::lock_guard<std::mutex> lock(*run.mutex);
+    const NodeDefinition* node_ptr = run.graph.find_node(record.task.node_id);
     StepResult result;
     result.run_id = run_id;
     result.node_id = record.task.node_id;
@@ -2815,7 +3035,7 @@ StepResult ExecutionEngine::commit_task_execution(RunId run_id, RunRuntime& run,
     result.branch_id = checkpoint_branch_id;
     result.step_index = checkpoint_branch->frame.step_index;
 
-    update_run_status(run, run_id);
+    update_run_status_locked(run, run_id);
 
     const CheckpointId checkpoint_id = static_cast<CheckpointId>(checkpoint_manager_.size() + 1U);
     checkpoint_branch->frame.checkpoint_id = checkpoint_id;
@@ -2869,6 +3089,15 @@ StepResult ExecutionEngine::commit_task_execution(RunId run_id, RunRuntime& run,
 }
 
 void ExecutionEngine::update_run_status(RunRuntime& run, RunId run_id) {
+    std::lock_guard<std::mutex> run_lock(*run.mutex);
+    update_run_status_locked(run, run_id);
+}
+
+void ExecutionEngine::update_run_status_locked(RunRuntime& run, RunId run_id) {
+    if (is_terminal_status(run.status)) {
+        return;
+    }
+
     bool has_failed_branch = false;
     bool has_paused_branch = false;
     bool has_completed_branch = false;
@@ -2902,7 +3131,7 @@ void ExecutionEngine::update_run_status(RunRuntime& run, RunId run_id) {
         run.status = ExecutionStatus::Failed;
         return;
     }
-    if (has_pending_tasks || has_active_branch || has_async_waiters) {
+    if (has_pending_tasks || has_active_branch || has_async_waiters || run.in_flight_tasks > 0) {
         run.status = ExecutionStatus::Running;
         return;
     }
@@ -2938,9 +3167,12 @@ const GraphDefinition* ExecutionEngine::registered_graph(GraphId graph_id) const
         return &iterator->second;
     }
 
-    for (const auto& [_, run] : runs_) {
-        if (run.graph.id == graph_id) {
-            return &run.graph;
+    {
+        std::lock_guard<std::mutex> lock(runs_mutex_);
+        for (const auto& [_, run] : runs_) {
+            if (run.graph.id == graph_id) {
+                return &run.graph;
+            }
         }
     }
 
@@ -2952,12 +3184,17 @@ void ExecutionEngine::re_register_async_waiter(
     uint32_t branch_id,
     const PendingAsyncOperation& pending_async
 ) {
-    auto run_iterator = runs_.find(run_id);
-    if (run_iterator == runs_.end()) {
-        return;
+    RunRuntime* run_ptr = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(runs_mutex_);
+        auto run_iterator = runs_.find(run_id);
+        if (run_iterator == runs_.end()) {
+            return;
+        }
+        run_ptr = &run_iterator->second;
     }
-    const auto branch_iterator = run_iterator->second.branches.find(branch_id);
-    if (branch_iterator == run_iterator->second.branches.end()) {
+    const auto branch_iterator = run_ptr->branches.find(branch_id);
+    if (branch_iterator == run_ptr->branches.end()) {
         return;
     }
 
@@ -2988,6 +3225,35 @@ void ExecutionEngine::re_register_async_waiter(
         case AsyncOperationKind::None:
             break;
     }
+}
+
+void ExecutionEngine::push_commit(RunId run_id, TaskExecutionRecord record) {
+    {
+        std::lock_guard<std::mutex> lock(commit_mutex_);
+        commit_queue_.push_back(TaskCommitRecord{run_id, std::move(record)});
+    }
+    commit_cv_.notify_one();
+}
+
+std::optional<ExecutionEngine::TaskCommitRecord> ExecutionEngine::pop_commit(RunId run_id, std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(commit_mutex_);
+    const bool found = commit_cv_.wait_for(lock, timeout, [this, run_id]() {
+        return std::any_of(commit_queue_.begin(), commit_queue_.end(), [run_id](const auto& entry) {
+            return entry.run_id == run_id;
+        });
+    });
+
+    if (!found) {
+        return std::nullopt;
+    }
+
+    const auto iterator = std::find_if(commit_queue_.begin(), commit_queue_.end(), [run_id](const auto& entry) {
+        return entry.run_id == run_id;
+    });
+
+    TaskCommitRecord result = std::move(*iterator);
+    commit_queue_.erase(iterator);
+    return result;
 }
 
 } // namespace agentcore

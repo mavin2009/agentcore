@@ -117,16 +117,16 @@ NodeResult branch_d_node(ExecutionContext& context) {
 }
 
 int64_t read_int_field(const WorkflowState& state, StateKey key) {
-    if (state.fields.size() <= key || !std::holds_alternative<int64_t>(state.fields[key])) {
+    if (state.size() <= key || !std::holds_alternative<int64_t>(state.load(key))) {
         return 0;
     }
-    return std::get<int64_t>(state.fields[key]);
+    return std::get<int64_t>(state.load(key));
 }
 
 bool read_bool_field(const WorkflowState& state, StateKey key) {
-    return state.fields.size() > key &&
-        std::holds_alternative<bool>(state.fields[key]) &&
-        std::get<bool>(state.fields[key]);
+    return state.size() > key &&
+        std::holds_alternative<bool>(state.load(key)) &&
+        std::get<bool>(state.load(key));
 }
 
 std::vector<TraceEvent> append_trace_events(
@@ -249,10 +249,10 @@ NodeResult async_subgraph_benchmark_child_node(ExecutionContext& context) {
 
 NodeResult summarize_async_subgraph_benchmark_node(ExecutionContext& context) {
     std::string async_value;
-    if (context.state.fields.size() > kAsyncSubgraphBenchmarkResult &&
-        std::holds_alternative<BlobRef>(context.state.fields[kAsyncSubgraphBenchmarkResult])) {
+    if (context.state.size() > kAsyncSubgraphBenchmarkResult &&
+        std::holds_alternative<BlobRef>(context.state.load(kAsyncSubgraphBenchmarkResult))) {
         async_value = std::string(
-            context.blobs.read_string(std::get<BlobRef>(context.state.fields[kAsyncSubgraphBenchmarkResult]))
+            context.blobs.read_string(std::get<BlobRef>(context.state.load(kAsyncSubgraphBenchmarkResult)))
         );
     }
 
@@ -320,21 +320,21 @@ NodeResult async_multi_wait_benchmark_right_node(ExecutionContext& context) {
 
 NodeResult summarize_async_multi_wait_benchmark_child_node(ExecutionContext& context) {
     std::string left_value;
-    if (context.state.fields.size() > kAsyncMultiWaitSubgraphBenchmarkChildLeft &&
-        std::holds_alternative<BlobRef>(context.state.fields[kAsyncMultiWaitSubgraphBenchmarkChildLeft])) {
+    if (context.state.size() > kAsyncMultiWaitSubgraphBenchmarkChildLeft &&
+        std::holds_alternative<BlobRef>(context.state.load(kAsyncMultiWaitSubgraphBenchmarkChildLeft))) {
         left_value = std::string(
             context.blobs.read_string(
-                std::get<BlobRef>(context.state.fields[kAsyncMultiWaitSubgraphBenchmarkChildLeft])
+                std::get<BlobRef>(context.state.load(kAsyncMultiWaitSubgraphBenchmarkChildLeft))
             )
         );
     }
 
     std::string right_value;
-    if (context.state.fields.size() > kAsyncMultiWaitSubgraphBenchmarkChildRight &&
-        std::holds_alternative<BlobRef>(context.state.fields[kAsyncMultiWaitSubgraphBenchmarkChildRight])) {
+    if (context.state.size() > kAsyncMultiWaitSubgraphBenchmarkChildRight &&
+        std::holds_alternative<BlobRef>(context.state.load(kAsyncMultiWaitSubgraphBenchmarkChildRight))) {
         right_value = std::string(
             context.blobs.read_string(
-                std::get<BlobRef>(context.state.fields[kAsyncMultiWaitSubgraphBenchmarkChildRight])
+                std::get<BlobRef>(context.state.load(kAsyncMultiWaitSubgraphBenchmarkChildRight))
             )
         );
     }
@@ -349,11 +349,11 @@ NodeResult summarize_async_multi_wait_benchmark_child_node(ExecutionContext& con
 
 NodeResult summarize_async_multi_wait_benchmark_parent_node(ExecutionContext& context) {
     std::string child_summary;
-    if (context.state.fields.size() > kAsyncMultiWaitSubgraphBenchmarkResult &&
-        std::holds_alternative<BlobRef>(context.state.fields[kAsyncMultiWaitSubgraphBenchmarkResult])) {
+    if (context.state.size() > kAsyncMultiWaitSubgraphBenchmarkResult &&
+        std::holds_alternative<BlobRef>(context.state.load(kAsyncMultiWaitSubgraphBenchmarkResult))) {
         child_summary = std::string(
             context.blobs.read_string(
-                std::get<BlobRef>(context.state.fields[kAsyncMultiWaitSubgraphBenchmarkResult])
+                std::get<BlobRef>(context.state.load(kAsyncMultiWaitSubgraphBenchmarkResult))
             )
         );
     }
@@ -1452,11 +1452,11 @@ BenchmarkRun run_parallel_benchmark_once(const GraphDefinition& graph, std::size
     assert(result.status == ExecutionStatus::Completed);
 
     const WorkflowState& state = engine.state(run_id);
-    assert(state.fields.size() > kSummary);
-    assert(std::holds_alternative<BlobRef>(state.fields[kSummary]));
+    assert(state.size() > kSummary);
+    assert(std::holds_alternative<BlobRef>(state.load(kSummary)));
 
     const std::string summary = std::string(
-        engine.state_store(run_id).blobs().read_string(std::get<BlobRef>(state.fields[kSummary]))
+        engine.state_store(run_id).blobs().read_string(std::get<BlobRef>(state.load(kSummary)))
     );
     const auto record = engine.checkpoints().get(result.last_checkpoint_id);
     assert(record.has_value());
@@ -1962,10 +1962,10 @@ AsyncSubgraphBenchmarkRun run_async_subgraph_benchmark_once(
     }
 
     const WorkflowState& state = engine.state(run_id);
-    assert(std::holds_alternative<BlobRef>(state.fields[kAsyncSubgraphBenchmarkSummary]));
+    assert(std::holds_alternative<BlobRef>(state.load(kAsyncSubgraphBenchmarkSummary)));
     assert(
         engine.state_store(run_id).blobs().read_string(
-            std::get<BlobRef>(state.fields[kAsyncSubgraphBenchmarkSummary])
+            std::get<BlobRef>(state.load(kAsyncSubgraphBenchmarkSummary))
         ) == "async-subgraph=bench::benchmark-async"
     );
 
@@ -2024,10 +2024,10 @@ AsyncMultiWaitSubgraphBenchmarkRun run_async_multi_wait_subgraph_benchmark_once(
     }
 
     const WorkflowState& state = engine.state(run_id);
-    assert(std::holds_alternative<BlobRef>(state.fields[kAsyncMultiWaitSubgraphBenchmarkSummary]));
+    assert(std::holds_alternative<BlobRef>(state.load(kAsyncMultiWaitSubgraphBenchmarkSummary)));
     assert(
         engine.state_store(run_id).blobs().read_string(
-            std::get<BlobRef>(state.fields[kAsyncMultiWaitSubgraphBenchmarkSummary])
+            std::get<BlobRef>(state.load(kAsyncMultiWaitSubgraphBenchmarkSummary))
         ) == "multi-wait-subgraph=left=bench::join-left right=bench::join-right"
     );
 

@@ -58,10 +58,10 @@ int main() {
     assert(store.patch_log().size() == 1U);
 
     const WorkflowState& current = store.get_current_state();
-    assert(std::holds_alternative<int64_t>(current.fields[kCounter]));
-    assert(std::get<int64_t>(current.fields[kCounter]) == 42);
-    assert(std::holds_alternative<BlobRef>(current.fields[kSummary]));
-    assert(store.blobs().read_string(std::get<BlobRef>(current.fields[kSummary])) == "native runtime");
+    assert(std::holds_alternative<int64_t>(current.load(kCounter)));
+    assert(std::get<int64_t>(current.load(kCounter)) == 42);
+    assert(std::holds_alternative<BlobRef>(current.load(kSummary)));
+    assert(store.blobs().read_string(std::get<BlobRef>(current.load(kSummary))) == "native runtime");
     assert(store.knowledge_graph().entity_count() == 2U);
     assert(store.knowledge_graph().triple_count() == 1U);
 
@@ -72,9 +72,9 @@ int main() {
 
     const WorkflowState& restored_state = restored.get_current_state();
     assert(restored_state.version == 1U);
-    assert(std::get<int64_t>(restored_state.fields[kCounter]) == 42);
+    assert(std::get<int64_t>(restored_state.load(kCounter)) == 42);
     assert(
-        restored.blobs().read_string(std::get<BlobRef>(restored_state.fields[kSummary])) ==
+        restored.blobs().read_string(std::get<BlobRef>(restored_state.load(kSummary))) ==
         "native runtime"
     );
     assert(restored.patch_log().size() == 1U);
@@ -137,7 +137,7 @@ int main() {
     StatePatch fork_patch;
     fork_patch.updates.push_back(FieldUpdate{kCounter, int64_t{7}});
     static_cast<void>(fork.apply(fork_patch));
-    assert(std::get<int64_t>(store.get_current_state().fields[kCounter]) == 42);
+    assert(std::get<int64_t>(store.get_current_state().load(kCounter)) == 42);
     const StateStore::SharedBacking shared_after_patch = store.shared_backing_with(fork);
     assert(shared_after_patch.blobs);
     assert(shared_after_patch.strings);

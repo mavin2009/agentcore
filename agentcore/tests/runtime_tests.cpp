@@ -58,9 +58,8 @@ void configure_checkpoint_storage(ExecutionEngine& engine, const std::string& pa
 }
 
 NodeResult wait_then_continue_node(ExecutionContext& context) {
-    const Value* attempts_value = context.state.fields.size() > kResumeAttempt
-        ? &context.state.fields[kResumeAttempt]
-        : nullptr;
+    const Value attempts_val = context.state.load(kResumeAttempt);
+    const Value* attempts_value = std::holds_alternative<std::monostate>(attempts_val) ? nullptr : &attempts_val;
     const bool first_visit = attempts_value == nullptr ||
         !std::holds_alternative<int64_t>(*attempts_value) ||
         std::get<int64_t>(*attempts_value) == 0;
@@ -363,10 +362,10 @@ NodeResult summarize_resumable_subgraph_parent_node(ExecutionContext& context) {
 
 NodeResult summarize_async_subgraph_parent_node(ExecutionContext& context) {
     std::string async_value;
-    if (context.state.fields.size() > kAsyncSubgraphResult &&
-        std::holds_alternative<BlobRef>(context.state.fields[kAsyncSubgraphResult])) {
+    if (context.state.size() > kAsyncSubgraphResult &&
+        std::holds_alternative<BlobRef>(context.state.load(kAsyncSubgraphResult))) {
         async_value = std::string(
-            context.blobs.read_string(std::get<BlobRef>(context.state.fields[kAsyncSubgraphResult]))
+            context.blobs.read_string(std::get<BlobRef>(context.state.load(kAsyncSubgraphResult)))
         );
     }
 
@@ -434,21 +433,21 @@ NodeResult async_multi_wait_right_node(ExecutionContext& context) {
 
 NodeResult summarize_multi_wait_child_node(ExecutionContext& context) {
     std::string left_value;
-    if (context.state.fields.size() > kAsyncSubgraphMultiWaitChildLeft &&
-        std::holds_alternative<BlobRef>(context.state.fields[kAsyncSubgraphMultiWaitChildLeft])) {
+    if (context.state.size() > kAsyncSubgraphMultiWaitChildLeft &&
+        std::holds_alternative<BlobRef>(context.state.load(kAsyncSubgraphMultiWaitChildLeft))) {
         left_value = std::string(
             context.blobs.read_string(
-                std::get<BlobRef>(context.state.fields[kAsyncSubgraphMultiWaitChildLeft])
+                std::get<BlobRef>(context.state.load(kAsyncSubgraphMultiWaitChildLeft))
             )
         );
     }
 
     std::string right_value;
-    if (context.state.fields.size() > kAsyncSubgraphMultiWaitChildRight &&
-        std::holds_alternative<BlobRef>(context.state.fields[kAsyncSubgraphMultiWaitChildRight])) {
+    if (context.state.size() > kAsyncSubgraphMultiWaitChildRight &&
+        std::holds_alternative<BlobRef>(context.state.load(kAsyncSubgraphMultiWaitChildRight))) {
         right_value = std::string(
             context.blobs.read_string(
-                std::get<BlobRef>(context.state.fields[kAsyncSubgraphMultiWaitChildRight])
+                std::get<BlobRef>(context.state.load(kAsyncSubgraphMultiWaitChildRight))
             )
         );
     }
@@ -463,10 +462,10 @@ NodeResult summarize_multi_wait_child_node(ExecutionContext& context) {
 
 NodeResult summarize_multi_wait_parent_node(ExecutionContext& context) {
     std::string child_summary;
-    if (context.state.fields.size() > kAsyncSubgraphMultiWaitResult &&
-        std::holds_alternative<BlobRef>(context.state.fields[kAsyncSubgraphMultiWaitResult])) {
+    if (context.state.size() > kAsyncSubgraphMultiWaitResult &&
+        std::holds_alternative<BlobRef>(context.state.load(kAsyncSubgraphMultiWaitResult))) {
         child_summary = std::string(
-            context.blobs.read_string(std::get<BlobRef>(context.state.fields[kAsyncSubgraphMultiWaitResult]))
+            context.blobs.read_string(std::get<BlobRef>(context.state.load(kAsyncSubgraphMultiWaitResult)))
         );
     }
 
@@ -574,16 +573,16 @@ NodeResult join_branch_d_node(ExecutionContext& context) {
 }
 
 int64_t read_int_field(const WorkflowState& state, StateKey key) {
-    if (state.fields.size() <= key || !std::holds_alternative<int64_t>(state.fields[key])) {
+    if (state.size() <= key || !std::holds_alternative<int64_t>(state.load(key))) {
         return 0;
     }
-    return std::get<int64_t>(state.fields[key]);
+    return std::get<int64_t>(state.load(key));
 }
 
 bool read_bool_field(const WorkflowState& state, StateKey key) {
-    return state.fields.size() > key &&
-        std::holds_alternative<bool>(state.fields[key]) &&
-        std::get<bool>(state.fields[key]);
+    return state.size() > key &&
+        std::holds_alternative<bool>(state.load(key)) &&
+        std::get<bool>(state.load(key));
 }
 
 template <int RouteIndex>
@@ -667,14 +666,14 @@ NodeResult async_join_writer_node(ExecutionContext& context) {
 
 NodeResult summarize_async_join_node(ExecutionContext& context) {
     const int64_t sync_value = read_int_field(context.state, kJoinSyncValue);
-    const bool consensus = context.state.fields.size() > kJoinConsensus &&
-        std::holds_alternative<bool>(context.state.fields[kJoinConsensus]) &&
-        std::get<bool>(context.state.fields[kJoinConsensus]);
+    const bool consensus = context.state.size() > kJoinConsensus &&
+        std::holds_alternative<bool>(context.state.load(kJoinConsensus)) &&
+        std::get<bool>(context.state.load(kJoinConsensus));
     std::string async_value;
-    if (context.state.fields.size() > kJoinAsyncResult &&
-        std::holds_alternative<BlobRef>(context.state.fields[kJoinAsyncResult])) {
+    if (context.state.size() > kJoinAsyncResult &&
+        std::holds_alternative<BlobRef>(context.state.load(kJoinAsyncResult))) {
         async_value = std::string(
-            context.blobs.read_string(std::get<BlobRef>(context.state.fields[kJoinAsyncResult]))
+            context.blobs.read_string(std::get<BlobRef>(context.state.load(kJoinAsyncResult)))
         );
     }
 
@@ -1923,9 +1922,9 @@ void test_resume_flow() {
     const RunResult run_result = engine.run_to_completion(run_id);
     assert(run_result.status == ExecutionStatus::Completed);
     const WorkflowState& state = engine.state(run_id);
-    assert(state.fields.size() > kResumeDone);
-    assert(std::holds_alternative<bool>(state.fields[kResumeDone]));
-    assert(std::get<bool>(state.fields[kResumeDone]));
+    assert(state.size() > kResumeDone);
+    assert(std::holds_alternative<bool>(state.load(kResumeDone)));
+    assert(std::get<bool>(state.load(kResumeDone)));
 }
 
 void test_knowledge_graph_integration() {
@@ -1940,8 +1939,8 @@ void test_knowledge_graph_integration() {
     assert(engine.knowledge_graph(run_id).triple_count() == 1U);
 
     const WorkflowState& state = engine.state(run_id);
-    assert(std::holds_alternative<BlobRef>(state.fields[kKnowledgeGraphSummary]));
-    const BlobRef summary_ref = std::get<BlobRef>(state.fields[kKnowledgeGraphSummary]);
+    assert(std::holds_alternative<BlobRef>(state.load(kKnowledgeGraphSummary)));
+    const BlobRef summary_ref = std::get<BlobRef>(state.load(kKnowledgeGraphSummary));
     const std::string summary(engine.state_store(run_id).blobs().read_string(summary_ref));
     assert(summary == "agentcore faster_than reference_runtime");
 }
@@ -1960,9 +1959,9 @@ void test_subgraph_composition_and_public_streaming() {
 
     const WorkflowState& state = engine.state(run_id);
     assert(read_int_field(state, kSubgraphOutput) == 46);
-    assert(std::holds_alternative<BlobRef>(state.fields[kSubgraphSummary]));
+    assert(std::holds_alternative<BlobRef>(state.load(kSubgraphSummary)));
     assert(
-        engine.state_store(run_id).blobs().read_string(std::get<BlobRef>(state.fields[kSubgraphSummary])) ==
+        engine.state_store(run_id).blobs().read_string(std::get<BlobRef>(state.load(kSubgraphSummary))) ==
         "subgraph-output=46"
     );
 
@@ -2060,10 +2059,10 @@ void test_resumable_subgraph_checkpoint_restart_equivalence() {
     assert(direct_result.status == ExecutionStatus::Completed);
     const WorkflowState& direct_state = direct_engine.state(direct_run_id);
     assert(read_int_field(direct_state, kResumableSubgraphOutput) == 106);
-    assert(std::holds_alternative<BlobRef>(direct_state.fields[kResumableSubgraphSummary]));
+    assert(std::holds_alternative<BlobRef>(direct_state.load(kResumableSubgraphSummary)));
     assert(
         direct_engine.state_store(direct_run_id).blobs().read_string(
-            std::get<BlobRef>(direct_state.fields[kResumableSubgraphSummary])
+            std::get<BlobRef>(direct_state.load(kResumableSubgraphSummary))
         ) == "resumable-subgraph-output=106"
     );
 
@@ -2196,16 +2195,16 @@ void test_async_subgraph_auto_resume_through_parent_scheduler() {
     const RunResult direct_result = direct_engine.run_to_completion(direct_run_id);
     assert(direct_result.status == ExecutionStatus::Completed);
     const WorkflowState& direct_state = direct_engine.state(direct_run_id);
-    assert(std::holds_alternative<BlobRef>(direct_state.fields[kAsyncSubgraphResult]));
+    assert(std::holds_alternative<BlobRef>(direct_state.load(kAsyncSubgraphResult)));
     assert(
         direct_engine.state_store(direct_run_id).blobs().read_string(
-            std::get<BlobRef>(direct_state.fields[kAsyncSubgraphResult])
+            std::get<BlobRef>(direct_state.load(kAsyncSubgraphResult))
         ) == "nested::async-fast-path"
     );
-    assert(std::holds_alternative<BlobRef>(direct_state.fields[kAsyncSubgraphSummary]));
+    assert(std::holds_alternative<BlobRef>(direct_state.load(kAsyncSubgraphSummary)));
     assert(
         direct_engine.state_store(direct_run_id).blobs().read_string(
-            std::get<BlobRef>(direct_state.fields[kAsyncSubgraphSummary])
+            std::get<BlobRef>(direct_state.load(kAsyncSubgraphSummary))
         ) == "async-subgraph=nested::async-fast-path"
     );
 
@@ -2327,10 +2326,10 @@ void test_async_multi_wait_subgraph_checkpoint_resume_equivalence() {
     const RunResult direct_result = direct_engine.run_to_completion(direct_run_id);
     assert(direct_result.status == ExecutionStatus::Completed);
     const WorkflowState& direct_state = direct_engine.state(direct_run_id);
-    assert(std::holds_alternative<BlobRef>(direct_state.fields[kAsyncSubgraphMultiWaitSummary]));
+    assert(std::holds_alternative<BlobRef>(direct_state.load(kAsyncSubgraphMultiWaitSummary)));
     assert(
         direct_engine.state_store(direct_run_id).blobs().read_string(
-            std::get<BlobRef>(direct_state.fields[kAsyncSubgraphMultiWaitSummary])
+            std::get<BlobRef>(direct_state.load(kAsyncSubgraphMultiWaitSummary))
         ) == "multi-wait-subgraph=left=nested::join-left right=nested::join-right"
     );
 
@@ -2382,10 +2381,10 @@ void test_async_multi_wait_subgraph_checkpoint_resume_equivalence() {
     const RunResult resumed_result = resumed_engine.run_to_completion(resumed_run_id);
     assert(resumed_result.status == ExecutionStatus::Completed);
     const WorkflowState& resumed_state = resumed_engine.state(resumed_run_id);
-    assert(std::holds_alternative<BlobRef>(resumed_state.fields[kAsyncSubgraphMultiWaitSummary]));
+    assert(std::holds_alternative<BlobRef>(resumed_state.load(kAsyncSubgraphMultiWaitSummary)));
     assert(
         resumed_engine.state_store(resumed_run_id).blobs().read_string(
-            std::get<BlobRef>(resumed_state.fields[kAsyncSubgraphMultiWaitSummary])
+            std::get<BlobRef>(resumed_state.load(kAsyncSubgraphMultiWaitSummary))
         ) == "multi-wait-subgraph=left=nested::join-left right=nested::join-right"
     );
     const auto resumed_record = resumed_engine.checkpoints().get(resumed_result.last_checkpoint_id);
@@ -2573,13 +2572,13 @@ void test_join_scope_merges_branch_state_and_knowledge_graph() {
     assert(engine.knowledge_graph(run_id).triple_count() == 4U);
 
     const WorkflowState& state = engine.state(run_id);
-    assert(std::holds_alternative<BlobRef>(state.fields[kJoinSummary]));
+    assert(std::holds_alternative<BlobRef>(state.load(kJoinSummary)));
     const std::string summary(
-        engine.state_store(run_id).blobs().read_string(std::get<BlobRef>(state.fields[kJoinSummary]))
+        engine.state_store(run_id).blobs().read_string(std::get<BlobRef>(state.load(kJoinSummary)))
     );
     assert(summary == "sum=10 triples=4");
-    assert(std::holds_alternative<int64_t>(state.fields[kJoinAccumulator]));
-    assert(std::get<int64_t>(state.fields[kJoinAccumulator]) == 10);
+    assert(std::holds_alternative<int64_t>(state.load(kJoinAccumulator)));
+    assert(std::get<int64_t>(state.load(kJoinAccumulator)) == 10);
 }
 
 void test_structural_join_validation() {
@@ -2718,11 +2717,11 @@ void test_async_tool_auto_resume() {
     assert(result.steps_executed >= 2U);
 
     const WorkflowState& state = engine.state(run_id);
-    assert(std::holds_alternative<bool>(state.fields[kAsyncStarted]));
-    assert(std::get<bool>(state.fields[kAsyncStarted]));
-    assert(std::holds_alternative<BlobRef>(state.fields[kAsyncResult]));
+    assert(std::holds_alternative<bool>(state.load(kAsyncStarted)));
+    assert(std::get<bool>(state.load(kAsyncStarted)));
+    assert(std::holds_alternative<BlobRef>(state.load(kAsyncResult)));
     assert(
-        engine.state_store(run_id).blobs().read_string(std::get<BlobRef>(state.fields[kAsyncResult])) ==
+        engine.state_store(run_id).blobs().read_string(std::get<BlobRef>(state.load(kAsyncResult))) ==
         "async-fast-path"
     );
 }
@@ -2781,11 +2780,11 @@ void test_async_tool_checkpoint_resume_after_restart() {
     assert(run_result.status == ExecutionStatus::Completed);
 
     const WorkflowState& state = restored_engine.state(run_id);
-    assert(std::holds_alternative<bool>(state.fields[kAsyncStarted]));
-    assert(std::get<bool>(state.fields[kAsyncStarted]));
-    assert(std::holds_alternative<BlobRef>(state.fields[kAsyncResult]));
+    assert(std::holds_alternative<bool>(state.load(kAsyncStarted)));
+    assert(std::get<bool>(state.load(kAsyncStarted)));
+    assert(std::holds_alternative<BlobRef>(state.load(kAsyncResult)));
     assert(
-        restored_engine.state_store(run_id).blobs().read_string(std::get<BlobRef>(state.fields[kAsyncResult])) ==
+        restored_engine.state_store(run_id).blobs().read_string(std::get<BlobRef>(state.load(kAsyncResult))) ==
         "async-fast-path"
     );
 
@@ -3082,8 +3081,8 @@ void test_durable_checkpoint_reload() {
     const RunResult run_result = restored_engine.run_to_completion(run_id);
     assert(run_result.status == ExecutionStatus::Completed);
     const WorkflowState& state = restored_engine.state(run_id);
-    assert(std::holds_alternative<bool>(state.fields[kResumeDone]));
-    assert(std::get<bool>(state.fields[kResumeDone]));
+    assert(std::holds_alternative<bool>(state.load(kResumeDone)));
+    assert(std::get<bool>(state.load(kResumeDone)));
 
     std::remove(checkpoint_path.c_str());
 }
@@ -3123,7 +3122,7 @@ void exercise_interrupt_edit_resume_flow(bool use_sqlite) {
     assert(live_resume.resumed);
     const RunResult live_result = engine.run_to_completion(run_id);
     assert(live_result.status == ExecutionStatus::Completed);
-    assert(std::get<bool>(engine.state(run_id).fields[kResumeDone]));
+    assert(std::get<bool>(engine.state(run_id).load(kResumeDone)));
 
     ExecutionEngine restored_engine(1);
     restored_engine.register_graph(make_resume_graph());
@@ -3135,7 +3134,7 @@ void exercise_interrupt_edit_resume_flow(bool use_sqlite) {
     assert(restart_resume.run_id == run_id);
     const RunResult restart_result = restored_engine.run_to_completion(run_id);
     assert(restart_result.status == ExecutionStatus::Completed);
-    assert(std::get<bool>(restored_engine.state(run_id).fields[kResumeDone]));
+    assert(std::get<bool>(restored_engine.state(run_id).load(kResumeDone)));
 
     std::remove(checkpoint_path.c_str());
 }
@@ -3173,10 +3172,10 @@ void exercise_recorded_effect_restart_equivalence(bool use_sqlite) {
         assert(g_recorded_effect_invocations.load() == 1);
 
         const WorkflowState& final_state = engine.state(run_id);
-        assert(std::get<bool>(final_state.fields[kRecordedEffectDone]));
+        assert(std::get<bool>(final_state.load(kRecordedEffectDone)));
         assert(
             engine.state_store(run_id).blobs().read_string(
-                std::get<BlobRef>(final_state.fields[kRecordedEffectOutput])
+                std::get<BlobRef>(final_state.load(kRecordedEffectOutput))
             ) == "outcome::write-once"
         );
         assert(engine.state_store(run_id).task_journal().size() == 1U);
@@ -3225,10 +3224,10 @@ void exercise_recorded_effect_restart_equivalence(bool use_sqlite) {
         assert(g_recorded_effect_invocations.load() == 1);
 
         const WorkflowState& final_state = restored_engine.state(run_id);
-        assert(std::get<bool>(final_state.fields[kRecordedEffectDone]));
+        assert(std::get<bool>(final_state.load(kRecordedEffectDone)));
         assert(
             restored_engine.state_store(run_id).blobs().read_string(
-                std::get<BlobRef>(final_state.fields[kRecordedEffectOutput])
+                std::get<BlobRef>(final_state.load(kRecordedEffectOutput))
             ) == "outcome::write-once"
         );
         assert(restored_engine.state_store(run_id).task_journal().size() == 1U);

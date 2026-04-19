@@ -46,20 +46,20 @@ std::atomic<int> g_persistent_session_memo_calls{0};
 std::atomic<int> g_persistent_session_mismatch_calls{0};
 
 int64_t read_int_field(const WorkflowState& state, StateKey key) {
-    if (key >= state.fields.size()) {
+    if (key >= state.size()) {
         return 0;
     }
-    if (!std::holds_alternative<int64_t>(state.fields[key])) {
+    if (!std::holds_alternative<int64_t>(state.load(key))) {
         return 0;
     }
-    return std::get<int64_t>(state.fields[key]);
+    return std::get<int64_t>(state.load(key));
 }
 
 std::string session_id_from_value(const WorkflowState& state, const StringInterner& strings, StateKey key) {
-    if (key >= state.fields.size()) {
+    if (key >= state.size()) {
         return {};
     }
-    const Value& value = state.fields[key];
+    const Value& value = state.load(key);
     if (std::holds_alternative<InternedStringId>(value)) {
         return std::string(strings.resolve(std::get<InternedStringId>(value)));
     }
@@ -74,9 +74,9 @@ std::string session_id_from_value(const WorkflowState& state, const StringIntern
 
 std::string read_blob_string_field(const StateStore& state_store, StateKey key) {
     const WorkflowState& state = state_store.get_current_state();
-    assert(key < state.fields.size());
-    assert(std::holds_alternative<BlobRef>(state.fields[key]));
-    return std::string(state_store.blobs().read_string(std::get<BlobRef>(state.fields[key])));
+    assert(key < state.size());
+    assert(std::holds_alternative<BlobRef>(state.load(key)));
+    return std::string(state_store.blobs().read_string(std::get<BlobRef>(state.load(key))));
 }
 
 NodeResult stop_node(ExecutionContext&) {

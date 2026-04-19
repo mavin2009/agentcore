@@ -6,7 +6,12 @@ import inspect
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 
-from agentcore import _agentcore_native as _native
+class _LazyNative:
+    def __getattr__(self, name):
+        import agentcore
+        return getattr(agentcore._agentcore_native, name)
+
+_native = _LazyNative()
 
 START = "__start__"
 END = "__end__"
@@ -16,16 +21,13 @@ END = "__end__"
 class Command:
     update: dict[str, Any] | None = None
     goto: str | None = None
+    wait: bool = False
 
 
-def _normalize_config(config: Any) -> dict[str, Any]:
+def _normalize_config(config: dict[str, Any] | None) -> dict[str, Any]:
     if config is None:
         return {}
-    if isinstance(config, dict):
-        return dict(config)
-    if hasattr(config, "items"):
-        return dict(config.items())
-    raise TypeError("config must be a mapping or None")
+    return dict(config)
 
 
 def _normalize_update(value: Any) -> dict[str, Any]:
@@ -38,63 +40,24 @@ def _normalize_update(value: Any) -> dict[str, Any]:
     raise TypeError("node updates must be mappings or None")
 
 
-def _normalize_result(result: Any) -> tuple[dict[str, Any], str | None]:
+def _normalize_result(result: Any) -> tuple[dict[str, Any], str | None, bool]:
     if isinstance(result, Command):
-        return _normalize_update(result.update), result.goto
+        return _normalize_update(result.update), result.goto, bool(result.wait)
     if result is None:
-        return {}, None
+        return {}, None, False
     if isinstance(result, str):
-        return {}, result
+        return {}, result, False
     if isinstance(result, (tuple, list)):
-        if len(result) != 2:
-            raise TypeError("tuple/list node results must contain exactly two elements")
-        return _normalize_update(result[0]), None if result[1] is None else str(result[1])
-    return _normalize_update(result), None
-
-
-def _accepts_config(function: Any) -> bool:
-    try:
-        signature = inspect.signature(function)
-    except (TypeError, ValueError):
-        return True
-
-    positional_count = 0
-    for parameter in signature.parameters.values():
-        if parameter.kind == inspect.Parameter.VAR_POSITIONAL:
-            return True
-        if parameter.kind in (
-            inspect.Parameter.POSITIONAL_ONLY,
-            inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        ):
-            positional_count += 1
-    return positional_count >= 2
-
-
-def _run_awaitable_blocking(awaitable: Any) -> Any:
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(awaitable)
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        return executor.submit(asyncio.run, awaitable).result()
-
-
-def _resolve_maybe_awaitable(value: Any) -> Any:
-    if inspect.isawaitable(value):
-        return _run_awaitable_blocking(value)
-    return value
-
-
-def _call_with_optional_config(
-    function: Any,
-    accepts_config: bool,
-    state: dict[str, Any],
-    config: dict[str, Any],
-) -> Any:
-    if accepts_config:
-        return function(state, config)
-    return function(state)
+        if len(result) == 2:
+            return _normalize_update(result[0]), None if result[1] is None else str(result[1]), False
+        if len(result) == 3:
+            return (
+                _normalize_update(result[0]),
+                None if result[1] is None else str(result[1]),
+                bool(result[2]),
+            )
+        raise TypeError("tuple/list node results must contain exactly two or three elements")
+    return _normalize_update(result), None, False
 
 
 def _normalize_batch_configs(config: Any, size: int) -> list[dict[str, Any]]:
@@ -107,18 +70,16 @@ def _normalize_batch_configs(config: Any, size: int) -> list[dict[str, Any]]:
 
 
 class StateGraph:
-    def __init__(self, state_schema: Any = None, *, name: str | None = None, worker_count: int = 1):
+    def __init__(self, state_schema: type, name: str | None = None, worker_count: int = 1):
         self._state_schema = state_schema
-        self._name = name or getattr(state_schema, "__name__", "agentcore_state_graph")
-        self._worker_count = max(1, int(worker_count))
+        self._name = name or getattr(state_schema, "__name__", "agentcore_compat_graph")
+        self._worker_count = worker_count
         self._nodes: dict[str, Any] = {}
         self._edges: list[tuple[str, str]] = []
-        self._conditional_edges: dict[str, tuple[Any, dict[Any, str]]] = {}
+        self._conditional_edges: dict[str, tuple[Any, dict[str, str]]] = {}
         self._entry_point: str | None = None
 
     def add_node(self, name: str, action: Any) -> "StateGraph":
-        if not callable(action):
-            raise TypeError("node actions must be callable")
         self._nodes[name] = action
         if self._entry_point is None:
             self._entry_point = name
@@ -135,7 +96,7 @@ class StateGraph:
         self,
         source: str,
         path: Any,
-        path_map: dict[Any, str] | None = None,
+        path_map: dict[str, str] | None = None,
     ) -> "StateGraph":
         if not callable(path):
             raise TypeError("conditional routing functions must be callable")
@@ -162,30 +123,26 @@ class StateGraph:
             _native._add_edge(native_graph, source, self._map_target_name(target))
 
         _native._finalize(native_graph)
-        return CompiledStateGraph(native_graph, self._name)
+        return CompiledStateGraph(native_graph)
 
     def _map_target_name(self, target: str) -> str:
         if target == END:
             return _native._INTERNAL_END_NODE_NAME
         return target
 
-    def _build_callback(self, node_name: str):
-        node_action = self._nodes[node_name]
+    def _build_callback(self, node_name: str) -> Any:
+        action = self._nodes[node_name]
         routing_spec = self._conditional_edges.get(node_name)
-        node_accepts_config = _accepts_config(node_action)
-        route_accepts_config = _accepts_config(routing_spec[0]) if routing_spec is not None else False
 
         def wrapped(state: dict[str, Any], config: dict[str, Any] | None = None) -> Any:
-            normalized_config = _normalize_config(config)
-            node_result = _call_with_optional_config(
-                node_action,
-                node_accepts_config,
-                dict(state),
-                normalized_config,
-            )
-            updates, explicit_goto = _normalize_result(_resolve_maybe_awaitable(node_result))
-            if explicit_goto is not None:
-                return updates, self._map_target_name(explicit_goto)
+            updates: dict[str, Any] = {}
+
+            if action is not None:
+                updates, explicit_goto, should_wait = _normalize_result(action(state, config))
+                if should_wait:
+                    return updates, None, True
+                if explicit_goto is not None:
+                    return updates, self._map_target_name(explicit_goto)
 
             if routing_spec is None:
                 return updates
@@ -193,13 +150,7 @@ class StateGraph:
             route_fn, route_map = routing_spec
             merged_state = dict(state)
             merged_state.update(updates)
-            route_result = _call_with_optional_config(
-                route_fn,
-                route_accepts_config,
-                merged_state,
-                normalized_config,
-            )
-            route_value = _resolve_maybe_awaitable(route_result)
+            route_value = route_fn(merged_state, config)
             if route_map:
                 if route_value not in route_map:
                     raise KeyError(f"missing conditional route mapping for {route_value!r}")
@@ -216,22 +167,16 @@ class StateGraph:
 
 
 class CompiledStateGraph:
-    def __init__(self, native_graph: Any, name: str):
+    def __init__(self, native_graph: Any):
         self._native_graph = native_graph
-        self._name = name
 
-    @property
-    def name(self) -> str:
-        return self._name
-
-    def invoke(
-        self,
-        input_state: dict[str, Any] | None = None,
-        *,
-        config: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
+    def invoke(self, input_state: dict[str, Any] | None = None, config: dict[str, Any] | None = None) -> dict[str, Any]:
         initial_state = {} if input_state is None else dict(input_state)
-        return _native._invoke(self._native_graph, initial_state, _normalize_config(config))
+        return _native._invoke(
+            self._native_graph,
+            initial_state,
+            _normalize_config(config),
+        )
 
     def invoke_with_metadata(
         self,
@@ -256,8 +201,6 @@ class CompiledStateGraph:
         include_subgraphs: bool = True,
         stream_mode: str = "events",
     ):
-        if stream_mode != "events":
-            raise NotImplementedError("the native compatibility layer currently supports only stream_mode='events'")
         initial_state = {} if input_state is None else dict(input_state)
         for event in _native._stream(
             self._native_graph,
@@ -274,41 +217,6 @@ class CompiledStateGraph:
         config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return await asyncio.to_thread(self.invoke, input_state, config=config)
-
-    async def ainvoke_with_metadata(
-        self,
-        input_state: dict[str, Any] | None = None,
-        *,
-        config: dict[str, Any] | None = None,
-        include_subgraphs: bool = True,
-    ) -> dict[str, Any]:
-        return await asyncio.to_thread(
-            self.invoke_with_metadata,
-            input_state,
-            config=config,
-            include_subgraphs=include_subgraphs,
-        )
-
-    async def astream(
-        self,
-        input_state: dict[str, Any] | None = None,
-        *,
-        config: dict[str, Any] | None = None,
-        include_subgraphs: bool = True,
-        stream_mode: str = "events",
-    ):
-        events = await asyncio.to_thread(
-            lambda: list(
-                self.stream(
-                    input_state,
-                    config=config,
-                    include_subgraphs=include_subgraphs,
-                    stream_mode=stream_mode,
-                )
-            )
-        )
-        for event in events:
-            yield event
 
     def batch(
         self,

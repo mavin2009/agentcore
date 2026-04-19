@@ -116,7 +116,7 @@ agentcore_source_group(agentcore_graph)
 
 add_library(agentcore_state STATIC ${AGENTCORE_STATE_SOURCES})
 set_target_properties(agentcore_state PROPERTIES EXPORT_NAME state)
-target_link_libraries(agentcore_state PUBLIC agentcore_graph)
+target_link_libraries(agentcore_state PUBLIC agentcore_graph atomic)
 agentcore_configure_target(agentcore_state)
 agentcore_source_group(agentcore_state)
 

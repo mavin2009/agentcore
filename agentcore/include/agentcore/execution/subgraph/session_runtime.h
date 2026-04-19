@@ -15,6 +15,8 @@ struct SubgraphSessionRecord {
     std::string session_id;
     uint64_t session_revision{0};
     std::vector<std::byte> snapshot_bytes;
+    std::shared_ptr<RunSnapshot> snapshot;
+    std::shared_ptr<StateStore> projected_state;
 };
 
 using SubgraphSessionShard = std::unordered_map<std::string, SubgraphSessionRecord>;
@@ -41,7 +43,9 @@ void store_committed_subgraph_session(
     NodeId parent_node_id,
     std::string session_id,
     uint64_t session_revision,
-    std::vector<std::byte> snapshot_bytes
+    std::vector<std::byte> snapshot_bytes,
+    std::shared_ptr<RunSnapshot> snapshot = {},
+    std::shared_ptr<StateStore> projected_state = {}
 );
 
 bool acquire_subgraph_session_lease(

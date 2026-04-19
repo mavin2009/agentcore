@@ -4,6 +4,7 @@
 
 #include <Python.h>
 
+#include <iostream>
 #include <memory>
 #include <string>
 #include <utility>
@@ -702,28 +703,6 @@ AdapterMetadata default_python_model_metadata(std::string_view name) {
     return metadata;
 }
 
-bool parse_python_bytes_like(
-    PyObject* object,
-    std::vector<std::byte>* value,
-    std::string* error_message
-) {
-    value->clear();
-    if (object == nullptr || object == Py_None) {
-        return true;
-    }
-
-    Py_buffer view{};
-    if (PyObject_GetBuffer(object, &view, PyBUF_SIMPLE) != 0) {
-        *error_message = "expected a bytes-like object";
-        PyErr_Clear();
-        return false;
-    }
-    const auto* begin = static_cast<const std::byte*>(view.buf);
-    value->assign(begin, begin + static_cast<std::size_t>(view.len));
-    PyBuffer_Release(&view);
-    return true;
-}
-
 PyObject* py_create_graph(PyObject*, PyObject* args, PyObject* kwargs) {
     const char* name = nullptr;
     Py_ssize_t worker_count = 1;
@@ -819,6 +798,7 @@ PyObject* py_add_node(PyObject*, PyObject* args, PyObject* kwargs) {
     if (join_incoming_branches != 0) {
         policy_flags |= node_policy_mask(NodePolicyFlag::JoinIncomingBranches);
     }
+
 
     if (!handle->add_node(
             name,

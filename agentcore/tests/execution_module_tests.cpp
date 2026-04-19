@@ -83,19 +83,19 @@ int main() {
     assert(engine.checkpoints().size() >= 2U);
 
     const WorkflowState& state = engine.state(run_id);
-    assert(state.fields.size() > kResult);
-    assert(std::holds_alternative<BlobRef>(state.fields[kResult]));
+    assert(state.size() > kResult);
+    assert(std::holds_alternative<BlobRef>(state.load(kResult)));
     assert(
-        engine.state_store(run_id).blobs().read_string(std::get<BlobRef>(state.fields[kResult])) ==
+        engine.state_store(run_id).blobs().read_string(std::get<BlobRef>(state.load(kResult))) ==
         "execution-module-ok"
     );
-    assert(state.fields.size() > kBranchId);
-    assert(std::holds_alternative<int64_t>(state.fields[kGraphId]));
-    assert(std::holds_alternative<int64_t>(state.fields[kNodeId]));
-    assert(std::holds_alternative<int64_t>(state.fields[kBranchId]));
-    assert(std::get<int64_t>(state.fields[kGraphId]) == 301);
-    assert(std::get<int64_t>(state.fields[kNodeId]) == 1);
-    assert(std::get<int64_t>(state.fields[kBranchId]) == 0);
+    assert(state.size() > kBranchId);
+    assert(std::holds_alternative<int64_t>(state.load(kGraphId)));
+    assert(std::holds_alternative<int64_t>(state.load(kNodeId)));
+    assert(std::holds_alternative<int64_t>(state.load(kBranchId)));
+    assert(std::get<int64_t>(state.load(kGraphId)) == 301);
+    assert(std::get<int64_t>(state.load(kNodeId)) == 1);
+    assert(std::get<int64_t>(state.load(kBranchId)) == 0);
 
     const auto trace_events = engine.trace().events_for_run(run_id);
     const auto& records = engine.checkpoints().records();

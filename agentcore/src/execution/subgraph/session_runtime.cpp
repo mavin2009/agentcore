@@ -434,13 +434,17 @@ void store_committed_subgraph_session(
     NodeId parent_node_id,
     std::string session_id,
     uint64_t session_revision,
-    std::vector<std::byte> snapshot_bytes
+    std::vector<std::byte> snapshot_bytes,
+    std::shared_ptr<RunSnapshot> snapshot,
+    std::shared_ptr<StateStore> projected_state
 ) {
     const std::string session_key = session_id;
     session_table[parent_node_id][session_key] = SubgraphSessionRecord{
         std::move(session_id),
         session_revision,
-        std::move(snapshot_bytes)
+        std::move(snapshot_bytes),
+        std::move(snapshot),
+        std::move(projected_state)
     };
 }
 
@@ -494,7 +498,9 @@ std::vector<CommittedSubgraphSessionSnapshot> flatten_subgraph_session_table(
                 node_id,
                 session_id,
                 record.session_revision,
-                record.snapshot_bytes
+                record.snapshot_bytes.empty() && record.snapshot != nullptr
+                    ? serialize_run_snapshot_bytes(*record.snapshot)
+                    : record.snapshot_bytes
             });
         }
     }
@@ -522,7 +528,9 @@ void restore_subgraph_session_table(
             snapshot.parent_node_id,
             snapshot.session_id,
             snapshot.session_revision,
-            snapshot.snapshot_bytes
+            snapshot.snapshot_bytes,
+            {},
+            {}
         );
     }
 }
@@ -537,6 +545,10 @@ std::optional<StateStore> project_subgraph_session_state(
             *error_message = "subgraph snapshot is missing branches";
         }
         return std::nullopt;
+    }
+
+    if (snapshot.branches.size() == 1U) {
+        return primary->state_store;
     }
 
     StateStore projection = primary->state_store;
@@ -575,11 +587,11 @@ std::optional<StateStore> project_subgraph_session_state(
             }
         } else {
             const WorkflowState& source_state = branch.state_store.get_current_state();
-            projection.ensure_field_capacity(source_state.fields.size());
+            projection.ensure_field_capacity(source_state.size());
             StatePatch field_patch;
 
-            for (StateKey key = 0; key < source_state.fields.size(); ++key) {
-                const Value& candidate = source_state.fields[key];
+            for (StateKey key = 0; key < source_state.size(); ++key) {
+                const Value candidate = source_state.load(key);
                 if (std::holds_alternative<std::monostate>(candidate)) {
                     continue;
                 }

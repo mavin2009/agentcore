@@ -22,16 +22,16 @@ enum ControlFlowStateKey : StateKey {
 };
 
 int64_t read_int_field(const WorkflowState& state, StateKey key) {
-    if (state.fields.size() <= key || !std::holds_alternative<int64_t>(state.fields[key])) {
+    if (state.size() <= key || !std::holds_alternative<int64_t>(state.load(key))) {
         return 0;
     }
-    return std::get<int64_t>(state.fields[key]);
+    return std::get<int64_t>(state.load(key));
 }
 
 bool read_bool_field(const WorkflowState& state, StateKey key) {
-    return state.fields.size() > key &&
-        std::holds_alternative<bool>(state.fields[key]) &&
-        std::get<bool>(state.fields[key]);
+    return state.size() > key &&
+        std::holds_alternative<bool>(state.load(key)) &&
+        std::get<bool>(state.load(key));
 }
 
 NodeResult router_node(ExecutionContext& context) {

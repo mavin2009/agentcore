@@ -62,10 +62,10 @@ struct PersistentSessionResumeBenchmarkRun {
 };
 
 int64_t read_int_field(const WorkflowState& state, StateKey key) {
-    if (key >= state.fields.size() || !std::holds_alternative<int64_t>(state.fields[key])) {
+    if (key >= state.size() || !std::holds_alternative<int64_t>(state.load(key))) {
         return 0;
     }
-    return std::get<int64_t>(state.fields[key]);
+    return std::get<int64_t>(state.load(key));
 }
 
 std::vector<TraceEvent> append_trace_events(

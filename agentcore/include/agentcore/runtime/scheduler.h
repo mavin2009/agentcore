@@ -97,14 +97,16 @@ private:
 
 class WorkerPool {
 public:
-    explicit WorkerPool(std::size_t worker_count = 0);
+    explicit WorkerPool(std::size_t worker_count = 0, bool inline_mode = false);
     ~WorkerPool();
 
     WorkerPool(const WorkerPool&) = delete;
     auto operator=(const WorkerPool&) -> WorkerPool& = delete;
 
     void run_batch(const std::vector<std::function<void()>>& jobs);
+    void run_async(std::function<void()> job);
     [[nodiscard]] std::size_t worker_count() const noexcept { return worker_count_; }
+    [[nodiscard]] bool inline_mode() const noexcept { return inline_mode_; }
 
 private:
     struct BatchState {
@@ -122,6 +124,7 @@ private:
     void worker_loop();
 
     std::size_t worker_count_{1};
+    bool inline_mode_{false};
     std::vector<std::thread> workers_;
     std::deque<QueuedJob> jobs_;
     std::mutex mutex_;
@@ -167,7 +170,7 @@ private:
 
 class Scheduler {
 public:
-    explicit Scheduler(std::size_t worker_count = 0);
+    explicit Scheduler(std::size_t worker_count = 0, bool inline_worker_pool = false);
 
     void enqueue_task(const ScheduledTask& task);
     [[nodiscard]] std::optional<ScheduledTask> dequeue_ready(uint64_t now_ns);
@@ -186,7 +189,9 @@ public:
     [[nodiscard]] bool empty() const noexcept;
     [[nodiscard]] std::size_t queue_size() const noexcept;
     [[nodiscard]] std::size_t parallelism() const noexcept;
+    [[nodiscard]] bool inline_mode() const noexcept;
     void run_batch(const std::vector<std::function<void()>>& jobs);
+    void run_async(std::function<void()> job);
     void register_async_waiter(const AsyncWaitKey& key, const ScheduledTask& task);
     void signal_async_completion(const AsyncWaitKey& key);
     [[nodiscard]] std::size_t promote_ready_async_tasks(uint64_t now_ns);

@@ -214,7 +214,13 @@ std::size_t WorkQueue::size() const noexcept {
     return tasks_.size();
 }
 
-WorkerPool::WorkerPool(std::size_t worker_count) {
+WorkerPool::WorkerPool(std::size_t worker_count, bool inline_mode) {
+    inline_mode_ = inline_mode;
+    if (inline_mode_) {
+        worker_count_ = 1U;
+        return;
+    }
+
     const std::size_t detected_workers = worker_count == 0U
         ? std::max<std::size_t>(2U, std::thread::hardware_concurrency() == 0U ? 2U : std::thread::hardware_concurrency())
         : worker_count;
@@ -245,6 +251,13 @@ void WorkerPool::run_batch(const std::vector<std::function<void()>>& jobs) {
         return;
     }
 
+    if (inline_mode_) {
+        for (const auto& job : jobs) {
+            job();
+        }
+        return;
+    }
+
     const auto batch = std::make_shared<BatchState>();
     batch->remaining = jobs.size();
 
@@ -266,6 +279,23 @@ void WorkerPool::run_batch(const std::vector<std::function<void()>>& jobs) {
     }
 }
 
+void WorkerPool::run_async(std::function<void()> job) {
+    if (!job) {
+        return;
+    }
+
+    if (inline_mode_) {
+        job();
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        jobs_.push_back(QueuedJob{std::move(job), nullptr});
+    }
+    cv_.notify_one();
+}
+
 void WorkerPool::worker_loop() {
     while (true) {
         QueuedJob job;
@@ -285,11 +315,13 @@ void WorkerPool::worker_loop() {
         try {
             job.work();
         } catch (...) {
-            std::lock_guard<std::mutex> batch_lock(job.batch->mutex);
-            job.batch->errors.push_back(std::current_exception());
+            if (job.batch) {
+                std::lock_guard<std::mutex> batch_lock(job.batch->mutex);
+                job.batch->errors.push_back(std::current_exception());
+            }
         }
 
-        {
+        if (job.batch) {
             std::lock_guard<std::mutex> batch_lock(job.batch->mutex);
             job.batch->remaining -= 1U;
             if (job.batch->remaining == 0U) {
@@ -529,7 +561,8 @@ void AsyncCompletionQueue::wait_for_activity(std::chrono::milliseconds timeout) 
     });
 }
 
-Scheduler::Scheduler(std::size_t worker_count) : worker_pool_(worker_count) {}
+Scheduler::Scheduler(std::size_t worker_count, bool inline_worker_pool)
+    : worker_pool_(worker_count, inline_worker_pool) {}
 
 void Scheduler::enqueue_task(const ScheduledTask& task) {
     work_queue_.push(task);
@@ -588,8 +621,16 @@ std::size_t Scheduler::parallelism() const noexcept {
     return worker_pool_.worker_count();
 }
 
+bool Scheduler::inline_mode() const noexcept {
+    return worker_pool_.inline_mode();
+}
+
 void Scheduler::run_batch(const std::vector<std::function<void()>>& jobs) {
     worker_pool_.run_batch(jobs);
+}
+
+void Scheduler::run_async(std::function<void()> job) {
+    worker_pool_.run_async(std::move(job));
 }
 
 void Scheduler::register_async_waiter(const AsyncWaitKey& key, const ScheduledTask& task) {

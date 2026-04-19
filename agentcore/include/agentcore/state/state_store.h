@@ -4,6 +4,9 @@
 #include "agentcore/core/types.h"
 #include "agentcore/state/journal/task_journal.h"
 #include "agentcore/state/knowledge_graph.h"
+#include <atomic>
+#include <mutex>
+#include <array>
 #include <cstddef>
 #include <iosfwd>
 #include <memory>
@@ -15,8 +18,29 @@
 namespace agentcore {
 
 struct WorkflowState {
-    std::vector<Value> fields;         // indexed by StateKey
-    uint64_t version{0};
+    static constexpr std::size_t kSegmentSize = 64;
+    struct Segment {
+        std::array<Value, kSegmentSize> values;
+
+        Segment() {
+            values.fill(std::monostate{});
+        }
+    };
+
+    std::vector<std::shared_ptr<Segment>> segments;
+    std::atomic<std::size_t> total_capacity{0};
+    std::atomic<uint64_t> version{0};
+
+    WorkflowState() = default;
+    WorkflowState(const WorkflowState& other);
+    WorkflowState& operator=(const WorkflowState& other);
+    WorkflowState(WorkflowState&&) noexcept = default;
+    WorkflowState& operator=(WorkflowState&&) noexcept = default;
+
+    void resize(std::size_t new_size);
+    [[nodiscard]] std::size_t size() const noexcept { return total_capacity.load(std::memory_order_acquire); }
+    [[nodiscard]] Value load(StateKey key) const noexcept;
+    void store(StateKey key, Value value) noexcept;
 };
 
 struct FieldUpdate {
@@ -69,6 +93,8 @@ public:
     [[nodiscard]] BlobRef append_string(std::string_view text);
     [[nodiscard]] std::vector<std::byte> read_bytes(BlobRef ref) const;
     [[nodiscard]] std::string_view read_string(BlobRef ref) const;
+    [[nodiscard]] std::pair<const std::byte*, std::size_t> read_buffer(BlobRef ref) const;
+    [[nodiscard]] std::string_view read_string_view(BlobRef ref) const;
     [[nodiscard]] std::size_t size_bytes() const noexcept;
     [[nodiscard]] bool shares_storage_with(const BlobStore& other) const noexcept;
     void serialize(std::ostream& output) const;
@@ -90,15 +116,26 @@ struct PatchLogEntry {
 
 class PatchLog {
 public:
-    [[nodiscard]] uint64_t append(uint64_t state_version, const StatePatch& patch);
+    PatchLog();
+    uint64_t append(uint64_t state_version, const StatePatch& patch);
     [[nodiscard]] const PatchLogEntry* find(uint64_t offset) const;
-    [[nodiscard]] const std::vector<PatchLogEntry>& entries() const noexcept;
+    [[nodiscard]] std::vector<PatchLogEntry> entries() const;
+    [[nodiscard]] std::vector<PatchLogEntry> entries_from(uint64_t offset) const;
     [[nodiscard]] std::size_t size() const noexcept;
     void serialize(std::ostream& output) const;
     [[nodiscard]] static PatchLog deserialize(std::istream& input);
 
+    PatchLog(const PatchLog& other);
+    PatchLog& operator=(const PatchLog& other);
+    PatchLog(PatchLog&&) noexcept = default;
+    PatchLog& operator=(PatchLog&&) noexcept = default;
+
 private:
-    std::vector<PatchLogEntry> entries_;
+    struct Storage;
+
+    void ensure_unique();
+
+    std::shared_ptr<Storage> storage_;
 };
 
 class StateStore {
@@ -130,6 +167,11 @@ public:
     [[nodiscard]] SharedBacking shared_backing_with(const StateStore& other) const noexcept;
     void serialize(std::ostream& output) const;
     [[nodiscard]] static StateStore deserialize(std::istream& input);
+
+    StateStore(const StateStore& other);
+    StateStore& operator=(const StateStore& other);
+    StateStore(StateStore&&) noexcept = default;
+    StateStore& operator=(StateStore&&) noexcept = default;
 
 private:
     WorkflowState current_state_;

@@ -44,6 +44,7 @@ final_state = compiled.invoke(
         "tags": ["smoke", "sync"],
     },
 )
+print(f"DEBUG: final_state['count'] = {final_state.get('count')}")
 assert final_state["count"] == 2
 assert final_state["history"] == ["step-1", "step-2"]
 assert final_state["payload"] == {"seed": True, "last": "step-2"}
@@ -67,6 +68,8 @@ events = list(
     )
 )
 assert [event["node_name"] for event in events] == ["planner", "planner"]
+for event in events:
+    print(f"DEBUG: event['node_name']={event.get('node_name')}, event['graph_name']='{event.get('graph_name')}'")
 assert all(event["graph_name"] == "python_state_graph_api_smoke" for event in events)
 
 batch_results = compiled.batch(

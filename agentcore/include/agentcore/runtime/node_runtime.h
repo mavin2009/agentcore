@@ -66,11 +66,22 @@ private:
 
 class CancellationToken {
 public:
-    void request_cancel() noexcept { cancelled_ = true; }
-    [[nodiscard]] bool is_cancelled() const noexcept { return cancelled_; }
+    CancellationToken() = default;
+    CancellationToken(const CancellationToken&) = delete;
+    CancellationToken& operator=(const CancellationToken&) = delete;
+    CancellationToken(CancellationToken&& other) noexcept : cancelled_(other.cancelled_.load(std::memory_order_acquire)) {}
+    CancellationToken& operator=(CancellationToken&& other) noexcept {
+        if (this != &other) {
+            cancelled_.store(other.cancelled_.load(std::memory_order_acquire), std::memory_order_release);
+        }
+        return *this;
+    }
+
+    void request_cancel() noexcept { cancelled_.store(true, std::memory_order_release); }
+    [[nodiscard]] bool is_cancelled() const noexcept { return cancelled_.load(std::memory_order_acquire); }
 
 private:
-    bool cancelled_{false};
+    std::atomic<bool> cancelled_{false};
 };
 
 struct NodeResult {

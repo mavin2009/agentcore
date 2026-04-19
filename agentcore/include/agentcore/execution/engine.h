@@ -16,6 +16,8 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <deque>
+#include <condition_variable>
 
 namespace agentcore {
 
@@ -24,6 +26,8 @@ struct InputEnvelope {
     StatePatch initial_patch{};
     std::vector<std::byte> runtime_config_payload;
     std::optional<NodeId> entry_override;
+    BlobStore initial_blobs{};
+    StringInterner initial_strings{};
 };
 
 struct StepResult {
@@ -82,7 +86,7 @@ struct CheckpointPolicy {
 
 class ExecutionEngine {
 public:
-    explicit ExecutionEngine(std::size_t worker_count = 0);
+    explicit ExecutionEngine(std::size_t worker_count = 0, bool inline_scheduler = false);
 
     void register_graph(const GraphDefinition& graph);
     void set_checkpoint_policy(CheckpointPolicy policy) noexcept;
@@ -130,6 +134,12 @@ private:
         std::optional<NodeId> reactive_root_node_id;
         std::string last_subgraph_session_id;
         uint64_t last_subgraph_session_revision{0};
+
+        BranchRuntime() = default;
+        BranchRuntime(const BranchRuntime&) = delete;
+        BranchRuntime& operator=(const BranchRuntime&) = delete;
+        BranchRuntime(BranchRuntime&&) noexcept;
+        BranchRuntime& operator=(BranchRuntime&&) noexcept;
     };
 
     struct JoinScope {
@@ -157,6 +167,7 @@ private:
         GraphDefinition graph{};
         ExecutionStatus status{ExecutionStatus::NotStarted};
         std::vector<std::byte> runtime_config_payload;
+        mutable std::unique_ptr<std::mutex> mutex;
         std::unordered_map<uint32_t, BranchRuntime> branches;
         uint32_t next_branch_id{1};
         std::unordered_map<uint32_t, JoinScope> join_scopes;
@@ -165,6 +176,13 @@ private:
         SubgraphSessionLeaseTable active_subgraph_session_leases;
         std::shared_ptr<std::mutex> subgraph_session_mutex{std::make_shared<std::mutex>()};
         uint32_t next_split_id{1};
+        uint32_t in_flight_tasks{0};
+
+        RunRuntime();
+        RunRuntime(const RunRuntime&) = delete;
+        RunRuntime& operator=(const RunRuntime&) = delete;
+        RunRuntime(RunRuntime&&) noexcept;
+        RunRuntime& operator=(RunRuntime&&) noexcept;
     };
 
     struct TaskExecutionRecord {
@@ -178,6 +196,11 @@ private:
         uint32_t blocked_join_scope_id{0};
     };
 
+    struct TaskCommitRecord {
+        RunId run_id{0};
+        TaskExecutionRecord record{};
+    };
+
     [[nodiscard]] static uint64_t now_ns();
     [[nodiscard]] TaskExecutionRecord execute_task(RunRuntime& run, const ScheduledTask& task);
     [[nodiscard]] NodeResult execute_subgraph_node(
@@ -187,7 +210,10 @@ private:
         BranchRuntime& branch
     );
     StepResult commit_task_execution(RunId run_id, RunRuntime& run, const TaskExecutionRecord& record);
+    void push_commit(RunId run_id, TaskExecutionRecord record);
+    [[nodiscard]] std::optional<TaskCommitRecord> pop_commit(RunId run_id, std::chrono::milliseconds timeout);
     [[nodiscard]] RunSnapshot snapshot_run(RunId run_id, const RunRuntime& run) const;
+    [[nodiscard]] RunSnapshot snapshot_run_locked(RunId run_id, const RunRuntime& run) const;
     [[nodiscard]] bool should_capture_checkpoint_snapshot(
         const RunRuntime& run,
         const BranchRuntime& checkpoint_branch,
@@ -204,6 +230,7 @@ private:
         bool enqueue_paused_branches = true
     );
     void update_run_status(RunRuntime& run, RunId run_id);
+    void update_run_status_locked(RunRuntime& run, RunId run_id);
     [[nodiscard]] GraphDefinition resolve_runtime_graph(const RunSnapshot& snapshot) const;
     void re_register_async_waiter(RunId run_id, uint32_t branch_id, const PendingAsyncOperation& pending_async);
     void borrow_runtime_registries(ToolRegistry& tools, ModelRegistry& models) noexcept;
@@ -245,10 +272,14 @@ private:
         RunRuntime& run,
         uint32_t* trace_flags = nullptr
     );
-    [[nodiscard]] const GraphDefinition* registered_graph(GraphId graph_id) const noexcept;
+    const GraphDefinition* registered_graph(GraphId graph_id) const noexcept;
 
     std::unordered_map<RunId, RunRuntime> runs_;
+    mutable std::mutex runs_mutex_;
     std::unordered_map<GraphId, GraphDefinition> graph_registry_;
+    std::deque<TaskCommitRecord> commit_queue_;
+    mutable std::mutex commit_mutex_;
+    std::condition_variable commit_cv_;
     Scheduler scheduler_;
     CheckpointManager checkpoint_manager_;
     TraceSink trace_sink_;

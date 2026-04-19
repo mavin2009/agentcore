@@ -13,9 +13,12 @@ ctest --test-dir build --output-on-failure
 ./build/agentcore_runtime_benchmark
 ./build/agentcore_persistent_subgraph_session_benchmark
 PYTHONPATH=./build/python python3 ./python/benchmarks/state_graph_api_benchmark.py
+PYTHONPATH=./build/python python3 ./python/benchmarks/langgraph_head_to_head.py
 ```
 
 That path builds the native runtime, examples, benchmarks, and Python bindings, runs the registered CTest suite, then executes the benchmark surfaces that cover persistent subgraph sessions and replay behavior.
+
+This is also the release-candidate path used for the current published benchmark snapshot in [`../comparisons/langgraph-head-to-head.md`](../comparisons/langgraph-head-to-head.md).
 
 ## Python Smoke Tests
 
@@ -123,7 +126,13 @@ If you want the optional public comparison against upstream LangGraph, install L
 
 ```bash
 python3 -m pip install langgraph
-python3 ./python/benchmarks/langgraph_head_to_head.py
+PYTHONPATH=./build/python python3 ./python/benchmarks/langgraph_head_to_head.py
+```
+
+For a narrower stress test of wide fan-out/join behavior from Python, there is also:
+
+```bash
+PYTHONPATH=./build/python python3 ./python/benchmarks/massive_fanout_benchmark.py --fanout 50 --iterations 10 --workers 4
 ```
 
 These benchmarks are most useful when comparing revisions on the same machine with the same build configuration. They should be treated as regression instruments and change-detection tools, not as universal performance claims.
@@ -163,7 +172,8 @@ When changing scheduler, subgraph, or streaming behavior:
 2. Run the four Python smoke scripts.
 3. Run `./build/agentcore_runtime_benchmark`.
 4. Run `./build/agentcore_persistent_subgraph_session_benchmark`.
-5. If the change touched Python orchestration, also run the Python benchmark.
+5. Run `PYTHONPATH=./build/python python3 ./python/benchmarks/langgraph_head_to_head.py` when the change affects scheduler, state, subgraph, or Python runtime behavior.
+6. If the change touched Python orchestration more broadly, also run `PYTHONPATH=./build/python python3 ./python/benchmarks/state_graph_api_benchmark.py`.
 
 That sequence gives fast signal on correctness first and performance second.
 

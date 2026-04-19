@@ -258,6 +258,29 @@ The exported CMake targets are:
 
 - `agentcore::graph`
 - `agentcore::state`
+
+## Current Validation Snapshot
+
+The current tree has been validated from this repository on April 18, 2026 with:
+
+```bash
+cmake -S . -B build -DAGENTCORE_BUILD_PYTHON_BINDINGS=ON -DAGENTCORE_BUILD_BENCHMARKS=ON
+cmake --build build -j
+ctest --test-dir build --output-on-failure
+PYTHONPATH=./build/python python3 ./python/benchmarks/langgraph_head_to_head.py
+```
+
+That pass completed successfully, including the native and Python smoke coverage registered under CTest and the public head-to-head benchmark report.
+
+The current benchmark snapshot is documented in [`./docs/comparisons/langgraph-head-to-head.md`](./docs/comparisons/langgraph-head-to-head.md). At a high level, this pass shows:
+
+- AgentCore native faster on the long-running persistent-memory workload
+- AgentCore native using materially less peak memory on that same workload
+- AgentCore native faster on pause/resume
+- AgentCore native slightly faster on the 24-session persistent fan-out benchmark
+- AgentCore native still slightly slower on the simple direct-invoke micro-workload
+
+Those results should be read as a reproducible snapshot for this machine and this tree, not as a universal claim.
 - `agentcore::runtime`
 - `agentcore::execution`
 - `agentcore::adapters`

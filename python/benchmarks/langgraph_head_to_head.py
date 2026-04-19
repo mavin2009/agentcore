@@ -10,6 +10,7 @@ import statistics
 import subprocess
 import sys
 import time
+import importlib
 from pathlib import Path
 from typing import Any
 from typing_extensions import Annotated, TypedDict
@@ -19,9 +20,56 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 BUILD_PYTHON_ROOT = REPO_ROOT / "build" / "python"
 
 
+def _normalize_pythonpath_entries(raw_value: str | None) -> list[str]:
+    if not raw_value:
+        return []
+    return [entry for entry in raw_value.split(os.pathsep) if entry]
+
+
+def _without_build_python_root(raw_value: str | None) -> str | None:
+    normalized_build_root = str(BUILD_PYTHON_ROOT.resolve())
+    filtered = [
+        entry
+        for entry in _normalize_pythonpath_entries(raw_value)
+        if str(Path(entry).resolve()) != normalized_build_root
+    ]
+    if not filtered:
+        return None
+    return os.pathsep.join(filtered)
+
+
+def _prefer_installed_langgraph() -> None:
+    normalized_build_root = str(BUILD_PYTHON_ROOT.resolve())
+    sys.path[:] = [
+        entry
+        for entry in sys.path
+        if str(Path(entry or ".").resolve()) != normalized_build_root
+    ]
+    for module_name in list(sys.modules):
+        if module_name == "langgraph" or module_name.startswith("langgraph."):
+            del sys.modules[module_name]
+    importlib.invalidate_caches()
+
+
+def _prefer_agentcore_build_python() -> None:
+    normalized_build_root = str(BUILD_PYTHON_ROOT.resolve())
+    sys.path[:] = [
+        entry
+        for entry in sys.path
+        if str(Path(entry or ".").resolve()) != normalized_build_root
+    ]
+    sys.path.insert(0, normalized_build_root)
+    importlib.invalidate_caches()
+
+
 def _run_subprocess(worker: str) -> dict[str, Any]:
     command = [sys.executable, __file__, "--worker", worker]
     env = os.environ.copy()
+    sanitized_pythonpath = _without_build_python_root(env.get("PYTHONPATH"))
+    if sanitized_pythonpath is None:
+        env.pop("PYTHONPATH", None)
+    else:
+        env["PYTHONPATH"] = sanitized_pythonpath
     completed = subprocess.run(
         command,
         cwd=str(REPO_ROOT),
@@ -67,6 +115,19 @@ def _fmt_memory_kb(memory_kb: int) -> str:
     return f"{memory_kb / 1024:.1f} MiB"
 
 
+def _materialize_state(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return dict(value)
+    if hasattr(value, "items"):
+        return dict(value.items())
+    try:
+        return dict(value)
+    except Exception:
+        return value
+
+
 def _pct_less(reference: int, candidate: int) -> float:
     if reference <= 0:
         return 0.0
@@ -102,11 +163,12 @@ def _relative_memory_label(langgraph_kb: int, agentcore_kb: int) -> str:
 
 
 def _bench_langgraph_compat() -> dict[str, Any]:
+    _prefer_installed_langgraph()
     from langgraph.graph import END as LG_END
     from langgraph.graph import START as LG_START
     from langgraph.graph import StateGraph as LangGraphStateGraph
 
-    sys.path.insert(0, str(BUILD_PYTHON_ROOT))
+    _prefer_agentcore_build_python()
     from agentcore_langgraph_native.langgraph_compat import END as AC_END
     from agentcore_langgraph_native.langgraph_compat import START as AC_START
     from agentcore_langgraph_native.langgraph_compat import StateGraph as CompatStateGraph
@@ -212,6 +274,7 @@ def _bench_native_memory() -> dict[str, Any]:
     specialist_count = 10
 
     if runtime == "langgraph":
+        _prefer_installed_langgraph()
         import operator
         from typing_extensions import Annotated, TypedDict
 
@@ -278,7 +341,7 @@ def _bench_native_memory() -> dict[str, Any]:
         parent_graph = parent_builder.compile()
 
     elif runtime == "agentcore":
-        sys.path.insert(0, str(BUILD_PYTHON_ROOT))
+        _prefer_agentcore_build_python()
         from agentcore.graph import END, START, StateGraph
 
         child_graph = StateGraph(dict, name="memory_child", worker_count=4)
@@ -366,6 +429,7 @@ def _bench_native_resume() -> dict[str, Any]:
     iterations = 200
 
     if runtime == "langgraph":
+        _prefer_installed_langgraph()
         from typing_extensions import TypedDict
 
         from langgraph.checkpoint.memory import InMemorySaver
@@ -425,7 +489,7 @@ def _bench_native_resume() -> dict[str, Any]:
         resume_elapsed_ns = time.perf_counter_ns() - start_ns
 
     elif runtime == "agentcore":
-        sys.path.insert(0, str(BUILD_PYTHON_ROOT))
+        _prefer_agentcore_build_python()
         from agentcore.graph import Command, END, START, StateGraph
 
         def build_direct():
@@ -483,7 +547,7 @@ def _bench_native_resume() -> dict[str, Any]:
         "runtime": runtime,
         "direct_avg_ns": direct_elapsed_ns // iterations,
         "resume_avg_ns": resume_elapsed_ns // iterations,
-        "state_equal": bool(direct_state == resumed_state),
+        "state_equal": bool(_materialize_state(direct_state) == _materialize_state(resumed_state)),
     }
 
 
@@ -493,6 +557,7 @@ def _bench_native_fanout() -> dict[str, Any]:
     iterations = 50
 
     if runtime == "langgraph":
+        _prefer_installed_langgraph()
         import operator
         from typing_extensions import Annotated, TypedDict
 
@@ -576,7 +641,7 @@ def _bench_native_fanout() -> dict[str, Any]:
         }
 
     if runtime == "agentcore":
-        sys.path.insert(0, str(BUILD_PYTHON_ROOT))
+        _prefer_agentcore_build_python()
         from agentcore.graph import END, START, StateGraph
 
         child_graph = StateGraph(dict, name="fanout_child", worker_count=8)
