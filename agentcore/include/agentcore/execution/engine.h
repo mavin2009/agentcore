@@ -3,6 +3,7 @@
 
 #include "agentcore/core/types.h"
 #include "agentcore/execution/checkpoint.h"
+#include "agentcore/execution/reactive/memoization.h"
 #include "agentcore/execution/streaming/public_stream.h"
 #include "agentcore/execution/subgraph/session_runtime.h"
 #include "agentcore/graph/graph_ir.h"
@@ -16,10 +17,10 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
-#include <deque>
-#include <condition_variable>
 
 namespace agentcore {
+
+class SubgraphChildEnginePool;
 
 struct InputEnvelope {
     std::size_t initial_field_count{0};
@@ -84,9 +85,17 @@ struct CheckpointPolicy {
     bool snapshot_on_join_events{true};
 };
 
+struct ExecutionEngineOptions {
+    std::size_t worker_count{0U};
+    bool inline_scheduler{false};
+    ExecutionProfile profile{ExecutionProfile::Balanced};
+};
+
 class ExecutionEngine {
 public:
+    explicit ExecutionEngine(const ExecutionEngineOptions& options);
     explicit ExecutionEngine(std::size_t worker_count = 0, bool inline_scheduler = false);
+    ~ExecutionEngine();
 
     void register_graph(const GraphDefinition& graph);
     void set_checkpoint_policy(CheckpointPolicy policy) noexcept;
@@ -120,6 +129,8 @@ public:
     ) const;
 
 private:
+    friend class SubgraphChildEnginePool;
+
     struct BranchRuntime {
         ExecutionFrame frame{};
         StateStore state_store{};
@@ -132,6 +143,7 @@ private:
         std::optional<PendingSubgraphExecution> pending_subgraph;
         std::vector<uint32_t> join_stack;
         std::optional<NodeId> reactive_root_node_id;
+        DeterministicNodeMemoCache memo_cache{};
         std::string last_subgraph_session_id;
         uint64_t last_subgraph_session_revision{0};
 
@@ -141,6 +153,8 @@ private:
         BranchRuntime(BranchRuntime&&) noexcept;
         BranchRuntime& operator=(BranchRuntime&&) noexcept;
     };
+
+    using BranchPtr = std::shared_ptr<BranchRuntime>;
 
     struct JoinScope {
         uint32_t split_id{0};
@@ -168,7 +182,7 @@ private:
         ExecutionStatus status{ExecutionStatus::NotStarted};
         std::vector<std::byte> runtime_config_payload;
         mutable std::unique_ptr<std::mutex> mutex;
-        std::unordered_map<uint32_t, BranchRuntime> branches;
+        std::unordered_map<uint32_t, BranchPtr> branches;
         uint32_t next_branch_id{1};
         std::unordered_map<uint32_t, JoinScope> join_scopes;
         std::unordered_map<NodeId, ReactiveFrontierState> reactive_frontiers;
@@ -190,15 +204,11 @@ private:
         NodeResult node_result{};
         uint64_t started_at_ns{0};
         uint64_t ended_at_ns{0};
+        std::vector<TraceEvent> deferred_trace_events;
         std::string error_message;
         bool progressed{false};
         bool blocked_on_join{false};
         uint32_t blocked_join_scope_id{0};
-    };
-
-    struct TaskCommitRecord {
-        RunId run_id{0};
-        TaskExecutionRecord record{};
     };
 
     [[nodiscard]] static uint64_t now_ns();
@@ -207,11 +217,10 @@ private:
         RunId run_id,
         RunRuntime& run,
         const NodeDefinition& node,
-        BranchRuntime& branch
+        const BranchPtr& branch,
+        std::vector<TraceEvent>* deferred_trace_events
     );
-    StepResult commit_task_execution(RunId run_id, RunRuntime& run, const TaskExecutionRecord& record);
-    void push_commit(RunId run_id, TaskExecutionRecord record);
-    [[nodiscard]] std::optional<TaskCommitRecord> pop_commit(RunId run_id, std::chrono::milliseconds timeout);
+    StepResult commit_task_execution(RunId run_id, RunRuntime& run, TaskExecutionRecord record);
     [[nodiscard]] RunSnapshot snapshot_run(RunId run_id, const RunRuntime& run) const;
     [[nodiscard]] RunSnapshot snapshot_run_locked(RunId run_id, const RunRuntime& run) const;
     [[nodiscard]] bool should_capture_checkpoint_snapshot(
@@ -232,8 +241,16 @@ private:
     void update_run_status(RunRuntime& run, RunId run_id);
     void update_run_status_locked(RunRuntime& run, RunId run_id);
     [[nodiscard]] GraphDefinition resolve_runtime_graph(const RunSnapshot& snapshot) const;
+    void re_register_async_waiter_locked(
+        RunId run_id,
+        const RunRuntime& run,
+        uint32_t branch_id,
+        const PendingAsyncOperation& pending_async
+    );
     void re_register_async_waiter(RunId run_id, uint32_t branch_id, const PendingAsyncOperation& pending_async);
     void borrow_runtime_registries(ToolRegistry& tools, ModelRegistry& models) noexcept;
+    void borrow_graph_registry(const ExecutionEngine& provider) noexcept;
+    void reset_reusable_subgraph_child_state();
     [[nodiscard]] ToolRegistry& runtime_tools() noexcept;
     [[nodiscard]] const ToolRegistry& runtime_tools() const noexcept;
     [[nodiscard]] ModelRegistry& runtime_models() noexcept;
@@ -277,16 +294,16 @@ private:
     std::unordered_map<RunId, RunRuntime> runs_;
     mutable std::mutex runs_mutex_;
     std::unordered_map<GraphId, GraphDefinition> graph_registry_;
-    std::deque<TaskCommitRecord> commit_queue_;
-    mutable std::mutex commit_mutex_;
-    std::condition_variable commit_cv_;
     Scheduler scheduler_;
     CheckpointManager checkpoint_manager_;
     TraceSink trace_sink_;
     ToolRegistry tool_registry_;
     ModelRegistry model_registry_;
+    std::unique_ptr<SubgraphChildEnginePool> subgraph_engine_pool_;
+    const ExecutionEngine* borrowed_graph_provider_{nullptr};
     ToolRegistry* borrowed_tool_registry_{nullptr};
     ModelRegistry* borrowed_model_registry_{nullptr};
+    ExecutionEngineOptions options_{};
     CheckpointPolicy checkpoint_policy_{};
     RunId next_run_id_{1};
 };

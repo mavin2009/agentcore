@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import inspect
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Sequence
 
@@ -39,6 +40,8 @@ _VALID_MERGE_STRATEGIES = {
     "logical_and",
 }
 
+_MISSING = object()
+
 
 @dataclass(frozen=True)
 class Command:
@@ -66,6 +69,9 @@ class _NodeSpec:
     allow_fan_out: bool = False
     create_join_scope: bool = False
     join_incoming_branches: bool = False
+    deterministic: bool = False
+    read_keys: tuple[str, ...] = ()
+    cache_size: int = 16
     merge: dict[str, str] = field(default_factory=dict)
     subgraph: _SubgraphSpec | None = None
 
@@ -120,6 +126,26 @@ def _positional_arity(function: Any) -> int | None:
         ):
             positional_count += 1
     return positional_count
+
+
+def _compile_callback_invoker(function: Any) -> Any:
+    positional_arity = _positional_arity(function)
+    if positional_arity is None or positional_arity >= 3:
+        def invoke(state: Any, config: Any, runtime: RuntimeContext) -> Any:
+            return function(state, config, runtime)
+
+        return invoke
+
+    if positional_arity >= 2:
+        def invoke(state: Any, config: Any, runtime: RuntimeContext) -> Any:
+            return function(state, config)
+
+        return invoke
+
+    def invoke(state: Any, config: Any, runtime: RuntimeContext) -> Any:
+        return function(state)
+
+    return invoke
 
 
 def _run_awaitable_blocking(awaitable: Any) -> Any:
@@ -235,23 +261,81 @@ class RuntimeContext:
         return details["output"]
 
 
-def _extract_runtime_and_config(config: Any) -> tuple[dict[str, Any], RuntimeContext]:
+def _extract_runtime_and_config(config: Any) -> tuple[Any, RuntimeContext]:
+    runtime_accessor = getattr(config, "_agentcore_runtime_capsule", None)
+    if callable(runtime_accessor):
+        return config, RuntimeContext(runtime_accessor())
     normalized = _normalize_config(config)
     return normalized, RuntimeContext(normalized.pop(_RUNTIME_CONFIG_KEY, None))
 
 
-def _call_with_optional_runtime(
-    function: Any,
-    state: dict[str, Any],
-    config: dict[str, Any],
-    runtime: RuntimeContext,
-) -> Any:
-    positional_arity = _positional_arity(function)
-    if positional_arity is None or positional_arity >= 3:
-        return function(state, config, runtime)
-    if positional_arity >= 2:
-        return function(state, config)
-    return function(state)
+class _OverlayMapping(Mapping):
+    def __init__(self, base: Any, overlay: dict[str, Any]):
+        self._base = base
+        self._overlay = overlay
+
+    def __getitem__(self, key: str) -> Any:
+        if key in self._overlay:
+            return self._overlay[key]
+        return self._base[key]
+
+    def __iter__(self):
+        seen: set[str] = set()
+        for key in self._overlay:
+            seen.add(key)
+            yield key
+        for key in self._base.keys():
+            if key not in seen:
+                yield key
+
+    def __len__(self) -> int:
+        count = len(self._overlay)
+        for key in self._base.keys():
+            if key not in self._overlay:
+                count += 1
+        return count
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key in self._overlay:
+            return self._overlay[key]
+        return self._base.get(key, default)
+
+    def copy(self) -> dict[str, Any]:
+        copied = dict(self._base.items())
+        copied.update(self._overlay)
+        return copied
+
+
+class _StateView(Mapping):
+    def __init__(self, base: Any):
+        self._base = base
+
+    def __getitem__(self, key: str) -> Any:
+        value = self._base.get(key, _MISSING)
+        if value is _MISSING or value is None:
+            raise KeyError(key)
+        return value
+
+    def __iter__(self):
+        yield from self._base.keys()
+
+    def __len__(self) -> int:
+        return len(self._base.keys())
+
+    def get(self, key: str, default: Any = None) -> Any:
+        value = self._base.get(key, _MISSING)
+        if value is _MISSING or value is None:
+            return default
+        return value
+
+    def keys(self):
+        return self._base.keys()
+
+    def items(self):
+        return self._base.items()
+
+    def copy(self) -> dict[str, Any]:
+        return dict(self._base.items())
 
 
 def _normalize_batch_configs(config: Any, size: int) -> list[dict[str, Any]]:
@@ -298,6 +382,20 @@ def _normalize_merge_rules(merge: Any) -> dict[str, str]:
     return normalized
 
 
+def _normalize_string_sequence(value: Any, *, field_name: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        raise TypeError(f"{field_name} must be a sequence of strings, not a single string")
+
+    normalized: list[str] = []
+    for entry in value:
+        if not isinstance(entry, str):
+            raise TypeError(f"{field_name} must contain only strings")
+        normalized.append(entry)
+    return tuple(normalized)
+
+
 class StateGraph:
     def __init__(self, state_schema: Any = None, *, name: str | None = None, worker_count: int = 1):
         self._state_schema = state_schema
@@ -318,6 +416,9 @@ class StateGraph:
         allow_fan_out: bool = False,
         create_join_scope: bool = False,
         join_incoming_branches: bool = False,
+        deterministic: bool = False,
+        read_keys: Sequence[str] | None = None,
+        cache_size: int = 16,
         merge: dict[str, Any] | None = None,
     ) -> "StateGraph":
         if action is not None and not callable(action):
@@ -327,6 +428,11 @@ class StateGraph:
         if normalized_kind == "subgraph":
             raise ValueError("use add_subgraph(...) to register subgraph nodes")
 
+        normalized_read_keys = _normalize_string_sequence(read_keys, field_name="read_keys")
+        if not deterministic and normalized_read_keys:
+            raise ValueError("read_keys require deterministic=True")
+        normalized_cache_size = max(1, int(cache_size))
+
         self._nodes[name] = _NodeSpec(
             action=action,
             kind=normalized_kind,
@@ -334,6 +440,9 @@ class StateGraph:
             allow_fan_out=bool(allow_fan_out),
             create_join_scope=bool(create_join_scope),
             join_incoming_branches=bool(join_incoming_branches),
+            deterministic=bool(deterministic),
+            read_keys=normalized_read_keys,
+            cache_size=normalized_cache_size,
             merge=_normalize_merge_rules(merge),
         )
         if self._entry_point is None:
@@ -503,6 +612,9 @@ class StateGraph:
                     allow_fan_out=node_spec.allow_fan_out,
                     create_join_scope=node_spec.create_join_scope,
                     join_incoming_branches=node_spec.join_incoming_branches,
+                    deterministic=node_spec.deterministic,
+                    read_keys=node_spec.read_keys,
+                    cache_size=node_spec.cache_size,
                     merge_rules=node_spec.merge,
                 )
 
@@ -555,16 +667,22 @@ class StateGraph:
         node_spec = self._nodes[node_name]
         node_action = node_spec.action
         routing_spec = self._conditional_edges.get(node_name)
+        action_invoker = _compile_callback_invoker(node_action) if node_action is not None else None
+        route_invoker = None
+        route_map = None
+        if routing_spec is not None:
+            route_fn, route_map = routing_spec
+            route_invoker = _compile_callback_invoker(route_fn)
 
-        def wrapped(state: dict[str, Any], config: dict[str, Any] | None = None) -> Any:
+        def wrapped(state: Any, config: Any = None) -> Any:
             normalized_config, runtime = _extract_runtime_and_config(config)
+            state_view = _StateView(state)
             updates: dict[str, Any] = {}
             explicit_goto: str | None = None
 
-            if node_action is not None:
-                node_result = _call_with_optional_runtime(
-                    node_action,
-                    dict(state),
+            if action_invoker is not None:
+                node_result = action_invoker(
+                    state_view,
                     normalized_config,
                     runtime,
                 )
@@ -579,11 +697,8 @@ class StateGraph:
             if routing_spec is None:
                 return updates
 
-            route_fn, route_map = routing_spec
-            merged_state = dict(state)
-            merged_state.update(updates)
-            route_result = _call_with_optional_runtime(
-                route_fn,
+            merged_state = state_view if not updates else _OverlayMapping(state_view, updates)
+            route_result = route_invoker(
                 merged_state,
                 normalized_config,
                 runtime,

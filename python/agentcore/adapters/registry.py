@@ -128,6 +128,52 @@ def _positional_arity(function: Any) -> int | None:
     return positional_count
 
 
+def _compile_tool_handler_invoker(handler: Any) -> tuple[Any, bool]:
+    positional_arity = _positional_arity(handler)
+    if positional_arity == 0:
+        def invoke(request: Any, metadata: dict[str, Any]) -> Any:
+            return _resolve_maybe_awaitable(handler())
+
+        return invoke, False
+
+    if positional_arity == 1:
+        def invoke(request: Any, metadata: dict[str, Any]) -> Any:
+            return _resolve_maybe_awaitable(handler(request))
+
+        return invoke, False
+
+    def invoke(request: Any, metadata: dict[str, Any]) -> Any:
+        return _resolve_maybe_awaitable(handler(request, metadata))
+
+    return invoke, True
+
+
+def _compile_model_handler_invoker(handler: Any) -> tuple[Any, bool]:
+    positional_arity = _positional_arity(handler)
+    if positional_arity == 0:
+        def invoke(prompt: Any, schema: Any, metadata: dict[str, Any]) -> Any:
+            return _resolve_maybe_awaitable(handler())
+
+        return invoke, False
+
+    if positional_arity == 1:
+        def invoke(prompt: Any, schema: Any, metadata: dict[str, Any]) -> Any:
+            return _resolve_maybe_awaitable(handler(prompt))
+
+        return invoke, False
+
+    if positional_arity == 2:
+        def invoke(prompt: Any, schema: Any, metadata: dict[str, Any]) -> Any:
+            return _resolve_maybe_awaitable(handler(prompt, schema))
+
+        return invoke, False
+
+    def invoke(prompt: Any, schema: Any, metadata: dict[str, Any]) -> Any:
+        return _resolve_maybe_awaitable(handler(prompt, schema, metadata))
+
+    return invoke, True
+
+
 def _run_awaitable_blocking(awaitable: Any) -> Any:
     try:
         asyncio.get_running_loop()
@@ -166,30 +212,6 @@ def _model_handler_meta(
         "decode_prompt": decode_prompt,
         "decode_schema": decode_schema,
     }
-
-
-def _call_tool_handler(handler: Any, request: Any, metadata: dict[str, Any]) -> Any:
-    positional_arity = _positional_arity(handler)
-    if positional_arity == 0:
-        result = handler()
-    elif positional_arity == 1:
-        result = handler(request)
-    else:
-        result = handler(request, metadata)
-    return _resolve_maybe_awaitable(result)
-
-
-def _call_model_handler(handler: Any, prompt: Any, schema: Any, metadata: dict[str, Any]) -> Any:
-    positional_arity = _positional_arity(handler)
-    if positional_arity == 0:
-        result = handler()
-    elif positional_arity == 1:
-        result = handler(prompt)
-    elif positional_arity == 2:
-        result = handler(prompt, schema)
-    else:
-        result = handler(prompt, schema, metadata)
-    return _resolve_maybe_awaitable(result)
 
 
 def _looks_like_response_envelope(value: Any, *, control_keys: frozenset[str]) -> bool:
@@ -296,14 +318,16 @@ class ToolRegistryView:
             _default_tool_metadata(normalized_name, decode_input=normalized_decode),
             metadata,
         )
+        handler_invoker, requires_metadata = _compile_tool_handler_invoker(handler)
 
         def native_handler(input_bytes: bytes) -> dict[str, Any]:
             request = decode_adapter_payload(input_bytes, decode=normalized_decode)
-            result = _call_tool_handler(
-                handler,
-                request,
-                _tool_handler_meta(normalized_name, decode_input=normalized_decode),
+            handler_metadata = (
+                _tool_handler_meta(normalized_name, decode_input=normalized_decode)
+                if requires_metadata else
+                {}
             )
+            result = handler_invoker(request, handler_metadata)
             return _normalize_tool_handler_result(result)
 
         _native._register_python_tool_adapter(
@@ -425,21 +449,22 @@ class ModelRegistryView:
             ),
             metadata,
         )
+        handler_invoker, requires_metadata = _compile_model_handler_invoker(handler)
 
         def native_handler(prompt_bytes: bytes, schema_bytes: bytes, max_tokens: int) -> dict[str, Any]:
             prompt = decode_adapter_payload(prompt_bytes, decode=normalized_prompt_decode)
             schema = decode_adapter_payload(schema_bytes, decode=normalized_schema_decode)
-            result = _call_model_handler(
-                handler,
-                prompt,
-                schema,
+            handler_metadata = (
                 _model_handler_meta(
                     normalized_name,
                     max_tokens=max_tokens,
                     decode_prompt=normalized_prompt_decode,
                     decode_schema=normalized_schema_decode,
-                ),
+                )
+                if requires_metadata else
+                {}
             )
+            result = handler_invoker(prompt, schema, handler_metadata)
             return _normalize_model_handler_result(result)
 
         _native._register_python_model_adapter(

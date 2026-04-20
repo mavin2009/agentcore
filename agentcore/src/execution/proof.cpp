@@ -78,6 +78,13 @@ void hash_graph(Fnv1a64& hasher, const GraphDefinition& graph) {
             hasher.update_string(subscription.relation);
             hasher.update_string(subscription.object_label);
         }
+        hasher.update_pod(node.memoization.deterministic);
+        const uint64_t memoization_key_count = static_cast<uint64_t>(node.memoization.read_keys.size());
+        hasher.update_pod(memoization_key_count);
+        for (StateKey read_key : node.memoization.read_keys) {
+            hasher.update_pod(read_key);
+        }
+        hasher.update_pod(node.memoization.max_entries);
         hasher.update_pod(node.subgraph.has_value());
         if (node.subgraph.has_value()) {
             hasher.update_pod(node.subgraph->graph_id);

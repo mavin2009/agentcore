@@ -65,6 +65,9 @@ int main() {
     assert(scheduler.task_count_for_run(7U) == 2U);
     assert(scheduler.task_count_for_run(8U) == 1U);
     assert(scheduler.task_count_for_run(99U) == 0U);
+    assert(scheduler.next_task_ready_time_for_run(7U).has_value());
+    assert(*scheduler.next_task_ready_time_for_run(7U) == 0U);
+    assert(scheduler.next_task_ready_time_for_run(99U) == std::nullopt);
 
     const auto ready_run7 = scheduler.dequeue_ready_for_run(7U, 0U);
     assert(ready_run7.has_value());
@@ -83,11 +86,23 @@ int main() {
     assert(!scheduler.has_tasks_for_run(8U));
     assert(scheduler.task_count_for_run(8U) == 0U);
 
+    scheduler.enqueue_task(ScheduledTask{11U, 31U, 1U, 50U});
+    scheduler.enqueue_task(ScheduledTask{11U, 32U, 1U, 5U});
+    assert(scheduler.next_task_ready_time_for_run(11U).has_value());
+    assert(*scheduler.next_task_ready_time_for_run(11U) == 5U);
+    assert(!scheduler.has_ready_for_run(11U, 4U));
+    const auto delayed_ready = scheduler.dequeue_ready_for_run(11U, 5U);
+    assert(delayed_ready.has_value());
+    assert(delayed_ready->node_id == 32U);
+    scheduler.remove_run(11U);
+
     const AsyncWaitKey tool_wait_key{AsyncWaitKind::Tool, 41U};
     scheduler.register_async_waiter(tool_wait_key, ScheduledTask{7, 11, 2, 0U});
     assert(scheduler.has_async_waiters());
     scheduler.signal_async_completion(tool_wait_key);
+    assert(scheduler.has_async_waiters_for_run(7U));
     assert(scheduler.promote_ready_async_tasks(0U) == 1U);
+    assert(!scheduler.has_async_waiters_for_run(7U));
     const auto promoted_task = scheduler.dequeue_ready_for_run(7U, 0U);
     assert(promoted_task.has_value());
     assert(promoted_task->node_id == 11U);
@@ -122,6 +137,22 @@ int main() {
     assert(rearmed_task.has_value());
     assert(rearmed_task->node_id == 15U);
     scheduler.remove_async_waiters_for_task(*rearmed_task);
+
+    const ScheduledTask grouped_wait_task{12U, 17U, 8U, 0U};
+    const AsyncWaitKey grouped_wait_left{AsyncWaitKind::Tool, 91U};
+    const AsyncWaitKey grouped_wait_right{AsyncWaitKind::Model, 92U};
+    scheduler.register_async_wait_group(
+        std::vector<AsyncWaitKey>{grouped_wait_left, grouped_wait_right},
+        grouped_wait_task
+    );
+    scheduler.signal_async_completion(grouped_wait_left);
+    assert(scheduler.promote_ready_async_tasks(0U) == 0U);
+    assert(scheduler.has_async_waiters_for_run(12U));
+    scheduler.signal_async_completion(grouped_wait_right);
+    assert(scheduler.promote_ready_async_tasks(0U) == 1U);
+    const auto grouped_ready = scheduler.dequeue_ready_for_run(12U, 0U);
+    assert(grouped_ready.has_value());
+    assert(grouped_ready->node_id == 17U);
 
     StateStore store;
     BlobStore& blobs = store.blobs();

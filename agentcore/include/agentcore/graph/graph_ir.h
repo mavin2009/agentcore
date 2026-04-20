@@ -126,6 +126,16 @@ struct SubgraphBinding {
     }
 };
 
+struct NodeMemoizationPolicy {
+    bool deterministic{false};
+    std::vector<StateKey> read_keys;
+    uint32_t max_entries{16U};
+
+    [[nodiscard]] bool enabled() const noexcept {
+        return deterministic;
+    }
+};
+
 struct NodeDefinition {
     NodeId id{0};
     NodeKind kind{NodeKind::Compute};
@@ -138,6 +148,7 @@ struct NodeDefinition {
     std::vector<FieldMergeRule> field_merge_rules;
     std::vector<KnowledgeSubscription> knowledge_subscriptions;
     std::optional<SubgraphBinding> subgraph;
+    NodeMemoizationPolicy memoization{};
 };
 
 enum class EdgeKind : uint8_t {

@@ -583,6 +583,43 @@ void test_parallel_persistent_subgraph_sessions() {
     assert(namespaced_session_ids == expected_namespaced_session_ids);
 }
 
+void test_parallel_persistent_subgraph_session_digest_determinism() {
+    auto run_digest_once = []() {
+        ExecutionEngine engine(4);
+        engine.register_graph(make_persistent_session_child_graph(968U, persistent_session_child_node));
+
+        InputEnvelope input;
+        input.initial_field_count = 11U;
+
+        const RunId run_id = engine.start(
+            make_parallel_persistent_parent_graph(
+                968U,
+                prepare_left_session_node,
+                prepare_right_session_node,
+                969U,
+                "parallel_persistent_session_digest_determinism"
+            ),
+            input
+        );
+        const RunResult result = engine.run_to_completion(run_id);
+        assert(result.status == ExecutionStatus::Completed);
+
+        const auto record = engine.checkpoints().get(result.last_checkpoint_id);
+        assert(record.has_value());
+        assert(record->resumable());
+        return compute_run_proof_digest(*record, engine.trace().events_for_run(run_id));
+    };
+
+    const RunProofDigest expected = run_digest_once();
+    assert(expected.combined_digest != 0U);
+    for (std::size_t iteration = 0; iteration < 4U; ++iteration) {
+        const RunProofDigest observed = run_digest_once();
+        assert(observed.snapshot_digest == expected.snapshot_digest);
+        assert(observed.trace_digest == expected.trace_digest);
+        assert(observed.combined_digest == expected.combined_digest);
+    }
+}
+
 void test_parallel_persistent_subgraph_same_session_rejected() {
     ExecutionEngine engine(4);
     engine.register_graph(make_persistent_session_child_graph(964U, persistent_session_wait_child_node));
@@ -725,6 +762,7 @@ void test_persistent_subgraph_session_resume_equivalence() {
 int main() {
     agentcore::test_persistent_subgraph_session_reuse_and_stream_metadata();
     agentcore::test_parallel_persistent_subgraph_sessions();
+    agentcore::test_parallel_persistent_subgraph_session_digest_determinism();
     agentcore::test_parallel_persistent_subgraph_same_session_rejected();
     agentcore::test_persistent_subgraph_session_recorded_effect_mismatch();
     agentcore::test_persistent_subgraph_session_resume_equivalence();

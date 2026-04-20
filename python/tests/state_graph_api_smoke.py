@@ -1,6 +1,6 @@
 import asyncio
 
-from agentcore.graph import END, START, RuntimeContext, StateGraph
+from agentcore.graph import Command, END, START, RuntimeContext, StateGraph
 
 
 async def planner(state, config):
@@ -81,6 +81,120 @@ batch_results = compiled.batch(
 )
 assert [result["count"] for result in batch_results] == [2, 3]
 assert [result["run_label"] for result in batch_results] == ["batch-a", "batch-b"]
+
+
+def unary_step(state):
+    return {"count": int(state.get("count", 0)) + 1}
+
+
+def unary_route(state):
+    return END if int(state.get("count", 0)) >= 2 else "step"
+
+
+unary_graph = StateGraph(dict, name="python_unary_callback_smoke", worker_count=2)
+unary_graph.add_node("step", unary_step)
+unary_graph.add_edge(START, "step")
+unary_graph.add_conditional_edges("step", unary_route, {END: END, "step": "step"})
+unary_compiled = unary_graph.compile()
+
+unary_result = unary_compiled.invoke({"count": 0})
+assert unary_result["count"] == 2
+
+
+def patch_cache_step(state, config):
+    count = int(state.get("count", 0)) + 1
+    return {
+        "count": count,
+        "shared_total": int(state.get("shared_total", 0)) + count,
+        f"dynamic_{count}": f"value-{count}",
+    }
+
+
+def patch_cache_route(state, config):
+    return END if int(state.get("count", 0)) >= 2 else "step"
+
+
+patch_cache_graph = StateGraph(dict, name="python_patch_cache_smoke", worker_count=2)
+patch_cache_graph.add_node("step", patch_cache_step)
+patch_cache_graph.add_edge(START, "step")
+patch_cache_graph.add_conditional_edges("step", patch_cache_route, {END: END, "step": "step"})
+patch_cache_compiled = patch_cache_graph.compile()
+
+patch_cache_result = patch_cache_compiled.invoke({"count": 0, "shared_total": 0})
+assert patch_cache_result["count"] == 2
+assert patch_cache_result["shared_total"] == 3
+assert patch_cache_result["dynamic_1"] == "value-1"
+assert patch_cache_result["dynamic_2"] == "value-2"
+
+memoized_call_counter = {"stable": 0, "invalidated": 0}
+
+
+def stable_memoized_node(state, config):
+    memoized_call_counter["stable"] += 1
+    return {"memo_output": int(state.get("input_value", 0)) * 10}
+
+
+def stable_router(state, config):
+    round_index = int(state.get("memo_round", 0))
+    if round_index == 0:
+        return Command(update={"memo_round": 1}, goto="memoized")
+    return Command(goto=END)
+
+
+stable_memo_graph = StateGraph(dict, name="python_deterministic_memo_stable", worker_count=2)
+stable_memo_graph.add_node(
+    "memoized",
+    stable_memoized_node,
+    deterministic=True,
+    read_keys=("input_value",),
+    cache_size=8,
+)
+stable_memo_graph.add_node("router", stable_router, kind="control")
+stable_memo_graph.add_edge(START, "memoized")
+stable_memo_graph.add_edge("memoized", "router")
+stable_memo_compiled = stable_memo_graph.compile()
+
+stable_memo_result = stable_memo_compiled.invoke({"input_value": 7, "memo_round": 0})
+assert stable_memo_result["memo_output"] == 70
+assert stable_memo_result["memo_round"] == 1
+assert memoized_call_counter["stable"] == 1
+
+
+def invalidating_memoized_node(state, config):
+    memoized_call_counter["invalidated"] += 1
+    return {"memo_output": int(state.get("input_value", 0)) * 10}
+
+
+def invalidating_router(state, config):
+    round_index = int(state.get("memo_round", 0))
+    if round_index == 0:
+        return Command(
+            update={
+                "memo_round": 1,
+                "input_value": int(state.get("input_value", 0)) + 1,
+            },
+            goto="memoized",
+        )
+    return Command(goto=END)
+
+
+invalidating_memo_graph = StateGraph(dict, name="python_deterministic_memo_invalidation", worker_count=2)
+invalidating_memo_graph.add_node(
+    "memoized",
+    invalidating_memoized_node,
+    deterministic=True,
+    read_keys=("input_value",),
+    cache_size=8,
+)
+invalidating_memo_graph.add_node("router", invalidating_router, kind="control")
+invalidating_memo_graph.add_edge(START, "memoized")
+invalidating_memo_graph.add_edge("memoized", "router")
+invalidating_memo_compiled = invalidating_memo_graph.compile()
+
+invalidating_memo_result = invalidating_memo_compiled.invoke({"input_value": 7, "memo_round": 0})
+assert invalidating_memo_result["input_value"] == 8
+assert invalidating_memo_result["memo_output"] == 80
+assert memoized_call_counter["invalidated"] == 2
 
 
 async def exercise_async_surface():
@@ -178,5 +292,41 @@ assert memo_result["replayed"] is True
 assert recorded_effect_calls["count"] == 1
 assert recorded_effect_replays == [False, True]
 assert recorded_effect_runtime_available == [True, True]
+
+retained_runtime_state: dict[str, object] = {}
+
+
+def retain_callback_views(state, config, runtime: RuntimeContext):
+    retained_runtime_state["raw_state"] = state
+    retained_runtime_state["snapshot"] = state.copy()
+    retained_runtime_state["runtime"] = runtime
+    return {"captured": int(state.get("count", 0))}
+
+
+retained_graph = StateGraph(dict, name="python_retained_callback_views_smoke", worker_count=2)
+retained_graph.add_node("capture", retain_callback_views)
+retained_graph.add_edge(START, "capture")
+retained_graph.add_edge("capture", END)
+retained_compiled = retained_graph.compile()
+
+retained_result = retained_compiled.invoke({"count": 7})
+assert retained_result["captured"] == 7
+assert retained_runtime_state["snapshot"] == {"count": 7}
+
+try:
+    retained_runtime_state["raw_state"].get("count")
+    raise AssertionError("retained callback state should expire after the callback returns")
+except RuntimeError:
+    pass
+
+try:
+    retained_runtime_state["runtime"].record_once_with_metadata(
+        "python::expired-runtime::smoke",
+        {"count": 7},
+        lambda: {"value": "stale"},
+    )
+    raise AssertionError("retained runtime context should expire after the callback returns")
+except RuntimeError:
+    pass
 
 print("python state graph api smoke passed")

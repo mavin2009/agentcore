@@ -16,6 +16,28 @@ namespace agentcore {
 
 namespace {
 
+constexpr ExecutionProfile kBenchmarkExecutionProfile = ExecutionProfile::Balanced;
+
+const char* benchmark_profile_name() noexcept {
+    switch (kBenchmarkExecutionProfile) {
+        case ExecutionProfile::Strict:
+            return "strict";
+        case ExecutionProfile::Balanced:
+            return "balanced";
+        case ExecutionProfile::Fast:
+            return "fast";
+    }
+    return "balanced";
+}
+
+ExecutionEngine make_benchmark_engine(std::size_t worker_count, bool inline_scheduler = false) {
+    return ExecutionEngine(ExecutionEngineOptions{
+        worker_count,
+        inline_scheduler,
+        kBenchmarkExecutionProfile
+    });
+}
+
 enum PersistentSessionBenchmarkStateKey : StateKey {
     kSessionBenchmarkSessionId = 0,
     kSessionBenchmarkInput = 1,
@@ -368,7 +390,7 @@ PersistentSessionParallelBenchmarkRun run_parallel_persistent_session_benchmark_
     const GraphDefinition& parent_graph,
     const GraphDefinition& child_graph
 ) {
-    ExecutionEngine engine(4U);
+    ExecutionEngine engine = make_benchmark_engine(4U);
     engine.register_graph(child_graph);
 
     InputEnvelope input;
@@ -434,7 +456,7 @@ PersistentSessionResumeBenchmarkRun run_resumable_persistent_session_benchmark_o
     input.initial_patch.updates.push_back(FieldUpdate{kSessionBenchmarkRound, int64_t{0}});
 
     g_persistent_session_benchmark_producer_calls.store(0U);
-    ExecutionEngine direct_engine(1U);
+    ExecutionEngine direct_engine = make_benchmark_engine(1U);
     direct_engine.register_graph(child_graph);
     const RunId direct_run_id = direct_engine.start(parent_graph, input);
     const auto direct_started_at = std::chrono::steady_clock::now();
@@ -469,7 +491,7 @@ PersistentSessionResumeBenchmarkRun run_resumable_persistent_session_benchmark_o
     g_persistent_session_benchmark_producer_calls.store(0U);
     const auto started_at = std::chrono::steady_clock::now();
     {
-        ExecutionEngine first_engine(1U);
+        ExecutionEngine first_engine = make_benchmark_engine(1U);
         first_engine.register_graph(child_graph);
         first_engine.enable_checkpoint_persistence(checkpoint_path);
 
@@ -483,7 +505,7 @@ PersistentSessionResumeBenchmarkRun run_resumable_persistent_session_benchmark_o
         );
     }
 
-    ExecutionEngine resumed_engine(1U);
+    ExecutionEngine resumed_engine = make_benchmark_engine(1U);
     resumed_engine.register_graph(parent_graph);
     resumed_engine.register_graph(child_graph);
     resumed_engine.enable_checkpoint_persistence(checkpoint_path);
@@ -584,6 +606,7 @@ int main() {
         run_resumable_persistent_session_benchmark_once(resumable_parent_graph, resumable_child_graph);
 
     std::cout << "agentcore_persistent_subgraph_session_benchmark" << '\n'
+              << "execution_profile=" << benchmark_profile_name() << '\n'
               << "persistent_session_parallel_branches=" << kPersistentSessionBenchmarkBranches << '\n'
               << "persistent_session_parallel_ns=" << parallel.elapsed_ns << '\n'
               << "persistent_session_parallel_stream_read_ns=" << parallel.stream_read_ns << '\n'

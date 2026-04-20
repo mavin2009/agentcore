@@ -34,14 +34,14 @@ NodeResult planner_node(ExecutionContext& context) {
 }
 
 NodeResult executor_node(ExecutionContext& context) {
-    const Value* plan_value = context.state.fields.size() > kPlan ? &context.state.fields[kPlan] : nullptr;
-    if (plan_value == nullptr || !std::holds_alternative<BlobRef>(*plan_value)) {
+    const Value plan_value = context.state.size() > kPlan ? context.state.load(kPlan) : Value{};
+    if (!std::holds_alternative<BlobRef>(plan_value)) {
         return NodeResult{NodeResult::HardFail};
     }
 
     ToolInvocationContext tool_context{context.blobs, context.strings};
     const ToolResponse response = context.tools.invoke(
-        ToolRequest{context.strings.intern("executor"), std::get<BlobRef>(*plan_value)},
+        ToolRequest{context.strings.intern("executor"), std::get<BlobRef>(plan_value)},
         tool_context
     );
 
@@ -106,8 +106,8 @@ int main() {
     const StateStore& state_store = engine.state_store(run_id);
     const WorkflowState& state = state_store.get_current_state();
 
-    const BlobRef plan_ref = std::get<BlobRef>(state.fields[kPlan]);
-    const BlobRef execution_ref = std::get<BlobRef>(state.fields[kExecution]);
+    const BlobRef plan_ref = std::get<BlobRef>(state.load(kPlan));
+    const BlobRef execution_ref = std::get<BlobRef>(state.load(kExecution));
 
     std::cout << "planner_executor_graph\n";
     std::cout << "status=" << static_cast<int>(result.status) << "\n";

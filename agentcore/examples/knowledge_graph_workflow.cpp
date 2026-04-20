@@ -119,7 +119,7 @@ int main() {
     const RunId run_id = engine.start(graph, input);
     const RunResult result = engine.run_to_completion(run_id);
     const StateStore& state_store = engine.state_store(run_id);
-    const BlobRef summary_ref = std::get<BlobRef>(state_store.get_current_state().fields[kGraphSummary]);
+    const BlobRef summary_ref = std::get<BlobRef>(state_store.get_current_state().load(kGraphSummary));
 
     std::cout << "knowledge_graph_workflow\n";
     std::cout << "status=" << static_cast<int>(result.status) << "\n";

@@ -518,6 +518,38 @@ bool GraphDefinition::validate(std::string* error_message) const {
                 "knowledge subscriptions require ReactToKnowledgeGraph policy: " + node.name
             );
         }
+        if (node.memoization.enabled()) {
+            if (node.kind != NodeKind::Compute &&
+                node.kind != NodeKind::Control &&
+                node.kind != NodeKind::Aggregate) {
+                return fail_validation(
+                    error_message,
+                    "deterministic memoization is currently supported only for compute, control, and aggregate nodes: " +
+                        node.name
+                );
+            }
+            if (has_node_policy(node.policy_flags, NodePolicyFlag::ReactToKnowledgeGraph)) {
+                return fail_validation(
+                    error_message,
+                    "knowledge-reactive nodes cannot enable deterministic memoization yet: " + node.name
+                );
+            }
+            std::unordered_set<StateKey> memoization_keys;
+            for (StateKey key : node.memoization.read_keys) {
+                if (!memoization_keys.insert(key).second) {
+                    return fail_validation(
+                        error_message,
+                        "duplicate memoization read dependency for state key " +
+                            std::to_string(key) + " on node " + node.name
+                    );
+                }
+            }
+        } else if (!node.memoization.read_keys.empty()) {
+            return fail_validation(
+                error_message,
+                "memoization read dependencies require deterministic memoization on node: " + node.name
+            );
+        }
         std::unordered_set<StateKey> merge_rule_keys;
         for (const FieldMergeRule& rule : node.field_merge_rules) {
             if (!merge_rule_keys.insert(rule.key).second) {

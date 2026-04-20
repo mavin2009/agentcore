@@ -58,6 +58,75 @@ std::string fetch_python_error() {
     return !bytes.empty() && bytes.front() == tag;
 }
 
+[[nodiscard]] bool tagged_buffer_has_payload(const std::byte* bytes, std::size_t size, std::byte tag) {
+    return bytes != nullptr && size != 0U && bytes[0] == tag;
+}
+
+bool lookup_state_key_in_python_dict(
+    PyObject* lookup,
+    PyObject* key,
+    StateKey* output,
+    bool* found,
+    std::string* error_message
+) {
+    *found = false;
+    if (lookup == nullptr) {
+        return true;
+    }
+
+    PyObject* lookup_value = PyDict_GetItemWithError(lookup, key);
+    if (lookup_value == nullptr) {
+        if (PyErr_Occurred() != nullptr) {
+            if (error_message != nullptr) {
+                *error_message = fetch_python_error();
+            }
+            return false;
+        }
+        return true;
+    }
+
+    const unsigned long raw_key = PyLong_AsUnsignedLong(lookup_value);
+    if (PyErr_Occurred() != nullptr) {
+        if (error_message != nullptr) {
+            *error_message = fetch_python_error();
+        }
+        return false;
+    }
+
+    *output = static_cast<StateKey>(raw_key);
+    *found = true;
+    return true;
+}
+
+bool cache_state_key_in_python_dict(
+    PyObject* lookup,
+    PyObject* key,
+    StateKey state_key,
+    std::string* error_message
+) {
+    if (lookup == nullptr) {
+        return true;
+    }
+
+    PyObject* py_state_key = PyLong_FromUnsignedLong(static_cast<unsigned long>(state_key));
+    if (py_state_key == nullptr) {
+        if (error_message != nullptr) {
+            *error_message = fetch_python_error();
+        }
+        return false;
+    }
+
+    const int rc = PyDict_SetItem(lookup, key, py_state_key);
+    Py_DECREF(py_state_key);
+    if (rc != 0) {
+        if (error_message != nullptr) {
+            *error_message = fetch_python_error();
+        }
+        return false;
+    }
+    return true;
+}
+
 [[nodiscard]] BlobRef append_tagged_blob(BlobStore& blobs, std::byte tag, const std::byte* bytes, std::size_t size) {
     std::vector<std::byte> tagged(size + 1U, std::byte{0});
     tagged[0] = tag;
@@ -77,6 +146,9 @@ PyObject* get_json_module() {
     return j;
 }
 
+PyObject* load_object_from_pickle_buffer(const std::byte* bytes, std::size_t size, std::string* err);
+PyObject* load_object_from_json_buffer(const std::byte* bytes, std::size_t size, std::string* err);
+
 bool dump_object_as_pickle_bytes(PyObject* obj, std::vector<std::byte>* out, std::string* err) {
     PyObject* p = get_pickle_module();
     if (!p) { *err = fetch_python_error(); return false; }
@@ -95,75 +167,361 @@ bool dump_object_as_pickle_bytes(PyObject* obj, std::vector<std::byte>* out, std
 }
 
 PyObject* load_object_from_pickle_bytes(const std::vector<std::byte>& bytes, std::string* err) {
+    if (bytes.empty()) {
+        if (err != nullptr) {
+            *err = "pickle payload is empty";
+        }
+        return nullptr;
+    }
+    return load_object_from_pickle_buffer(bytes.data(), bytes.size(), err);
+}
+
+PyObject* load_object_from_pickle_buffer(const std::byte* bytes, std::size_t size, std::string* err) {
     PyObject* p = get_pickle_module();
     if (!p) { *err = fetch_python_error(); return nullptr; }
     static PyObject* loads = PyObject_GetAttrString(p, "loads");
-    PyObject* b = PyBytes_FromStringAndSize(reinterpret_cast<const char*>(bytes.data() + 1), static_cast<Py_ssize_t>(bytes.size() - 1));
+    if (bytes == nullptr || size <= 1U) {
+        if (err != nullptr) {
+            *err = "pickle payload is empty";
+        }
+        return nullptr;
+    }
+
+    PyObject* b = PyBytes_FromStringAndSize(
+        reinterpret_cast<const char*>(bytes + 1),
+        static_cast<Py_ssize_t>(size - 1U)
+    );
+    if (b == nullptr) {
+        if (err != nullptr) {
+            *err = fetch_python_error();
+        }
+        return nullptr;
+    }
+
     PyObject* res = PyObject_CallFunctionObjArgs(loads, b, nullptr);
     Py_DECREF(b);
-    if (!res) *err = fetch_python_error();
+    if (!res && err != nullptr) *err = fetch_python_error();
     return res;
 }
 
 PyObject* load_object_from_json_bytes(const std::vector<std::byte>& bytes, std::string* err) {
+    if (bytes.empty()) {
+        if (err != nullptr) {
+            *err = "json payload is empty";
+        }
+        return nullptr;
+    }
+    return load_object_from_json_buffer(bytes.data(), bytes.size(), err);
+}
+
+PyObject* load_object_from_json_buffer(const std::byte* bytes, std::size_t size, std::string* err) {
     PyObject* j = get_json_module();
     if (!j) { *err = fetch_python_error(); return nullptr; }
     static PyObject* loads = PyObject_GetAttrString(j, "loads");
-    PyObject* t = PyUnicode_FromStringAndSize(reinterpret_cast<const char*>(bytes.data() + 1), static_cast<Py_ssize_t>(bytes.size() - 1));
-    if (!t) { *err = fetch_python_error(); return nullptr; }
-    PyObject* res = PyObject_CallFunctionObjArgs(loads, t, nullptr);
-    Py_DECREF(t);
-    if (!res) *err = fetch_python_error();
+    if (bytes == nullptr || size <= 1U) {
+        if (err != nullptr) {
+            *err = "json payload is empty";
+        }
+        return nullptr;
+    }
+
+    PyObject* b = PyBytes_FromStringAndSize(
+        reinterpret_cast<const char*>(bytes + 1),
+        static_cast<Py_ssize_t>(size - 1U)
+    );
+    if (!b) {
+        if (err != nullptr) {
+            *err = fetch_python_error();
+        }
+        return nullptr;
+    }
+
+    PyObject* res = PyObject_CallFunctionObjArgs(loads, b, nullptr);
+    Py_DECREF(b);
+    if (!res && err != nullptr) *err = fetch_python_error();
     return res;
+}
+
+struct RuntimeViewProxy {
+    PyObject_HEAD
+    ExecutionContext* runtime{nullptr};
+    const WorkflowState* state{nullptr};
+    const BlobStore* blobs{nullptr};
+    const StringInterner* strings{nullptr};
+    std::atomic<bool> active;
+};
+
+struct OwnedStateSnapshot {
+    WorkflowState state;
+    BlobStore blobs;
+    StringInterner strings;
+
+    OwnedStateSnapshot(
+        const WorkflowState& source_state,
+        const BlobStore& source_blobs,
+        const StringInterner& source_strings
+    )
+        : state(source_state),
+          blobs(source_blobs),
+          strings(source_strings) {}
+};
+
+void RuntimeViewProxy_dealloc(RuntimeViewProxy* self) {
+    self->active.~atomic();
+    Py_TYPE(self)->tp_free(reinterpret_cast<PyObject*>(self));
+}
+
+static PyTypeObject RuntimeViewProxyType = {
+    PyVarObject_HEAD_INIT(nullptr, 0)
+    "agentcore.RuntimeViewProxy",         /* tp_name */
+    sizeof(RuntimeViewProxy),             /* tp_basicsize */
+    0,                                    /* tp_itemsize */
+    (destructor)RuntimeViewProxy_dealloc, /* tp_dealloc */
+    0,                                    /* tp_print */
+    0,                                    /* tp_getattr */
+    0,                                    /* tp_setattr */
+    0,                                    /* tp_reserved */
+    0,                                    /* tp_repr */
+    0,                                    /* tp_as_number */
+    0,                                    /* tp_as_sequence */
+    0,                                    /* tp_as_mapping */
+    0,                                    /* tp_hash */
+    0,                                    /* tp_call */
+    0,                                    /* tp_str */
+    0,                                    /* tp_getattro */
+    0,                                    /* tp_setattro */
+    0,                                    /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT,                   /* tp_flags */
+    "Runtime View Proxy",                 /* tp_doc */
+    0,                                    /* tp_traverse */
+    0,                                    /* tp_clear */
+    0,                                    /* tp_richcompare */
+    0,                                    /* tp_weaklistoffset */
+    0,                                    /* tp_iter */
+    0,                                    /* tp_iternext */
+    0,                                    /* tp_methods */
+    0,                                    /* tp_members */
+    0,                                    /* tp_getset */
+    0,                                    /* tp_base */
+    0,                                    /* tp_dict */
+    0,                                    /* tp_descr_get */
+    0,                                    /* tp_descr_set */
+    0,                                    /* tp_dictoffset */
+    0,                                    /* tp_init */
+    0,                                    /* tp_alloc */
+    0,                                    /* tp_new */
+    0,                                    /* tp_free */
+};
+
+PyObject* create_runtime_view_proxy(ExecutionContext& context) {
+    if (PyType_Ready(&RuntimeViewProxyType) < 0) {
+        return nullptr;
+    }
+    RuntimeViewProxy* self = PyObject_New(RuntimeViewProxy, &RuntimeViewProxyType);
+    if (self != nullptr) {
+        self->runtime = &context;
+        self->state = &context.state;
+        self->blobs = &context.blobs;
+        self->strings = &context.strings;
+        new (&self->active) std::atomic<bool>(true);
+    }
+    return reinterpret_cast<PyObject*>(self);
+}
+
+RuntimeViewProxy* runtime_view_from_object(PyObject* object, std::string* error_message) {
+    if (object == nullptr || !PyObject_TypeCheck(object, &RuntimeViewProxyType)) {
+        if (error_message != nullptr) {
+            *error_message = "invalid runtime capsule";
+        }
+        return nullptr;
+    }
+    auto* view = reinterpret_cast<RuntimeViewProxy*>(object);
+    if (!view->active.load(std::memory_order_acquire)) {
+        if (error_message != nullptr) {
+            *error_message = "runtime context is no longer active";
+        }
+        return nullptr;
+    }
+    return view;
+}
+
+ExecutionContext* runtime_context_from_capsule(PyObject* capsule, std::string* error_message) {
+    RuntimeViewProxy* view = runtime_view_from_object(capsule, error_message);
+    return view == nullptr ? nullptr : view->runtime;
 }
 
 struct StateProxy {
     PyObject_HEAD
-    WorkflowState state;
-    BlobStore blobs;
-    StringInterner strings;
+    const WorkflowState* state;
+    const BlobStore* blobs;
+    const StringInterner* strings;
+    std::shared_ptr<OwnedStateSnapshot> owned_snapshot;
     std::shared_ptr<std::vector<std::string>> state_names;
     std::shared_ptr<std::unordered_map<std::string, StateKey>> state_keys;
+    PyObject* state_key_lookup;
+    PyObject* value_cache;
+    RuntimeViewProxy* borrowed_view;
+    PyObject* runtime_capsule_owner;
     const GraphHandle* handle;
 };
 
 void StateProxy_dealloc(StateProxy* self) {
-    self->state.~WorkflowState();
-    self->blobs.~BlobStore();
-    self->strings.~StringInterner();
+    self->owned_snapshot.~shared_ptr();
     self->state_names.~shared_ptr();
     self->state_keys.~shared_ptr();
+    Py_XDECREF(self->state_key_lookup);
+    Py_XDECREF(self->value_cache);
+    Py_XDECREF(self->runtime_capsule_owner);
     Py_TYPE(self)->tp_free(reinterpret_cast<PyObject*>(self));
+}
+
+bool StateProxy_resolve(
+    StateProxy* proxy,
+    const WorkflowState** state,
+    const BlobStore** blobs,
+    const StringInterner** strings
+) {
+    if (proxy->borrowed_view != nullptr &&
+        !proxy->borrowed_view->active.load(std::memory_order_acquire)) {
+        PyErr_SetString(
+            PyExc_RuntimeError,
+            "state view is no longer active; call state.copy() during callback to retain a snapshot"
+        );
+        return false;
+    }
+
+    *state = proxy->state;
+    *blobs = proxy->blobs;
+    *strings = proxy->strings;
+    return true;
+}
+
+PyObject* StateProxy_cached_value(
+    StateProxy* proxy,
+    StateKey state_key,
+    const Value& value,
+    const BlobStore& blobs,
+    const StringInterner& strings,
+    bool ensure_cache
+) {
+    if (proxy->value_cache == nullptr && ensure_cache) {
+        proxy->value_cache = PyList_New(static_cast<Py_ssize_t>(proxy->state_names->size()));
+        if (proxy->value_cache == nullptr) {
+            return nullptr;
+        }
+        for (Py_ssize_t index = 0; index < PyList_GET_SIZE(proxy->value_cache); ++index) {
+            Py_INCREF(Py_None);
+            PyList_SET_ITEM(proxy->value_cache, index, Py_None);
+        }
+    }
+
+    if (proxy->value_cache != nullptr &&
+        static_cast<Py_ssize_t>(state_key) < PyList_GET_SIZE(proxy->value_cache)) {
+        PyObject* cached = PyList_GET_ITEM(proxy->value_cache, static_cast<Py_ssize_t>(state_key));
+        if (cached != Py_None) {
+            Py_INCREF(cached);
+            return cached;
+        }
+    }
+
+    std::string err;
+    PyObject* python_value = proxy->handle->convert_value_to_python(value, blobs, strings, &err);
+    if (python_value == nullptr) {
+        return nullptr;
+    }
+
+    if (proxy->value_cache != nullptr &&
+        static_cast<Py_ssize_t>(state_key) < PyList_GET_SIZE(proxy->value_cache)) {
+        Py_INCREF(python_value);
+        if (PyList_SetItem(proxy->value_cache, static_cast<Py_ssize_t>(state_key), python_value) != 0) {
+            Py_DECREF(python_value);
+            return nullptr;
+        }
+    }
+
+    return python_value;
+}
+
+bool StateProxy_resolve_key(StateProxy* proxy, PyObject* key, StateKey* state_key, bool* found) {
+    *found = false;
+    if (!PyUnicode_Check(key)) {
+        PyErr_SetString(PyExc_TypeError, "keys must be strings");
+        return false;
+    }
+
+    if (proxy->state_key_lookup != nullptr) {
+        PyObject* lookup_value = PyDict_GetItemWithError(proxy->state_key_lookup, key);
+        if (lookup_value != nullptr) {
+            const unsigned long raw_key = PyLong_AsUnsignedLong(lookup_value);
+            if (PyErr_Occurred() != nullptr) {
+                return false;
+            }
+            *state_key = static_cast<StateKey>(raw_key);
+            *found = true;
+            return true;
+        }
+        if (PyErr_Occurred() != nullptr) {
+            return false;
+        }
+    }
+
+    std::string err;
+    const std::string key_name = python_string(key, &err);
+    if (!err.empty()) {
+        PyErr_SetString(PyExc_KeyError, err.c_str());
+        return false;
+    }
+    const auto it = proxy->state_keys->find(key_name);
+    if (it == proxy->state_keys->end()) {
+        return true;
+    }
+
+    *state_key = it->second;
+    *found = true;
+    return true;
 }
 
 Py_ssize_t StateProxy_length(PyObject* self) {
     auto* proxy = reinterpret_cast<StateProxy*>(self);
-    return static_cast<Py_ssize_t>(proxy->state.size());
+    const WorkflowState* state = nullptr;
+    const BlobStore* blobs = nullptr;
+    const StringInterner* strings = nullptr;
+    if (!StateProxy_resolve(proxy, &state, &blobs, &strings)) {
+        return -1;
+    }
+    return static_cast<Py_ssize_t>(state->size());
 }
 
 PyObject* StateProxy_subscript(PyObject* self, PyObject* key) {
     auto* proxy = reinterpret_cast<StateProxy*>(self);
-    if (!PyUnicode_Check(key)) {
-        PyErr_SetString(PyExc_TypeError, "keys must be strings");
+    StateKey state_key = 0;
+    bool found = false;
+    if (!StateProxy_resolve_key(proxy, key, &state_key, &found)) {
         return nullptr;
     }
-    std::string err;
-    std::string kn = python_string(key, &err);
-    if (!err.empty()) {
-        PyErr_SetString(PyExc_KeyError, err.c_str());
+    if (!found) {
+        std::string err;
+        const std::string key_name = python_string(key, &err);
+        if (!err.empty()) {
+            PyErr_SetString(PyExc_KeyError, err.c_str());
+            return nullptr;
+        }
+        PyErr_Format(PyExc_KeyError, "'%s'", key_name.c_str());
         return nullptr;
     }
-    auto it = proxy->state_keys->find(kn);
-    if (it == proxy->state_keys->end()) {
-        PyErr_Format(PyExc_KeyError, "'%s'", kn.c_str());
+
+    const WorkflowState* state = nullptr;
+    const BlobStore* blobs = nullptr;
+    const StringInterner* strings = nullptr;
+    if (!StateProxy_resolve(proxy, &state, &blobs, &strings)) {
         return nullptr;
     }
-    StateKey k = it->second;
-    Value v = proxy->state.load(k);
+
+    Value v = state->load(state_key);
     if (std::holds_alternative<std::monostate>(v)) {
         Py_RETURN_NONE;
     }
-    return proxy->handle->convert_value_to_python(v, proxy->blobs, proxy->strings, &err);
+    return StateProxy_cached_value(proxy, state_key, v, *blobs, *strings, false);
 }
 
 static PyMappingMethods StateProxy_as_mapping = {
@@ -175,25 +533,45 @@ static PyMappingMethods StateProxy_as_mapping = {
 PyObject* StateProxy_get(PyObject* self, PyObject* args) {
     PyObject *k, *d = Py_None;
     if (!PyArg_ParseTuple(args, "O|O", &k, &d)) return nullptr;
-    PyObject* r = StateProxy_subscript(self, k);
-    if (!r) {
-        if (PyErr_ExceptionMatches(PyExc_KeyError)) {
-            PyErr_Clear();
-            Py_INCREF(d);
-            return d;
-        }
+
+    auto* proxy = reinterpret_cast<StateProxy*>(self);
+    StateKey state_key = 0;
+    bool found = false;
+    if (!StateProxy_resolve_key(proxy, k, &state_key, &found)) {
         return nullptr;
     }
-    return r;
+    if (!found) {
+        Py_INCREF(d);
+        return d;
+    }
+
+    const WorkflowState* state = nullptr;
+    const BlobStore* blobs = nullptr;
+    const StringInterner* strings = nullptr;
+    if (!StateProxy_resolve(proxy, &state, &blobs, &strings)) {
+        return nullptr;
+    }
+
+    Value value = state->load(state_key);
+    if (std::holds_alternative<std::monostate>(value)) {
+        Py_RETURN_NONE;
+    }
+    return StateProxy_cached_value(proxy, state_key, value, *blobs, *strings, false);
 }
 
 PyObject* StateProxy_keys(PyObject* self, PyObject*) {
     auto* proxy = reinterpret_cast<StateProxy*>(self);
+    const WorkflowState* state = nullptr;
+    const BlobStore* blobs = nullptr;
+    const StringInterner* strings = nullptr;
+    if (!StateProxy_resolve(proxy, &state, &blobs, &strings)) {
+        return nullptr;
+    }
     PyObject* list = PyList_New(0);
     const auto& names = *proxy->state_names;
     for (std::size_t i = 0; i < names.size(); ++i) {
-        if (i < proxy->state.size()) {
-            Value v = proxy->state.load(static_cast<StateKey>(i));
+        if (i < state->size()) {
+            Value v = state->load(static_cast<StateKey>(i));
             if (!std::holds_alternative<std::monostate>(v)) {
                 PyObject* k = unicode_from_utf8(names[i]);
                 PyList_Append(list, k);
@@ -206,15 +584,27 @@ PyObject* StateProxy_keys(PyObject* self, PyObject*) {
 
 PyObject* StateProxy_items(PyObject* self, PyObject*) {
     auto* proxy = reinterpret_cast<StateProxy*>(self);
+    const WorkflowState* state = nullptr;
+    const BlobStore* blobs = nullptr;
+    const StringInterner* strings = nullptr;
+    if (!StateProxy_resolve(proxy, &state, &blobs, &strings)) {
+        return nullptr;
+    }
     PyObject* list = PyList_New(0);
     const auto& names = *proxy->state_names;
     for (std::size_t i = 0; i < names.size(); ++i) {
-        if (i < proxy->state.size()) {
-            Value v = proxy->state.load(static_cast<StateKey>(i));
+        if (i < state->size()) {
+            Value v = state->load(static_cast<StateKey>(i));
             if (!std::holds_alternative<std::monostate>(v)) {
                 PyObject* k = unicode_from_utf8(names[i]);
-                std::string err;
-                PyObject* val = proxy->handle->convert_value_to_python(v, proxy->blobs, proxy->strings, &err);
+                PyObject* val = StateProxy_cached_value(
+                    proxy,
+                    static_cast<StateKey>(i),
+                    v,
+                    *blobs,
+                    *strings,
+                    true
+                );
                 if (val) {
                     PyObject* item = PyTuple_Pack(2, k, val);
                     PyList_Append(list, item);
@@ -228,10 +618,101 @@ PyObject* StateProxy_items(PyObject* self, PyObject*) {
     return list;
 }
 
+PyObject* StateProxy_to_dict(StateProxy* proxy);
+
+PyObject* StateProxy_copy(PyObject* self, PyObject*) {
+    return StateProxy_to_dict(reinterpret_cast<StateProxy*>(self));
+}
+
+PyObject* StateProxy_to_dict(StateProxy* proxy) {
+    const WorkflowState* state = nullptr;
+    const BlobStore* blobs = nullptr;
+    const StringInterner* strings = nullptr;
+    if (!StateProxy_resolve(proxy, &state, &blobs, &strings)) {
+        return nullptr;
+    }
+
+    PyObject* dict = PyDict_New();
+    if (dict == nullptr) {
+        return nullptr;
+    }
+
+    const auto& names = *proxy->state_names;
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        if (i >= state->size()) {
+            continue;
+        }
+        Value value = state->load(static_cast<StateKey>(i));
+        if (std::holds_alternative<std::monostate>(value)) {
+            continue;
+        }
+
+        PyObject* key = unicode_from_utf8(names[i]);
+        PyObject* python_value = StateProxy_cached_value(
+            proxy,
+            static_cast<StateKey>(i),
+            value,
+            *blobs,
+            *strings,
+            true
+        );
+        if (key == nullptr || python_value == nullptr) {
+            Py_XDECREF(key);
+            Py_XDECREF(python_value);
+            Py_DECREF(dict);
+            return nullptr;
+        }
+        if (PyDict_SetItem(dict, key, python_value) != 0) {
+            Py_DECREF(key);
+            Py_DECREF(python_value);
+            Py_DECREF(dict);
+            return nullptr;
+        }
+        Py_DECREF(key);
+        Py_DECREF(python_value);
+    }
+
+    return dict;
+}
+
+PyObject* StateProxy_richcompare(PyObject* self, PyObject* other, int op) {
+    if (op != Py_EQ && op != Py_NE) {
+        Py_RETURN_NOTIMPLEMENTED;
+    }
+
+    PyObject* left_dict = StateProxy_to_dict(reinterpret_cast<StateProxy*>(self));
+    if (left_dict == nullptr) {
+        return nullptr;
+    }
+
+    PyObject* right_object = other;
+    PyObject* owned_right_dict = nullptr;
+    if (PyObject_TypeCheck(other, Py_TYPE(self))) {
+        owned_right_dict = StateProxy_to_dict(reinterpret_cast<StateProxy*>(other));
+        if (owned_right_dict == nullptr) {
+            Py_DECREF(left_dict);
+            return nullptr;
+        }
+        right_object = owned_right_dict;
+    }
+
+    const int equals = PyObject_RichCompareBool(left_dict, right_object, Py_EQ);
+    Py_DECREF(left_dict);
+    Py_XDECREF(owned_right_dict);
+    if (equals < 0) {
+        return nullptr;
+    }
+    if ((op == Py_EQ && equals != 0) || (op == Py_NE && equals == 0)) {
+        Py_RETURN_TRUE;
+    }
+    Py_RETURN_FALSE;
+}
+
 static PyMethodDef StateProxy_methods[] = {
     {"get", reinterpret_cast<PyCFunction>(StateProxy_get), METH_VARARGS, "Get value"},
     {"keys", reinterpret_cast<PyCFunction>(StateProxy_keys), METH_NOARGS, "Get keys"},
     {"items", reinterpret_cast<PyCFunction>(StateProxy_items), METH_NOARGS, "Get items"},
+    {"copy", reinterpret_cast<PyCFunction>(StateProxy_copy), METH_NOARGS, "Copy to a dict"},
     {nullptr, nullptr, 0, nullptr}
 };
 
@@ -259,7 +740,7 @@ static PyTypeObject StateProxyType = {
     "State Proxy",                    /* tp_doc */
     0,                                /* tp_traverse */
     0,                                /* tp_clear */
-    0,                                /* tp_richcompare */
+    StateProxy_richcompare,           /* tp_richcompare */
     0,                                /* tp_weaklistoffset */
     0,                                /* tp_iter */
     0,                                /* tp_iternext */
@@ -277,20 +758,215 @@ static PyTypeObject StateProxyType = {
     0,                                /* tp_free */
 };
 
-PyObject* create_state_proxy(const GraphHandle* handle, const WorkflowState& state, const BlobStore& blobs, const StringInterner& strings,
-                            const std::shared_ptr<std::vector<std::string>>& state_names,
-                            const std::shared_ptr<std::unordered_map<std::string, StateKey>>& state_keys) {
+PyObject* create_state_proxy(
+    const GraphHandle* handle,
+    const WorkflowState& state,
+    const BlobStore& blobs,
+    const StringInterner& strings,
+    const std::shared_ptr<std::vector<std::string>>& state_names,
+    const std::shared_ptr<std::unordered_map<std::string, StateKey>>& state_keys,
+    PyObject* state_key_lookup
+) {
     if (PyType_Ready(&StateProxyType) < 0) return nullptr;
     StateProxy* self = PyObject_New(StateProxy, &StateProxyType);
     if (self) {
-        new (&self->state) WorkflowState(state);
-        new (&self->blobs) BlobStore(blobs);
-        new (&self->strings) StringInterner(strings);
+        new (&self->owned_snapshot) std::shared_ptr<OwnedStateSnapshot>(
+            std::make_shared<OwnedStateSnapshot>(state, blobs, strings)
+        );
         new (&self->state_names) std::shared_ptr<std::vector<std::string>>(state_names);
         new (&self->state_keys) std::shared_ptr<std::unordered_map<std::string, StateKey>>(state_keys);
+        self->state_key_lookup = state_key_lookup;
+        Py_XINCREF(self->state_key_lookup);
+        self->value_cache = nullptr;
+        self->state = &self->owned_snapshot->state;
+        self->blobs = &self->owned_snapshot->blobs;
+        self->strings = &self->owned_snapshot->strings;
+        self->borrowed_view = nullptr;
+        self->runtime_capsule_owner = nullptr;
         self->handle = handle;
     }
     return (PyObject*)self;
+}
+
+PyObject* create_borrowed_state_proxy(
+    const GraphHandle* handle,
+    const WorkflowState& state,
+    const BlobStore& blobs,
+    const StringInterner& strings,
+    RuntimeViewProxy* borrowed_view,
+    PyObject* runtime_capsule_owner,
+    const std::shared_ptr<std::vector<std::string>>& state_names,
+    const std::shared_ptr<std::unordered_map<std::string, StateKey>>& state_keys,
+    PyObject* state_key_lookup
+) {
+    if (PyType_Ready(&StateProxyType) < 0) return nullptr;
+    StateProxy* self = PyObject_New(StateProxy, &StateProxyType);
+    if (self) {
+        new (&self->owned_snapshot) std::shared_ptr<OwnedStateSnapshot>();
+        new (&self->state_names) std::shared_ptr<std::vector<std::string>>(state_names);
+        new (&self->state_keys) std::shared_ptr<std::unordered_map<std::string, StateKey>>(state_keys);
+        self->state_key_lookup = state_key_lookup;
+        Py_XINCREF(self->state_key_lookup);
+        self->value_cache = nullptr;
+        self->state = &state;
+        self->blobs = &blobs;
+        self->strings = &strings;
+        self->borrowed_view = borrowed_view;
+        self->runtime_capsule_owner = runtime_capsule_owner;
+        Py_XINCREF(self->runtime_capsule_owner);
+        self->handle = handle;
+    }
+    return reinterpret_cast<PyObject*>(self);
+}
+
+struct ConfigProxy {
+    PyObject_HEAD
+    PyObject* base_config;
+    PyObject* runtime_capsule;
+};
+
+void ConfigProxy_dealloc(ConfigProxy* self) {
+    Py_XDECREF(self->base_config);
+    Py_XDECREF(self->runtime_capsule);
+    Py_TYPE(self)->tp_free(reinterpret_cast<PyObject*>(self));
+}
+
+Py_ssize_t ConfigProxy_length(PyObject* self) {
+    auto* proxy = reinterpret_cast<ConfigProxy*>(self);
+    return PyMapping_Size(proxy->base_config);
+}
+
+PyObject* ConfigProxy_subscript(PyObject* self, PyObject* key) {
+    auto* proxy = reinterpret_cast<ConfigProxy*>(self);
+    return PyObject_GetItem(proxy->base_config, key);
+}
+
+static PyMappingMethods ConfigProxy_as_mapping = {
+    ConfigProxy_length,
+    ConfigProxy_subscript,
+    nullptr
+};
+
+PyObject* ConfigProxy_get(PyObject* self, PyObject* args) {
+    PyObject *key, *default_value = Py_None;
+    if (!PyArg_ParseTuple(args, "O|O", &key, &default_value)) {
+        return nullptr;
+    }
+    PyObject* result = ConfigProxy_subscript(self, key);
+    if (result == nullptr) {
+        if (PyErr_ExceptionMatches(PyExc_KeyError)) {
+            PyErr_Clear();
+            Py_INCREF(default_value);
+            return default_value;
+        }
+        return nullptr;
+    }
+    return result;
+}
+
+PyObject* ConfigProxy_keys(PyObject* self, PyObject*) {
+    auto* proxy = reinterpret_cast<ConfigProxy*>(self);
+    return PyMapping_Keys(proxy->base_config);
+}
+
+PyObject* ConfigProxy_items(PyObject* self, PyObject*) {
+    auto* proxy = reinterpret_cast<ConfigProxy*>(self);
+    return PyMapping_Items(proxy->base_config);
+}
+
+PyObject* ConfigProxy_copy(PyObject* self, PyObject*) {
+    auto* proxy = reinterpret_cast<ConfigProxy*>(self);
+    if (PyDict_Check(proxy->base_config)) {
+        return PyDict_Copy(proxy->base_config);
+    }
+    PyObject* items = PyMapping_Items(proxy->base_config);
+    if (items == nullptr) {
+        return nullptr;
+    }
+    PyObject* dict = PyDict_New();
+    if (dict == nullptr) {
+        Py_DECREF(items);
+        return nullptr;
+    }
+    if (PyDict_MergeFromSeq2(dict, items, 1) != 0) {
+        Py_DECREF(items);
+        Py_DECREF(dict);
+        return nullptr;
+    }
+    Py_DECREF(items);
+    return dict;
+}
+
+PyObject* ConfigProxy_runtime_capsule(PyObject* self, PyObject*) {
+    auto* proxy = reinterpret_cast<ConfigProxy*>(self);
+    Py_INCREF(proxy->runtime_capsule);
+    return proxy->runtime_capsule;
+}
+
+static PyMethodDef ConfigProxy_methods[] = {
+    {"get", reinterpret_cast<PyCFunction>(ConfigProxy_get), METH_VARARGS, "Get value"},
+    {"keys", reinterpret_cast<PyCFunction>(ConfigProxy_keys), METH_NOARGS, "Get keys"},
+    {"items", reinterpret_cast<PyCFunction>(ConfigProxy_items), METH_NOARGS, "Get items"},
+    {"copy", reinterpret_cast<PyCFunction>(ConfigProxy_copy), METH_NOARGS, "Copy to a dict"},
+    {"_agentcore_runtime_capsule", reinterpret_cast<PyCFunction>(ConfigProxy_runtime_capsule), METH_NOARGS, "Return the active runtime capsule"},
+    {nullptr, nullptr, 0, nullptr}
+};
+
+static PyTypeObject ConfigProxyType = {
+    PyVarObject_HEAD_INIT(nullptr, 0)
+    "agentcore.ConfigProxy",          /* tp_name */
+    sizeof(ConfigProxy),              /* tp_basicsize */
+    0,                                /* tp_itemsize */
+    (destructor)ConfigProxy_dealloc,  /* tp_dealloc */
+    0,                                /* tp_print */
+    0,                                /* tp_getattr */
+    0,                                /* tp_setattr */
+    0,                                /* tp_reserved */
+    0,                                /* tp_repr */
+    0,                                /* tp_as_number */
+    0,                                /* tp_as_sequence */
+    &ConfigProxy_as_mapping,          /* tp_as_mapping */
+    0,                                /* tp_hash */
+    0,                                /* tp_call */
+    0,                                /* tp_str */
+    0,                                /* tp_getattro */
+    0,                                /* tp_setattro */
+    0,                                /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT,               /* tp_flags */
+    "Config Proxy",                   /* tp_doc */
+    0,                                /* tp_traverse */
+    0,                                /* tp_clear */
+    0,                                /* tp_richcompare */
+    0,                                /* tp_weaklistoffset */
+    0,                                /* tp_iter */
+    0,                                /* tp_iternext */
+    ConfigProxy_methods,              /* tp_methods */
+    0,                                /* tp_members */
+    0,                                /* tp_getset */
+    0,                                /* tp_base */
+    0,                                /* tp_dict */
+    0,                                /* tp_descr_get */
+    0,                                /* tp_descr_set */
+    0,                                /* tp_dictoffset */
+    0,                                /* tp_init */
+    0,                                /* tp_alloc */
+    0,                                /* tp_new */
+    0,                                /* tp_free */
+};
+
+PyObject* create_config_proxy(PyObject* base_config, PyObject* runtime_capsule) {
+    if (PyType_Ready(&ConfigProxyType) < 0) {
+        return nullptr;
+    }
+    ConfigProxy* self = PyObject_New(ConfigProxy, &ConfigProxyType);
+    if (self == nullptr) {
+        return nullptr;
+    }
+    self->base_config = base_config;
+    self->runtime_capsule = runtime_capsule;
+    Py_XINCREF(self->base_config);
+    Py_XINCREF(self->runtime_capsule);
+    return reinterpret_cast<PyObject*>(self);
 }
 
 class GraphHandleRegistry {
@@ -341,12 +1017,23 @@ GraphHandle::GraphHandle(std::unique_ptr<ExecutionEngine> engine, std::string na
     graph_id_ = next_python_graph_id();
     GraphHandleRegistry::instance().add(graph_id_, this);
 
+    if (Py_IsInitialized()) {
+        const PyGILState_STATE gil = PyGILState_Ensure();
+        state_key_lookup_ = PyDict_New();
+        if (state_key_lookup_ == nullptr && PyErr_Occurred() != nullptr) {
+            PyErr_Clear();
+        }
+        PyGILState_Release(gil);
+    }
+
     // Reserved nodes
     node_ids_by_name_[kInternalBootstrapNodeName] = next_node_id_++;
     node_bindings_.push_back({node_ids_by_name_[kInternalBootstrapNodeName], kInternalBootstrapNodeName, nullptr, NodeKind::Compute});
+    node_binding_indices_[node_ids_by_name_[kInternalBootstrapNodeName]] = node_bindings_.size() - 1U;
 
     node_ids_by_name_[kInternalEndNodeName] = next_node_id_++;
     node_bindings_.push_back({node_ids_by_name_[kInternalEndNodeName], kInternalEndNodeName, nullptr, NodeKind::Control, node_policy_mask(NodePolicyFlag::StopAfterNode)});
+    node_binding_indices_[node_ids_by_name_[kInternalEndNodeName]] = node_bindings_.size() - 1U;
 }
 
 GraphHandle::~GraphHandle() {
@@ -355,10 +1042,12 @@ GraphHandle::~GraphHandle() {
         const PyGILState_STATE gil = PyGILState_Ensure();
         for (auto& binding : node_bindings_) {
             Py_XDECREF(binding.callback);
+            Py_XDECREF(binding.patch_key_lookup);
         }
         for (auto& entry : active_configs_) {
             Py_XDECREF(entry.second);
         }
+        Py_XDECREF(state_key_lookup_);
         PyGILState_Release(gil);
     }
 }
@@ -366,12 +1055,14 @@ GraphHandle::~GraphHandle() {
 PyObject* GraphHandle::state_to_python_dict(const WorkflowState& state, const BlobStore& blobs, const StringInterner& strings, std::string* error_message) const {
     std::shared_ptr<std::vector<std::string>> names;
     std::shared_ptr<std::unordered_map<std::string, StateKey>> keys;
+    PyObject* state_key_lookup = nullptr;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         names = state_names_;
         keys = state_keys_by_name_;
+        state_key_lookup = state_key_lookup_;
     }
-    return create_state_proxy(this, state, blobs, strings, names, keys);
+    return create_state_proxy(this, state, blobs, strings, names, keys, state_key_lookup);
 }
 
 PyObject* GraphHandle::convert_value_to_python(const Value& value, const BlobStore& blobs, const StringInterner& strings, std::string* error_message) const {
@@ -396,14 +1087,13 @@ PyObject* GraphHandle::convert_value_to_python(const Value& value, const BlobSto
         if (!buffer.first) {
             Py_RETURN_NONE;
         }
-        auto bytes = blobs.read_bytes(ref);
-        if (tagged_blob_has_payload(bytes, kPickleBlobTag)) {
-            return load_object_from_pickle_bytes(bytes, error_message);
+        if (tagged_buffer_has_payload(buffer.first, buffer.second, kPickleBlobTag)) {
+            return load_object_from_pickle_buffer(buffer.first, buffer.second, error_message);
         }
-        if (tagged_blob_has_payload(bytes, kJsonBlobTag)) {
-            return load_object_from_json_bytes(bytes, error_message);
+        if (tagged_buffer_has_payload(buffer.first, buffer.second, kJsonBlobTag)) {
+            return load_object_from_json_buffer(buffer.first, buffer.second, error_message);
         }
-        bool is_bytes = tagged_blob_has_payload(bytes, kBytesBlobTag);
+        bool is_bytes = tagged_buffer_has_payload(buffer.first, buffer.second, kBytesBlobTag);
         return PyMemoryView_FromMemory(
             const_cast<char*>(reinterpret_cast<const char*>(is_bytes ? buffer.first + 1 : buffer.first)),
             is_bytes ? buffer.second - 1 : buffer.second,
@@ -463,10 +1153,33 @@ StateKey GraphHandle::ensure_state_key_locked(std::string_view state_name) {
     StateKey key = static_cast<StateKey>(state_names_->size());
     state_names_->push_back(std::string(state_name));
     (*state_keys_by_name_)[std::string(state_name)] = key;
+
+    if (state_key_lookup_ != nullptr && Py_IsInitialized()) {
+        const bool release_gil = !PyGILState_Check();
+        PyGILState_STATE gil_state{};
+        if (release_gil) {
+            gil_state = PyGILState_Ensure();
+        }
+        PyObject* py_name = unicode_from_utf8(state_name);
+        PyObject* py_key = PyLong_FromUnsignedLong(static_cast<unsigned long>(key));
+        if (py_name != nullptr && py_key != nullptr) {
+            if (PyDict_SetItem(state_key_lookup_, py_name, py_key) != 0 &&
+                PyErr_Occurred() != nullptr) {
+                PyErr_Clear();
+            }
+        } else if (PyErr_Occurred() != nullptr) {
+            PyErr_Clear();
+        }
+        Py_XDECREF(py_name);
+        Py_XDECREF(py_key);
+        if (release_gil) {
+            PyGILState_Release(gil_state);
+        }
+    }
     return key;
 }
 
-bool GraphHandle::add_node(std::string_view name, PyObject* callback, NodeKind kind, uint32_t policy_flags, const std::vector<std::pair<std::string, JoinMergeStrategy>>& merge_rules, std::string* error_message) {
+bool GraphHandle::add_node(std::string_view name, PyObject* callback, NodeKind kind, uint32_t policy_flags, const NodeMemoizationPolicy& memoization, const std::vector<std::pair<std::string, JoinMergeStrategy>>& merge_rules, std::string* error_message) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (node_ids_by_name_.count(std::string(name))) {
         *error_message = "Node with name '" + std::string(name) + "' already exists";
@@ -482,7 +1195,16 @@ bool GraphHandle::add_node(std::string_view name, PyObject* callback, NodeKind k
         rules.push_back({ensure_state_key_locked(field), strategy});
     }
 
-    node_bindings_.push_back({node_id, std::string(name), callback, kind, policy_flags, std::move(rules)});
+    node_bindings_.push_back({
+        node_id,
+        std::string(name),
+        callback,
+        kind,
+        policy_flags,
+        std::move(rules),
+        memoization
+    });
+    node_binding_indices_[node_id] = node_bindings_.size() - 1U;
 
     if (!entry_node_id_) {
         entry_node_id_ = node_id;
@@ -515,7 +1237,18 @@ bool GraphHandle::add_subgraph_node(std::string_view name, GraphHandle* subgraph
         sb.session_id_source_key = ensure_state_key_locked(*session_id_source_name);
     }
 
-    node_bindings_.push_back({node_id, std::string(name), nullptr, NodeKind::Subgraph, 0, {}, sb, subgraph_handle});
+    node_bindings_.push_back({
+        node_id,
+        std::string(name),
+        nullptr,
+        NodeKind::Subgraph,
+        0U,
+        {},
+        {},
+        sb,
+        subgraph_handle
+    });
+    node_binding_indices_[node_id] = node_bindings_.size() - 1U;
 
     return true;
 }
@@ -584,7 +1317,8 @@ bool GraphHandle::finalize_locked(std::string* error_message) {
             0, 0, executor, {},
             binding.merge_rules,
             {},
-            binding.subgraph
+            binding.subgraph,
+            binding.memoization
         });
     }
 
@@ -980,17 +1714,98 @@ bool GraphHandle::build_initial_envelope(PyObject* input_state, PyObject* config
     return true;
 }
 
-bool GraphHandle::convert_mapping_to_patch(PyObject* mapping, BlobStore& blobs, StringInterner& strings, StatePatch* patch, std::string* error_message) {
+bool GraphHandle::convert_mapping_to_patch(
+    PyObject* mapping,
+    BlobStore& blobs,
+    StringInterner& strings,
+    StatePatch* patch,
+    std::string* error_message,
+    PyObject* fast_state_key_lookup
+) {
+    const Py_ssize_t mapping_size = PyDict_Size(mapping);
+    if (mapping_size < 0) {
+        if (error_message != nullptr) {
+            *error_message = fetch_python_error();
+        }
+        return false;
+    }
+    if (mapping_size == 0) {
+        return true;
+    }
+
+    patch->updates.reserve(
+        patch->updates.size() + static_cast<std::size_t>(mapping_size)
+    );
+
+    PyObject* global_state_key_lookup = state_key_lookup_;
     PyObject *key, *value;
     Py_ssize_t pos = 0;
     while (PyDict_Next(mapping, &pos, &key, &value)) {
-        std::string key_str = python_string(key, error_message);
-        if (!error_message->empty()) return false;
+        if (!PyUnicode_Check(key)) {
+            if (error_message != nullptr) {
+                *error_message = "state updates must use string keys";
+            }
+            return false;
+        }
+
+        StateKey state_key = 0;
+        bool found = false;
+        if (!lookup_state_key_in_python_dict(
+                fast_state_key_lookup,
+                key,
+                &state_key,
+                &found,
+                error_message
+            )) {
+            return false;
+        }
+        if (!found &&
+            global_state_key_lookup != nullptr &&
+            global_state_key_lookup != fast_state_key_lookup) {
+            if (!lookup_state_key_in_python_dict(
+                    global_state_key_lookup,
+                    key,
+                    &state_key,
+                    &found,
+                    error_message
+                )) {
+                return false;
+            }
+            if (found &&
+                fast_state_key_lookup != nullptr &&
+                !cache_state_key_in_python_dict(
+                    fast_state_key_lookup,
+                    key,
+                    state_key,
+                    error_message
+                )) {
+                return false;
+            }
+        }
+
+        if (!found) {
+            std::string key_str = python_string(key, error_message);
+            if (error_message != nullptr && !error_message->empty()) {
+                return false;
+            }
+            state_key = ensure_state_key(key_str);
+            if (fast_state_key_lookup != nullptr &&
+                !cache_state_key_in_python_dict(
+                    fast_state_key_lookup,
+                    key,
+                    state_key,
+                    error_message
+                )) {
+                return false;
+            }
+        }
 
         Value val;
-        if (!convert_python_value(value, blobs, strings, &val, error_message)) return false;
+        if (!convert_python_value(value, blobs, strings, &val, error_message)) {
+            return false;
+        }
 
-        patch->updates.push_back({ensure_state_key(key_str), val});
+        patch->updates.push_back({state_key, std::move(val)});
     }
     return true;
 }
@@ -1395,14 +2210,12 @@ NodeResult python_node_executor(ExecutionContext& ctx) {
         return NodeResult{NodeResult::HardFail};
     }
 
-    const NodeBinding* binding = nullptr;
+    NodeBinding* binding = nullptr;
     {
         std::lock_guard<std::mutex> lock(handle->mutex_);
-        for (const auto& nb : handle->node_bindings_) {
-            if (nb.node_id == ctx.node_id) {
-                binding = &nb;
-                break;
-            }
+        const auto it = handle->node_binding_indices_.find(ctx.node_id);
+        if (it != handle->node_binding_indices_.end()) {
+            binding = &handle->node_bindings_[it->second];
         }
     }
 
@@ -1412,38 +2225,105 @@ NodeResult python_node_executor(ExecutionContext& ctx) {
 
     const PyGILState_STATE gil = PyGILState_Ensure();
 
-    PyObject* py_state = handle->state_to_python_dict(ctx.state, ctx.blobs, ctx.strings, nullptr);
-    PyObject* py_config = nullptr;
+    PyObject* runtime_capsule = create_runtime_view_proxy(ctx);
+    if (runtime_capsule == nullptr) {
+        PyGILState_Release(gil);
+        return NodeResult{NodeResult::HardFail};
+    }
+    auto* runtime_view = reinterpret_cast<RuntimeViewProxy*>(runtime_capsule);
+
+    std::shared_ptr<std::vector<std::string>> state_names;
+    std::shared_ptr<std::unordered_map<std::string, StateKey>> state_keys;
+    PyObject* state_key_lookup = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(handle->mutex_);
+        state_names = handle->state_names_;
+        state_keys = handle->state_keys_by_name_;
+        state_key_lookup = handle->state_key_lookup_;
+    }
+
+    PyObject* py_state = create_borrowed_state_proxy(
+        handle,
+        ctx.state,
+        ctx.blobs,
+        ctx.strings,
+        runtime_view,
+        runtime_capsule,
+        state_names,
+        state_keys,
+        state_key_lookup
+    );
+    if (py_state == nullptr) {
+        Py_DECREF(runtime_capsule);
+        PyGILState_Release(gil);
+        return NodeResult{NodeResult::HardFail};
+    }
+
+    PyObject* base_config = nullptr;
     {
         std::lock_guard<std::mutex> lock(handle->mutex_);
         auto it = handle->active_configs_.find(ctx.run_id);
         if (it != handle->active_configs_.end()) {
-            py_config = PyDict_Copy(it->second);
+            base_config = it->second;
+            Py_INCREF(base_config);
         }
     }
-    if (py_config == nullptr && !ctx.runtime_config_payload.empty()) {
+    if (base_config == nullptr && !ctx.runtime_config_payload.empty()) {
         std::string config_error;
         if (tagged_blob_has_payload(ctx.runtime_config_payload, kPickleBlobTag)) {
-            py_config = load_object_from_pickle_bytes(ctx.runtime_config_payload, &config_error);
+            base_config = load_object_from_pickle_buffer(
+                ctx.runtime_config_payload.data(),
+                ctx.runtime_config_payload.size(),
+                &config_error
+            );
         } else if (tagged_blob_has_payload(ctx.runtime_config_payload, kJsonBlobTag)) {
-            py_config = load_object_from_json_bytes(ctx.runtime_config_payload, &config_error);
+            base_config = load_object_from_json_buffer(
+                ctx.runtime_config_payload.data(),
+                ctx.runtime_config_payload.size(),
+                &config_error
+            );
         }
-        if (py_config == nullptr) {
+        if (base_config == nullptr) {
             PyErr_Clear();
         }
     }
-    if (!py_config) py_config = PyDict_New();
-
-    PyObject* runtime_capsule = PyCapsule_New(&ctx, kRuntimeCapsuleName, nullptr);
-    PyDict_SetItemString(py_config, kPythonRuntimeConfigKey, runtime_capsule);
-    Py_DECREF(runtime_capsule);
+    if (base_config == nullptr) {
+        base_config = PyDict_New();
+    }
+    if (base_config == nullptr) {
+        runtime_view->active.store(false, std::memory_order_release);
+        Py_DECREF(py_state);
+        Py_DECREF(runtime_capsule);
+        PyGILState_Release(gil);
+        return NodeResult{NodeResult::HardFail};
+    }
+    PyObject* py_config = create_config_proxy(base_config, runtime_capsule);
+    Py_DECREF(base_config);
+    if (py_config == nullptr) {
+        runtime_view->active.store(false, std::memory_order_release);
+        Py_DECREF(py_state);
+        Py_DECREF(runtime_capsule);
+        PyGILState_Release(gil);
+        return NodeResult{NodeResult::HardFail};
+    }
 
     PyObject* args = PyTuple_Pack(2, py_state, py_config);
+    if (args == nullptr) {
+        runtime_view->active.store(false, std::memory_order_release);
+        Py_DECREF(py_state);
+        Py_DECREF(py_config);
+        Py_DECREF(runtime_capsule);
+        PyGILState_Release(gil);
+        return NodeResult{NodeResult::HardFail};
+    }
     PyObject* result = PyObject_CallObject(binding->callback, args);
+
+    runtime_view->active.store(false, std::memory_order_release);
 
     Py_DECREF(args);
     Py_DECREF(py_state);
     Py_DECREF(py_config);
+    Py_DECREF(runtime_capsule);
 
     NodeResult node_result{NodeResult::Success};
 
@@ -1473,7 +2353,33 @@ NodeResult python_node_executor(ExecutionContext& ctx) {
 
     std::string err;
     if (patch_obj && PyDict_Check(patch_obj)) {
-        handle->convert_mapping_to_patch(patch_obj, ctx.blobs, ctx.strings, &node_result.patch, &err);
+        PyObject* patch_key_lookup = nullptr;
+        if (PyDict_Size(patch_obj) > 0) {
+            if (binding != nullptr && binding->patch_key_lookup == nullptr) {
+                binding->patch_key_lookup = PyDict_New();
+                if (binding->patch_key_lookup == nullptr) {
+                    err = fetch_python_error();
+                }
+            }
+            if (binding != nullptr) {
+                patch_key_lookup = binding->patch_key_lookup;
+            }
+        }
+
+        if (err.empty() &&
+            !handle->convert_mapping_to_patch(
+                patch_obj,
+                ctx.blobs,
+                ctx.strings,
+                &node_result.patch,
+                &err,
+                patch_key_lookup
+            )) {
+            std::cerr << "Python patch conversion failed: " << err << std::endl;
+            Py_DECREF(result);
+            PyGILState_Release(gil);
+            return NodeResult{NodeResult::HardFail};
+        }
     }
 
     if (should_wait) {
@@ -1938,10 +2844,12 @@ PyObject* runtime_invoke_tool(
     const std::vector<std::byte>& input,
     std::string* error_message
 ) {
-    auto* ctx = static_cast<ExecutionContext*>(PyCapsule_GetPointer(capsule, kRuntimeCapsuleName));
+    ExecutionContext* ctx = runtime_context_from_capsule(capsule, error_message);
     if (ctx == nullptr) {
         if (error_message != nullptr) {
-            *error_message = "invalid runtime capsule";
+            if (error_message->empty()) {
+                *error_message = "invalid runtime capsule";
+            }
         }
         return nullptr;
     }
@@ -2024,10 +2932,12 @@ PyObject* runtime_invoke_model(
     uint32_t max_tokens,
     std::string* error_message
 ) {
-    auto* ctx = static_cast<ExecutionContext*>(PyCapsule_GetPointer(capsule, kRuntimeCapsuleName));
+    ExecutionContext* ctx = runtime_context_from_capsule(capsule, error_message);
     if (ctx == nullptr) {
         if (error_message != nullptr) {
-            *error_message = "invalid runtime capsule";
+            if (error_message->empty()) {
+                *error_message = "invalid runtime capsule";
+            }
         }
         return nullptr;
     }
@@ -2050,9 +2960,11 @@ PyObject* runtime_invoke_model(
 }
 
 PyObject* runtime_record_once(PyObject* capsule, std::string_view key, PyObject* request, PyObject* producer, std::string* error_message) {
-    auto* ctx = static_cast<ExecutionContext*>(PyCapsule_GetPointer(capsule, kRuntimeCapsuleName));
+    ExecutionContext* ctx = runtime_context_from_capsule(capsule, error_message);
     if (!ctx) {
-        *error_message = "Invalid runtime capsule";
+        if (error_message != nullptr && error_message->empty()) {
+            *error_message = "Invalid runtime capsule";
+        }
         return nullptr;
     }
 

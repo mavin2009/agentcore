@@ -91,10 +91,11 @@ NodeResult join_branch_d_node(ExecutionContext& context) {
 }
 
 int64_t read_int_field(const WorkflowState& state, StateKey key) {
-    if (state.fields.size() <= key || !std::holds_alternative<int64_t>(state.fields[key])) {
+    const Value value = state.size() > key ? state.load(key) : Value{};
+    if (!std::holds_alternative<int64_t>(value)) {
         return 0;
     }
-    return std::get<int64_t>(state.fields[key]);
+    return std::get<int64_t>(value);
 }
 
 NodeResult summarize_join_node(ExecutionContext& context) {
@@ -157,14 +158,16 @@ NodeResult async_join_writer_node(ExecutionContext& context) {
 
 NodeResult summarize_async_join_node(ExecutionContext& context) {
     const int64_t sync_value = read_int_field(context.state, kJoinSyncValue);
-    const bool consensus = context.state.fields.size() > kJoinConsensus &&
-        std::holds_alternative<bool>(context.state.fields[kJoinConsensus]) &&
-        std::get<bool>(context.state.fields[kJoinConsensus]);
+    const Value consensus_value =
+        context.state.size() > kJoinConsensus ? context.state.load(kJoinConsensus) : Value{};
+    const bool consensus = std::holds_alternative<bool>(consensus_value) &&
+        std::get<bool>(consensus_value);
     std::string async_value;
-    if (context.state.fields.size() > kJoinAsyncResult &&
-        std::holds_alternative<BlobRef>(context.state.fields[kJoinAsyncResult])) {
+    const Value async_result_value =
+        context.state.size() > kJoinAsyncResult ? context.state.load(kJoinAsyncResult) : Value{};
+    if (std::holds_alternative<BlobRef>(async_result_value)) {
         async_value = std::string(
-            context.blobs.read_string(std::get<BlobRef>(context.state.fields[kJoinAsyncResult]))
+            context.blobs.read_string(std::get<BlobRef>(async_result_value))
         );
     }
 

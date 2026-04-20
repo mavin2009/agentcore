@@ -54,8 +54,11 @@ int main() {
     assert(apply_result.state_changed);
     assert(apply_result.knowledge_graph_delta.entities.size() == 2U);
     assert(apply_result.knowledge_graph_delta.triples.size() == 1U);
+    assert(apply_result.changed_keys.size() == 2U);
     assert(store.get_current_state().version == 1U);
     assert(store.patch_log().size() == 1U);
+    assert(store.get_current_state().field_revision(kCounter) == 1U);
+    assert(store.get_current_state().field_revision(kSummary) == 1U);
 
     const WorkflowState& current = store.get_current_state();
     assert(std::holds_alternative<int64_t>(current.load(kCounter)));
@@ -80,6 +83,8 @@ int main() {
     assert(restored.patch_log().size() == 1U);
     assert(restored.knowledge_graph().entity_count() == 2U);
     assert(restored.knowledge_graph().triple_count() == 1U);
+    assert(restored.get_current_state().field_revision(kCounter) == 1U);
+    assert(restored.get_current_state().field_revision(kSummary) == 1U);
 
     const std::vector<const KnowledgeTriple*> matches =
         restored.knowledge_graph().match(runtime, relation, reference_runtime);
@@ -103,6 +108,16 @@ int main() {
     assert(duplicate_result.patch_log_offset == 1U);
     assert(store.get_current_state().version == 1U);
     assert(store.patch_log().size() == 1U);
+
+    StatePatch duplicate_field_patch;
+    duplicate_field_patch.updates.push_back(FieldUpdate{kCounter, int64_t{42}});
+    const StateApplyResult duplicate_field_result = store.apply_with_summary(duplicate_field_patch);
+    assert(!duplicate_field_result.state_changed);
+    assert(duplicate_field_result.changed_keys.empty());
+    assert(duplicate_field_result.patch_log_offset == 1U);
+    assert(store.get_current_state().version == 1U);
+    assert(store.patch_log().size() == 1U);
+    assert(store.get_current_state().field_revision(kCounter) == 1U);
 
     StatePatch recorded_task_patch;
     recorded_task_patch.task_records.push_back(TaskRecord{
@@ -138,6 +153,8 @@ int main() {
     fork_patch.updates.push_back(FieldUpdate{kCounter, int64_t{7}});
     static_cast<void>(fork.apply(fork_patch));
     assert(std::get<int64_t>(store.get_current_state().load(kCounter)) == 42);
+    assert(store.get_current_state().field_revision(kCounter) == 1U);
+    assert(fork.get_current_state().field_revision(kCounter) == 2U);
     const StateStore::SharedBacking shared_after_patch = store.shared_backing_with(fork);
     assert(shared_after_patch.blobs);
     assert(shared_after_patch.strings);

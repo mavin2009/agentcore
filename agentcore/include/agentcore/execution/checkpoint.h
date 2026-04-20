@@ -9,13 +9,24 @@
 #include "agentcore/runtime/tool_api.h"
 #include "agentcore/state/state_store.h"
 #include <cstddef>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace agentcore {
+
+enum class ExecutionProfile : uint8_t {
+    Strict = 0,
+    Balanced = 1,
+    Fast = 2
+};
 
 struct Checkpoint {
     RunId run_id{0};
@@ -129,6 +140,7 @@ class CheckpointStorageBackend {
 public:
     virtual ~CheckpointStorageBackend() = default;
 
+    virtual void append(const std::vector<CheckpointRecord>& records) = 0;
     virtual void replace_all(const std::vector<CheckpointRecord>& records) = 0;
     [[nodiscard]] virtual std::vector<CheckpointRecord> load_all() const = 0;
     [[nodiscard]] virtual std::string kind() const = 0;
@@ -140,6 +152,15 @@ public:
 
 class CheckpointManager {
 public:
+    CheckpointManager();
+    ~CheckpointManager();
+
+    CheckpointManager(const CheckpointManager&) = delete;
+    auto operator=(const CheckpointManager&) -> CheckpointManager& = delete;
+    CheckpointManager(CheckpointManager&&) = delete;
+    auto operator=(CheckpointManager&&) -> CheckpointManager& = delete;
+
+    void configure(ExecutionProfile profile);
     CheckpointId append(const Checkpoint& checkpoint, std::optional<RunSnapshot> snapshot);
     [[nodiscard]] std::optional<CheckpointRecord> get(CheckpointId checkpoint_id) const;
     [[nodiscard]] const std::vector<CheckpointRecord>& records() const noexcept;
@@ -157,14 +178,33 @@ public:
     [[nodiscard]] const std::string& persistence_path() const noexcept;
     [[nodiscard]] std::string storage_kind() const;
     [[nodiscard]] std::size_t load_persisted_records();
+    void flush();
+    void clear();
 
 private:
-    void persist_locked() const;
+    enum class PersistenceMode : uint8_t {
+        Synchronous = 0,
+        Background = 1
+    };
+
+    void ensure_worker_locked();
+    void stop_worker();
+    void flush_locked(std::unique_lock<std::mutex>& lock);
+    void persist_batch(const std::vector<CheckpointRecord>& records) const;
+    void writer_loop();
 
     mutable std::mutex mutex_;
+    mutable std::mutex persistence_mutex_;
+    std::condition_variable cv_;
     std::vector<CheckpointRecord> records_;
+    std::deque<CheckpointRecord> pending_records_;
     std::shared_ptr<CheckpointStorageBackend> storage_;
     std::string persistence_path_;
+    PersistenceMode persistence_mode_{PersistenceMode::Synchronous};
+    std::chrono::milliseconds flush_interval_{0};
+    std::size_t flush_batch_size_{1U};
+    bool stopping_{false};
+    std::thread worker_;
 };
 
 [[nodiscard]] std::vector<std::byte> serialize_run_snapshot_bytes(const RunSnapshot& snapshot);
@@ -172,20 +212,34 @@ private:
 
 class TraceSink {
 public:
+    void configure(ExecutionProfile profile, std::size_t fast_limit = 4096U);
     void emit(const TraceEvent& event);
-    [[nodiscard]] const std::vector<TraceEvent>& events() const noexcept;
+    void emit_batch(std::vector<TraceEvent> events);
+    [[nodiscard]] std::vector<TraceEvent> events() const;
     [[nodiscard]] std::vector<TraceEvent> events_for_run(RunId run_id) const;
     [[nodiscard]] std::vector<TraceEvent> events_for_run_since_sequence(
         RunId run_id,
         uint64_t next_sequence
     ) const;
+    [[nodiscard]] std::vector<TraceEvent> take_events_for_run(RunId run_id);
     [[nodiscard]] uint64_t next_sequence() const;
     void clear();
 
 private:
+    static constexpr std::size_t kSegmentSize = 256U;
+
+    struct RunTrace {
+        std::deque<std::vector<TraceEvent>> segments;
+        std::size_t event_count{0U};
+    };
+
+    void trim_run_locked(RunTrace& run_trace);
+
     mutable std::mutex mutex_;
-    std::vector<TraceEvent> events_;
+    std::unordered_map<RunId, RunTrace> events_by_run_;
     uint64_t next_sequence_{1};
+    bool bounded_{false};
+    std::size_t max_events_per_run_{0U};
 };
 
 } // namespace agentcore

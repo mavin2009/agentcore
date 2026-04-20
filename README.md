@@ -42,6 +42,7 @@ Several other design decisions follow from the same goal:
 - Flat graph IR: nodes and edges are index-based structs with compiled routing tables. This keeps graph lookup and routing simple and cache-friendly and avoids virtual-dispatch-heavy graph metadata in the hot path.
 - Explicit state patches: nodes return a `NodeResult` and a `StatePatch` instead of mutating global state in place. That gives the engine a single commit point for trace emission, checkpointing, and replay.
 - Typed hot state plus blob references: durable state lives in `WorkflowState::fields`, while larger payloads live in the `BlobStore`. The intent is to keep frequently-read execution state small while still allowing larger artifacts to flow through the graph.
+- Per-field revisions plus deterministic memoization: workflow fields now carry revision counters, and deterministic nodes can be memoized against declared state dependencies plus the runtime config payload. That makes repeated stable work cheaper without moving caching policy out of the runtime.
 - Scheduler separated from execution: the scheduler owns task queues, worker threads, and async waiter promotion, while the engine owns semantics. This lets concurrency policy evolve without turning the execution loop into a thread-management subsystem.
 - Knowledge graph in the state layer: graph memory is treated as first-class runtime state, not as an external sidecar. That keeps graph-aware workflows, subscriptions, and replay under the same state and checkpoint model as ordinary field updates.
 - Persistent child sessions are stored as isolated child snapshots plus explicit input/output bindings. This keeps concurrent distinct sessions safe, makes same-session conflicts reject cleanly, and prevents hidden mutable state from leaking across parent runs.
@@ -70,6 +71,8 @@ Node policies include flags for:
 - join-scope creation
 - knowledge-graph-reactive execution
 
+`NodeDefinition` also carries deterministic memoization metadata. The current runtime supports deterministic result caching for compute/control/aggregate nodes keyed by declared `read_keys` and the run config payload, with invalidation on declared key changes and conservative cache clearing when the knowledge graph changes.
+
 Subgraph composition is part of the graph layer through `SubgraphBinding`, and the helper surface for validating and namespacing subgraphs lives in [`./agentcore/include/agentcore/graph/composition/subgraph.h`](./agentcore/include/agentcore/graph/composition/subgraph.h). `SubgraphBinding` also carries persistent-session metadata through `session_mode` and `session_id_source_key`, which is what lets one child graph definition be reused across many isolated child sessions.
 
 ### State
@@ -82,6 +85,8 @@ The state layer is defined in [`./agentcore/include/agentcore/state/state_store.
 - `StringInterner` for stable interned string identifiers
 - `KnowledgeGraphStore` for entity/triple storage
 - `TaskJournal` for persisted once-only side-effect outcomes
+
+`WorkflowState` also tracks per-field revision counters. Those revisions are serialized together with the state snapshot, which keeps deterministic memoization invalidation explicit and compatible with replay/resume instead of depending on transient object identity.
 
 `Value` is a small tagged union defined in [`./agentcore/include/agentcore/core/types.h`](./agentcore/include/agentcore/core/types.h), and supports:
 
@@ -132,7 +137,7 @@ The current storage backends are:
 - binary file persistence
 - SQLite-backed persistence when the build is configured with SQLite support
 
-Proof digests are available in [`./agentcore/include/agentcore/execution/proof.h`](./agentcore/include/agentcore/execution/proof.h). The current proof surface computes digests over snapshots and trace sequences.
+Proof digests are available in [`./agentcore/include/agentcore/execution/proof.h`](./agentcore/include/agentcore/execution/proof.h). The current proof surface computes digests over snapshots and trace sequences. Those digests are run-specific artifacts: they include execution identity such as checkpoints and trace structure, so equality checks should compare matched replay/resume paths rather than unrelated runs.
 
 Public streaming is defined in [`./agentcore/include/agentcore/execution/streaming/public_stream.h`](./agentcore/include/agentcore/execution/streaming/public_stream.h). Stream events carry:
 
@@ -163,11 +168,13 @@ The runtime layer contains node execution interfaces, async handling, registries
 
 The current scheduler is composed of:
 
-- `WorkQueue` for ordered runnable tasks
+- `WorkQueue` for ordered runnable tasks, implemented as per-run ready queues plus a delayed-task heap
 - `WorkerPool` for batched parallel execution
-- `AsyncCompletionQueue` for tool/model completion promotion
+- `AsyncCompletionQueue` for tool/model completion promotion and grouped async wait barriers
 
-`Scheduler` exposes ready-queue operations, async waiter registration, completion signaling, and parallel batch execution.
+`Scheduler` exposes ready-queue operations, delayed-task wake planning, async waiter registration, grouped async wait registration, completion signaling, and parallel batch execution.
+
+The grouped async wait path is important for replayability. When a paused branch represents one checkpointed async frontier rather than a single handle, the scheduler only makes that branch runnable after the full frontier is complete. That prevents restart behavior from depending on which handle happened to complete first after restore.
 
 The reason this is split from the engine is to preserve a clean distinction between:
 
@@ -254,6 +261,18 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
+For optimized validation and benchmark work, the repository now also ships CMake presets:
+
+```bash
+cmake --preset release-perf
+cmake --build --preset release-perf -j
+ctest --preset release-perf
+./build/release-perf/agentcore_runtime_benchmark
+./build/release-perf/agentcore_persistent_subgraph_session_benchmark
+```
+
+The available configure presets are `release-perf`, `relwithdebinfo-perf`, `asan`, `ubsan`, and `tsan`.
+
 The exported CMake targets are:
 
 - `agentcore::graph`
@@ -261,24 +280,27 @@ The exported CMake targets are:
 
 ## Current Validation Snapshot
 
-The current tree has been validated from this repository on April 18, 2026 with:
+The current tree has been validated from this repository on April 19, 2026 with:
 
 ```bash
+cmake --preset release-perf
+cmake --build --preset release-perf -j
+ctest --preset release-perf
+./build/release-perf/agentcore_runtime_benchmark
+./build/release-perf/agentcore_persistent_subgraph_session_benchmark
 cmake -S . -B build -DAGENTCORE_BUILD_PYTHON_BINDINGS=ON -DAGENTCORE_BUILD_BENCHMARKS=ON
 cmake --build build -j
-ctest --test-dir build --output-on-failure
 PYTHONPATH=./build/python python3 ./python/benchmarks/langgraph_head_to_head.py
 ```
 
-That pass completed successfully, including the native and Python smoke coverage registered under CTest and the public head-to-head benchmark report.
+That pass completed successfully, including the optimized native validation lane, the native durable benchmark binaries, and the Python head-to-head benchmark report.
 
 The current benchmark snapshot is documented in [`./docs/comparisons/langgraph-head-to-head.md`](./docs/comparisons/langgraph-head-to-head.md). At a high level, this pass shows:
 
-- AgentCore native faster on the long-running persistent-memory workload
-- AgentCore native using materially less peak memory on that same workload
-- AgentCore native faster on pause/resume
-- AgentCore native slightly faster on the 24-session persistent fan-out benchmark
-- AgentCore native still slightly slower on the simple direct-invoke micro-workload
+- AgentCore compat `2.02x` faster on invoke, `1.99x` faster on stream, and `3.00x` faster per batch item on the same-code StateGraph-style workflow
+- AgentCore native `9.99x` faster and used `61.0%` less peak memory on the long-running persistent-memory workload
+- AgentCore native `14.14x` faster on pause/resume and `2.59x` faster on the simple direct-invoke micro-workload
+- The 24-session persistent fan-out benchmark is no longer near parity in this snapshot: AgentCore native is `7.69x` faster while emitting `48` session-tagged child events
 
 Those results should be read as a reproducible snapshot for this machine and this tree, not as a universal claim.
 - `agentcore::runtime`
@@ -324,6 +346,12 @@ The basic execution flow is:
 3. start a run with `ExecutionEngine::start()`
 4. drive the run with `step()` or `run_to_completion()`
 5. inspect state, checkpoints, traces, and stream events
+
+When you need to tune durability and observability cost explicitly, construct the engine with `ExecutionEngineOptions` and choose an execution profile:
+
+- `Strict`: synchronous checkpoint persistence and unbounded trace retention
+- `Balanced`: background checkpoint persistence with deterministic resumability and segmented per-run traces
+- `Fast`: metadata-heavy durability with bounded trace retention for lower hot-path cost
 
 ```cpp
 #include "agentcore/execution/engine.h"
@@ -467,6 +495,8 @@ metadata = compiled.invoke_with_metadata({"count": 0})
 
 The Python layer focuses on a compact builder surface backed by the native runtime rather than mirroring the entire internal C++ API. The reason is to keep the Python entry point predictable while execution, scheduling, checkpointing, streaming, joins, and subgraph behavior stay in native code.
 
+For deterministic pure nodes, `StateGraph.add_node(...)` also accepts `deterministic=True`, `read_keys=[...]`, and `cache_size=...`. That metadata lowers into the native graph IR rather than a Python decorator cache, so the runtime can invalidate entries from explicit state-field revisions and preserve the same final state under direct execution or resumed execution.
+
 When a callback accepts a third positional argument, the runtime passes a `RuntimeContext`. The current Python-facing helper surface is intentionally small:
 
 - `runtime.available`
@@ -509,7 +539,7 @@ Additional runnable entry points include:
 - `PYTHONPATH=./build/python python3 ./python/tests/patterns_smoke.py`
 - `PYTHONPATH=./build/python python3 ./python/tests/adapters_runtime_smoke.py`
 - `PYTHONPATH=./build/python python3 ./python/benchmarks/state_graph_api_benchmark.py`
-- `python3 ./python/benchmarks/langgraph_head_to_head.py` after installing upstream `langgraph`
+- `PYTHONPATH=./build/python python3 ./python/benchmarks/langgraph_head_to_head.py` after installing upstream `langgraph`
 
 The native benchmark currently exercises:
 
@@ -519,6 +549,7 @@ The native benchmark currently exercises:
 - reactive knowledge-graph frontier behavior
 - queue indexing behavior
 - recorded-effect hit/miss cost through the task journal
+- deterministic memoization hit/invalidation cost with executor-invocation counters
 - subgraph and resumable-subgraph execution
 - async multi-wait subgraph execution
 - persistent-session fan-out across distinct child sessions
@@ -530,12 +561,15 @@ The Python benchmark currently exercises:
 - async invoke cost
 - recorded-effect replay cost through the binding layer
 - recorded-effect miss cost through the binding layer
+- deterministic memoization hit/invalidation cost through the binding layer
 - persistent-session fan-out with namespaced and session-tagged events
 - pause/resume specialist flows with child-local memory and once-only effects
 
 The optional comparison benchmark in [`./python/benchmarks/langgraph_head_to_head.py`](./python/benchmarks/langgraph_head_to_head.py) publishes a measured snapshot against upstream LangGraph and is summarized in [`./docs/comparisons/langgraph-head-to-head.md`](./docs/comparisons/langgraph-head-to-head.md).
 
 The persistent-session native benchmark is also the replay-validation gate for this feature: it checks direct-versus-resumed output equality, proof-digest equality, committed-session counts, once-only producer counts, and namespaced/session-tagged event coverage. The Python benchmark mirrors those workloads through the binding layer, asserts final-state and session invariants, and emits the corresponding digests for inspection.
+
+The deterministic memoization benchmark is the regression gate for this seam: it checks identical final output between baseline and memoized stable-input runs, executor invocations collapsing from the visit count down to a single real node execution on stable declared inputs, full re-execution when a declared input changes, and consistent trace-event counts across the three control-flow shapes.
 
 ## Acknowledgements
 
@@ -552,4 +586,5 @@ The project also benefits from the broader systems community working on workflow
 
 ## License
 
-This repository includes a root [`./LICENSE`](./LICENSE) and [`./NOTICE`](./NOTICE). 
+This repository is licensed under the MIT License. See
+[`./LICENSE`](./LICENSE) and [`./NOTICE`](./NOTICE).

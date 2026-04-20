@@ -3,6 +3,7 @@
 #include "agentcore/graph/graph_ir.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cstdio>
@@ -15,6 +16,28 @@
 namespace agentcore {
 
 namespace {
+
+constexpr ExecutionProfile kBenchmarkExecutionProfile = ExecutionProfile::Balanced;
+
+const char* benchmark_profile_name() noexcept {
+    switch (kBenchmarkExecutionProfile) {
+        case ExecutionProfile::Strict:
+            return "strict";
+        case ExecutionProfile::Balanced:
+            return "balanced";
+        case ExecutionProfile::Fast:
+            return "fast";
+    }
+    return "balanced";
+}
+
+ExecutionEngine make_benchmark_engine(std::size_t worker_count, bool inline_scheduler = false) {
+    return ExecutionEngine(ExecutionEngineOptions{
+        worker_count,
+        inline_scheduler,
+        kBenchmarkExecutionProfile
+    });
+}
 
 enum BenchmarkStateKey : StateKey {
     kSummary = 0,
@@ -67,6 +90,12 @@ enum AsyncMultiWaitSubgraphBenchmarkChildStateKey : StateKey {
     kAsyncMultiWaitSubgraphBenchmarkChildSummary = 2
 };
 
+enum MemoizationBenchmarkStateKey : StateKey {
+    kMemoizationBenchmarkInput = 0,
+    kMemoizationBenchmarkOutput = 1,
+    kMemoizationBenchmarkVisits = 2
+};
+
 constexpr int kRoutingRouteCount = 16;
 constexpr int64_t kRoutingIterations = 128;
 constexpr int kFrontierSubscriberCount = 64;
@@ -77,6 +106,12 @@ constexpr int kForkBenchmarkEntityCount = 1024;
 constexpr int kForkBenchmarkTripleCount = 2048;
 constexpr std::size_t kSubgraphBenchmarkRuns = 64U;
 constexpr std::size_t kRecordedEffectBenchmarkIterations = 4096U;
+constexpr std::size_t kMemoizationBenchmarkVisitLimit = 64U;
+constexpr std::size_t kMemoizationBenchmarkMixRounds = 262144U;
+
+std::atomic<uint64_t> g_memoization_baseline_invocations{0U};
+std::atomic<uint64_t> g_memoization_hit_invocations{0U};
+std::atomic<uint64_t> g_memoization_invalidation_invocations{0U};
 
 NodeResult stop_node(ExecutionContext&) {
     return NodeResult::success();
@@ -121,6 +156,17 @@ int64_t read_int_field(const WorkflowState& state, StateKey key) {
         return 0;
     }
     return std::get<int64_t>(state.load(key));
+}
+
+int64_t benchmark_mix_value(int64_t input) {
+    uint64_t value = static_cast<uint64_t>(input) ^ 0x9e3779b97f4a7c15ULL;
+    for (std::size_t round = 0; round < kMemoizationBenchmarkMixRounds; ++round) {
+        value ^= value >> 33U;
+        value *= 0xff51afd7ed558ccdULL;
+        value ^= value >> 33U;
+        value += 0x9e3779b97f4a7c15ULL + static_cast<uint64_t>(round);
+    }
+    return static_cast<int64_t>(value & 0x3fffffffffffffffULL);
 }
 
 bool read_bool_field(const WorkflowState& state, StateKey key) {
@@ -364,6 +410,69 @@ NodeResult summarize_async_multi_wait_benchmark_parent_node(ExecutionContext& co
         context.blobs.append_string("multi-wait-subgraph=" + child_summary)
     });
     return NodeResult::success(std::move(patch), 0.98F);
+}
+
+NodeResult memoization_baseline_node(ExecutionContext& context) {
+    g_memoization_baseline_invocations.fetch_add(1U);
+    StatePatch patch;
+    patch.updates.push_back(FieldUpdate{
+        kMemoizationBenchmarkOutput,
+        benchmark_mix_value(read_int_field(context.state, kMemoizationBenchmarkInput))
+    });
+    return NodeResult::success(std::move(patch), 0.99F);
+}
+
+NodeResult memoization_hit_node(ExecutionContext& context) {
+    g_memoization_hit_invocations.fetch_add(1U);
+    StatePatch patch;
+    patch.updates.push_back(FieldUpdate{
+        kMemoizationBenchmarkOutput,
+        benchmark_mix_value(read_int_field(context.state, kMemoizationBenchmarkInput))
+    });
+    return NodeResult::success(std::move(patch), 0.99F);
+}
+
+NodeResult memoization_invalidation_node(ExecutionContext& context) {
+    g_memoization_invalidation_invocations.fetch_add(1U);
+    StatePatch patch;
+    patch.updates.push_back(FieldUpdate{
+        kMemoizationBenchmarkOutput,
+        benchmark_mix_value(read_int_field(context.state, kMemoizationBenchmarkInput))
+    });
+    return NodeResult::success(std::move(patch), 0.99F);
+}
+
+NodeResult memoization_stable_router_node(ExecutionContext& context) {
+    const int64_t next_visit = read_int_field(context.state, kMemoizationBenchmarkVisits) + 1;
+    StatePatch patch;
+    patch.updates.push_back(FieldUpdate{kMemoizationBenchmarkVisits, next_visit});
+
+    NodeResult result = NodeResult::success(std::move(patch), 1.0F);
+    result.next_override = next_visit < static_cast<int64_t>(kMemoizationBenchmarkVisitLimit)
+        ? NodeId{1U}
+        : NodeId{3U};
+    return result;
+}
+
+NodeResult memoization_invalidation_router_node(ExecutionContext& context) {
+    const int64_t next_visit = read_int_field(context.state, kMemoizationBenchmarkVisits) + 1;
+    StatePatch patch;
+    patch.updates.push_back(FieldUpdate{kMemoizationBenchmarkVisits, next_visit});
+
+    NodeResult result = NodeResult::success({}, 1.0F);
+    if (next_visit < static_cast<int64_t>(kMemoizationBenchmarkVisitLimit)) {
+        patch.updates.push_back(FieldUpdate{
+            kMemoizationBenchmarkInput,
+            read_int_field(context.state, kMemoizationBenchmarkInput) + 1
+        });
+        result.patch = std::move(patch);
+        result.next_override = NodeId{1U};
+        return result;
+    }
+
+    result.patch = std::move(patch);
+    result.next_override = NodeId{3U};
+    return result;
 }
 
 std::string frontier_signal_name(int index) {
@@ -1126,6 +1235,62 @@ GraphDefinition make_async_multi_wait_subgraph_benchmark_parent_graph() {
     return graph;
 }
 
+GraphDefinition make_memoization_benchmark_graph(
+    GraphId graph_id,
+    const char* graph_name,
+    NodeExecutorFn compute_executor,
+    NodeExecutorFn router_executor,
+    NodeMemoizationPolicy memoization
+) {
+    GraphDefinition graph;
+    graph.id = graph_id;
+    graph.name = graph_name;
+    graph.entry = 1U;
+    graph.nodes = {
+        NodeDefinition{
+            1U,
+            NodeKind::Compute,
+            "memoized_work",
+            0U,
+            0U,
+            0U,
+            compute_executor,
+            {},
+            {},
+            {},
+            std::nullopt,
+            std::move(memoization)
+        },
+        NodeDefinition{
+            2U,
+            NodeKind::Control,
+            "memoized_router",
+            0U,
+            0U,
+            0U,
+            router_executor,
+            {}
+        },
+        NodeDefinition{
+            3U,
+            NodeKind::Control,
+            "stop",
+            node_policy_mask(NodePolicyFlag::StopAfterNode),
+            0U,
+            0U,
+            stop_node,
+            {}
+        }
+    };
+    graph.edges = {
+        EdgeDefinition{1U, 1U, 2U, EdgeKind::OnSuccess, nullptr, 100U}
+    };
+    graph.bind_outgoing_edges(1U, std::vector<EdgeId>{1U});
+    graph.sort_edges_by_priority();
+    graph.compile_runtime();
+    return graph;
+}
+
 NodeResult routing_router_node(ExecutionContext& context) {
     const int64_t iteration = read_int_field(context.state, kRoutingIteration);
 
@@ -1442,8 +1607,17 @@ struct RecordedEffectBenchmarkRun {
     uint64_t journal_records{0};
 };
 
+struct MemoizationBenchmarkRun {
+    uint64_t elapsed_ns{0};
+    uint64_t trace_events{0};
+    uint64_t executor_invocations{0};
+    int64_t final_input{0};
+    int64_t final_output{0};
+    int64_t final_visits{0};
+};
+
 BenchmarkRun run_parallel_benchmark_once(const GraphDefinition& graph, std::size_t worker_count) {
-    ExecutionEngine engine(worker_count);
+    ExecutionEngine engine = make_benchmark_engine(worker_count);
     const RunId run_id = engine.start(graph, InputEnvelope{2U});
 
     const auto started_at = std::chrono::steady_clock::now();
@@ -1478,7 +1652,7 @@ RoutingBenchmarkRun run_routing_benchmark_once(
     const GraphDefinition& graph,
     CheckpointPolicy checkpoint_policy
 ) {
-    ExecutionEngine engine(1);
+    ExecutionEngine engine = make_benchmark_engine(1U);
     engine.set_checkpoint_policy(checkpoint_policy);
     const RunId run_id = engine.start(graph, InputEnvelope{4U});
 
@@ -1543,7 +1717,7 @@ StateForkBenchmarkRun run_state_fork_benchmark_once(bool materialized_copy) {
 }
 
 FrontierBenchmarkRun run_frontier_benchmark_once(const GraphDefinition& graph, NodeId watcher_base_id) {
-    ExecutionEngine engine(1);
+    ExecutionEngine engine = make_benchmark_engine(1U);
     const RunId run_id = engine.start(graph, InputEnvelope{2U});
 
     const auto started_at = std::chrono::steady_clock::now();
@@ -1760,11 +1934,44 @@ RecordedEffectBenchmarkRun run_recorded_effect_benchmark_once() {
     };
 }
 
+MemoizationBenchmarkRun run_memoization_benchmark_once(
+    const GraphDefinition& graph,
+    int64_t initial_input,
+    std::atomic<uint64_t>* invocation_counter
+) {
+    assert(invocation_counter != nullptr);
+    invocation_counter->store(0U);
+
+    ExecutionEngine engine = make_benchmark_engine(1U);
+    InputEnvelope input{3U};
+    input.initial_patch.updates.push_back(FieldUpdate{kMemoizationBenchmarkInput, initial_input});
+    input.initial_patch.updates.push_back(FieldUpdate{kMemoizationBenchmarkVisits, int64_t{0}});
+
+    const RunId run_id = engine.start(graph, input);
+    const auto started_at = std::chrono::steady_clock::now();
+    const RunResult result = engine.run_to_completion(run_id);
+    const auto ended_at = std::chrono::steady_clock::now();
+    assert(result.status == ExecutionStatus::Completed);
+
+    const WorkflowState& state = engine.state(run_id);
+    const std::vector<TraceEvent> trace_events = engine.trace().events_for_run(run_id);
+    return MemoizationBenchmarkRun{
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(ended_at - started_at).count()
+        ),
+        static_cast<uint64_t>(trace_events.size()),
+        invocation_counter->load(),
+        read_int_field(state, kMemoizationBenchmarkInput),
+        read_int_field(state, kMemoizationBenchmarkOutput),
+        read_int_field(state, kMemoizationBenchmarkVisits)
+    };
+}
+
 SubgraphBenchmarkRun run_subgraph_benchmark_once(
     const GraphDefinition& parent_graph,
     const GraphDefinition& child_graph
 ) {
-    ExecutionEngine engine(2U);
+    ExecutionEngine engine = make_benchmark_engine(2U);
     engine.register_graph(child_graph);
 
     const auto started_at = std::chrono::steady_clock::now();
@@ -1824,7 +2031,7 @@ ResumableSubgraphBenchmarkRun run_resumable_subgraph_benchmark_once(
         int64_t{11}
     });
 
-    ExecutionEngine direct_engine(1U);
+    ExecutionEngine direct_engine = make_benchmark_engine(1U);
     direct_engine.register_graph(child_graph);
     const RunId direct_run_id = direct_engine.start(parent_graph, input);
     const StepResult direct_wait = direct_engine.step(direct_run_id);
@@ -1863,7 +2070,7 @@ ResumableSubgraphBenchmarkRun run_resumable_subgraph_benchmark_once(
 
     const auto started_at = std::chrono::steady_clock::now();
     {
-        ExecutionEngine first_engine(1U);
+        ExecutionEngine first_engine = make_benchmark_engine(1U);
         first_engine.register_graph(child_graph);
         first_engine.enable_checkpoint_persistence(checkpoint_path);
 
@@ -1878,7 +2085,7 @@ ResumableSubgraphBenchmarkRun run_resumable_subgraph_benchmark_once(
         );
     }
 
-    ExecutionEngine resumed_engine(1U);
+    ExecutionEngine resumed_engine = make_benchmark_engine(1U);
     resumed_engine.register_graph(parent_graph);
     resumed_engine.register_graph(child_graph);
     resumed_engine.enable_checkpoint_persistence(checkpoint_path);
@@ -1926,7 +2133,7 @@ AsyncSubgraphBenchmarkRun run_async_subgraph_benchmark_once(
     const GraphDefinition& parent_graph,
     const GraphDefinition& child_graph
 ) {
-    ExecutionEngine engine(1U);
+    ExecutionEngine engine = make_benchmark_engine(1U);
     engine.register_graph(child_graph);
     engine.tools().register_tool("async_echo", [](const ToolRequest& request, ToolInvocationContext& context) {
         std::this_thread::sleep_for(std::chrono::milliseconds(35));
@@ -1988,7 +2195,7 @@ AsyncMultiWaitSubgraphBenchmarkRun run_async_multi_wait_subgraph_benchmark_once(
     const GraphDefinition& parent_graph,
     const GraphDefinition& child_graph
 ) {
-    ExecutionEngine engine(1U);
+    ExecutionEngine engine = make_benchmark_engine(1U);
     engine.register_graph(child_graph);
     engine.tools().register_tool("async_echo", [](const ToolRequest& request, ToolInvocationContext& context) {
         std::this_thread::sleep_for(std::chrono::milliseconds(35));
@@ -2067,6 +2274,30 @@ int main() {
     assert(naive_frontier_graph.validate(&error_message));
     GraphDefinition reactive_frontier_graph = make_reactive_frontier_benchmark_graph();
     assert(reactive_frontier_graph.validate(&error_message));
+    GraphDefinition memoization_baseline_graph = make_memoization_benchmark_graph(
+        480U,
+        "memoization_baseline_benchmark_graph",
+        memoization_baseline_node,
+        memoization_stable_router_node,
+        {}
+    );
+    assert(memoization_baseline_graph.validate(&error_message));
+    GraphDefinition memoization_hit_graph = make_memoization_benchmark_graph(
+        481U,
+        "memoization_hit_benchmark_graph",
+        memoization_hit_node,
+        memoization_stable_router_node,
+        NodeMemoizationPolicy{true, std::vector<StateKey>{kMemoizationBenchmarkInput}, 64U}
+    );
+    assert(memoization_hit_graph.validate(&error_message));
+    GraphDefinition memoization_invalidation_graph = make_memoization_benchmark_graph(
+        482U,
+        "memoization_invalidation_benchmark_graph",
+        memoization_invalidation_node,
+        memoization_invalidation_router_node,
+        NodeMemoizationPolicy{true, std::vector<StateKey>{kMemoizationBenchmarkInput}, 64U}
+    );
+    assert(memoization_invalidation_graph.validate(&error_message));
     GraphDefinition subgraph_child_graph = make_subgraph_benchmark_child_graph();
     assert(subgraph_child_graph.validate(&error_message));
     GraphDefinition subgraph_parent_graph = make_subgraph_benchmark_parent_graph();
@@ -2175,6 +2406,52 @@ int main() {
         : static_cast<double>(recorded_effect_benchmark.miss_elapsed_ns) /
             static_cast<double>(recorded_effect_benchmark.hit_elapsed_ns);
 
+    const MemoizationBenchmarkRun memoization_baseline = run_memoization_benchmark_once(
+        memoization_baseline_graph,
+        7,
+        &g_memoization_baseline_invocations
+    );
+    const MemoizationBenchmarkRun memoization_hit = run_memoization_benchmark_once(
+        memoization_hit_graph,
+        7,
+        &g_memoization_hit_invocations
+    );
+    const MemoizationBenchmarkRun memoization_invalidation = run_memoization_benchmark_once(
+        memoization_invalidation_graph,
+        7,
+        &g_memoization_invalidation_invocations
+    );
+    assert(memoization_baseline.executor_invocations == kMemoizationBenchmarkVisitLimit);
+    assert(memoization_hit.executor_invocations == 1U);
+    assert(memoization_invalidation.executor_invocations == kMemoizationBenchmarkVisitLimit);
+    assert(memoization_baseline.final_input == 7);
+    assert(memoization_hit.final_input == memoization_baseline.final_input);
+    assert(memoization_baseline.final_output == memoization_hit.final_output);
+    assert(memoization_baseline.final_visits == static_cast<int64_t>(kMemoizationBenchmarkVisitLimit));
+    assert(memoization_hit.final_visits == memoization_baseline.final_visits);
+    assert(memoization_baseline.trace_events == memoization_hit.trace_events);
+    assert(memoization_invalidation.trace_events == memoization_baseline.trace_events);
+    assert(
+        memoization_invalidation.final_input ==
+        7 + static_cast<int64_t>(kMemoizationBenchmarkVisitLimit - 1U)
+    );
+    assert(
+        memoization_invalidation.final_output ==
+        benchmark_mix_value(memoization_invalidation.final_input)
+    );
+    assert(
+        memoization_invalidation.final_visits ==
+        static_cast<int64_t>(kMemoizationBenchmarkVisitLimit)
+    );
+    const double memoization_hit_speedup = memoization_hit.elapsed_ns == 0U
+        ? 0.0
+        : static_cast<double>(memoization_baseline.elapsed_ns) /
+            static_cast<double>(memoization_hit.elapsed_ns);
+    const double memoization_invalidation_vs_hit = memoization_hit.elapsed_ns == 0U
+        ? 0.0
+        : static_cast<double>(memoization_invalidation.elapsed_ns) /
+            static_cast<double>(memoization_hit.elapsed_ns);
+
     const SubgraphBenchmarkRun subgraph_benchmark =
         run_subgraph_benchmark_once(subgraph_parent_graph, subgraph_child_graph);
     assert(subgraph_benchmark.output_value == static_cast<int64_t>(kSubgraphBenchmarkRuns + 11U));
@@ -2203,6 +2480,7 @@ int main() {
     assert(async_multi_wait_subgraph_benchmark.namespaced_events == 9U);
 
     std::cout << "agentcore_runtime_benchmark" << '\n'
+              << "execution_profile=" << benchmark_profile_name() << '\n'
               << "workers_sequential=1" << '\n'
               << "workers_parallel=" << worker_count << '\n'
               << "summary=" << parallel.summary << '\n'
@@ -2252,6 +2530,21 @@ int main() {
               << "recorded_effect_miss_producer_calls=" << recorded_effect_benchmark.miss_producer_calls << '\n'
               << "recorded_effect_hit_producer_calls=" << recorded_effect_benchmark.hit_producer_calls << '\n'
               << "recorded_effect_journal_records=" << recorded_effect_benchmark.journal_records << '\n'
+              << "memoization_visits=" << kMemoizationBenchmarkVisitLimit << '\n'
+              << "memoization_mix_rounds=" << kMemoizationBenchmarkMixRounds << '\n'
+              << "memoization_baseline_ns=" << memoization_baseline.elapsed_ns << '\n'
+              << "memoization_hit_ns=" << memoization_hit.elapsed_ns << '\n'
+              << "memoization_invalidation_ns=" << memoization_invalidation.elapsed_ns << '\n'
+              << "memoization_hit_speedup_x=" << memoization_hit_speedup << '\n'
+              << "memoization_invalidation_vs_hit_x=" << memoization_invalidation_vs_hit << '\n'
+              << "memoization_baseline_executor_invocations=" << memoization_baseline.executor_invocations << '\n'
+              << "memoization_hit_executor_invocations=" << memoization_hit.executor_invocations << '\n'
+              << "memoization_invalidation_executor_invocations=" << memoization_invalidation.executor_invocations << '\n'
+              << "memoization_trace_events=" << memoization_hit.trace_events << '\n'
+              << "memoization_hit_output_equal=" << static_cast<int>(
+                    memoization_baseline.final_output == memoization_hit.final_output
+                 ) << '\n'
+              << "memoization_invalidation_final_input=" << memoization_invalidation.final_input << '\n'
               << "subgraph_benchmark_runs=" << kSubgraphBenchmarkRuns << '\n'
               << "subgraph_benchmark_ns=" << subgraph_benchmark.elapsed_ns << '\n'
               << "subgraph_stream_read_ns=" << subgraph_benchmark.stream_read_ns << '\n'

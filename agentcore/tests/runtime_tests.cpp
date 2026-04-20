@@ -8,7 +8,9 @@
 #include <cassert>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -19,6 +21,45 @@
 namespace agentcore {
 
 namespace {
+
+bool verbose_runtime_test_logging_enabled() {
+    static const bool enabled = std::getenv("AGENTCORE_RUNTIME_TEST_VERBOSE") != nullptr;
+    return enabled;
+}
+
+void verbose_runtime_test_log(std::string_view message) {
+    if (verbose_runtime_test_logging_enabled()) {
+        std::cout << "[runtime_test_verbose] " << message << '\n';
+    }
+}
+
+void verbose_log_snapshot_summary(std::string_view label, const RunSnapshot& snapshot) {
+    if (!verbose_runtime_test_logging_enabled()) {
+        return;
+    }
+
+    verbose_runtime_test_log(
+        std::string(label) +
+        " status=" + std::to_string(static_cast<uint32_t>(snapshot.status)) +
+        " branches=" + std::to_string(snapshot.branches.size()) +
+        " pending_tasks=" + std::to_string(snapshot.pending_tasks.size()) +
+        " next_branch_id=" + std::to_string(snapshot.next_branch_id) +
+        " next_split_id=" + std::to_string(snapshot.next_split_id)
+    );
+    for (const BranchSnapshot& branch : snapshot.branches) {
+        verbose_runtime_test_log(
+            std::string(label) +
+            " branch=" + std::to_string(branch.frame.active_branch_id) +
+            " node=" + std::to_string(branch.frame.current_node) +
+            " step=" + std::to_string(branch.frame.step_index) +
+            " checkpoint=" + std::to_string(branch.frame.checkpoint_id) +
+            " status=" + std::to_string(static_cast<uint32_t>(branch.frame.status)) +
+            " pending_async=" + std::to_string(branch.pending_async.has_value() ? 1 : 0) +
+            " pending_group=" + std::to_string(branch.pending_async_group.size()) +
+            " pending_subgraph=" + std::to_string(branch.pending_subgraph.has_value() ? 1 : 0)
+        );
+    }
+}
 
 enum ResumeStateKey : StateKey {
     kResumeAttempt = 0,
@@ -486,6 +527,50 @@ NodeResult parallel_branch_node(ExecutionContext&) {
     std::this_thread::sleep_for(std::chrono::milliseconds(75));
     g_active_parallel_nodes.fetch_sub(1);
     return NodeResult::success();
+}
+
+NodeResult parallel_trace_left_node(ExecutionContext& context) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(70));
+    context.trace.emit(TraceEvent{
+        0U,
+        0U,
+        0U,
+        context.run_id,
+        context.graph_id,
+        context.node_id,
+        context.branch_id,
+        0U,
+        NodeResult::Success,
+        0.91F,
+        0U,
+        1U << 18U,
+        {},
+        0U,
+        {}
+    });
+    return NodeResult::success({}, 0.91F);
+}
+
+NodeResult parallel_trace_right_node(ExecutionContext& context) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    context.trace.emit(TraceEvent{
+        0U,
+        0U,
+        0U,
+        context.run_id,
+        context.graph_id,
+        context.node_id,
+        context.branch_id,
+        0U,
+        NodeResult::Success,
+        0.92F,
+        0U,
+        1U << 17U,
+        {},
+        0U,
+        {}
+    });
+    return NodeResult::success({}, 0.92F);
 }
 
 NodeResult async_tool_roundtrip_node(ExecutionContext& context) {
@@ -1532,6 +1617,48 @@ GraphDefinition make_parallel_fanout_graph() {
     return graph;
 }
 
+GraphDefinition make_parallel_trace_emission_graph() {
+    GraphDefinition graph;
+    graph.id = 41U;
+    graph.name = "parallel_trace_emission_test";
+    graph.entry = 1U;
+    graph.nodes = {
+        NodeDefinition{
+            1U,
+            NodeKind::Control,
+            "fanout",
+            node_policy_mask(NodePolicyFlag::AllowFanOut),
+            0U,
+            0U,
+            fanout_node,
+            {}
+        },
+        NodeDefinition{2U, NodeKind::Compute, "trace_left", 0U, 0U, 0U, parallel_trace_left_node, {}},
+        NodeDefinition{3U, NodeKind::Compute, "trace_right", 0U, 0U, 0U, parallel_trace_right_node, {}},
+        NodeDefinition{
+            4U,
+            NodeKind::Control,
+            "stop",
+            node_policy_mask(NodePolicyFlag::StopAfterNode),
+            0U,
+            0U,
+            stop_node,
+            {}
+        }
+    };
+    graph.edges = {
+        EdgeDefinition{1U, 1U, 2U, EdgeKind::OnSuccess, nullptr, 100U},
+        EdgeDefinition{2U, 1U, 3U, EdgeKind::OnSuccess, nullptr, 90U},
+        EdgeDefinition{3U, 2U, 4U, EdgeKind::OnSuccess, nullptr, 100U},
+        EdgeDefinition{4U, 3U, 4U, EdgeKind::OnSuccess, nullptr, 100U}
+    };
+    graph.bind_outgoing_edges(1U, std::vector<EdgeId>{1U, 2U});
+    graph.bind_outgoing_edges(2U, std::vector<EdgeId>{3U});
+    graph.bind_outgoing_edges(3U, std::vector<EdgeId>{4U});
+    graph.sort_edges_by_priority();
+    return graph;
+}
+
 GraphDefinition make_async_tool_graph() {
     GraphDefinition graph;
     graph.id = 13;
@@ -1953,59 +2080,66 @@ void test_subgraph_composition_and_public_streaming() {
     input.initial_field_count = 3U;
     input.initial_patch.updates.push_back(FieldUpdate{kSubgraphInput, int64_t{5}});
 
+    auto verify_parent_run = [&](RunId run_id, const RunResult& result) {
+        assert(result.status == ExecutionStatus::Completed);
+
+        const WorkflowState& state = engine.state(run_id);
+        assert(read_int_field(state, kSubgraphOutput) == 46);
+        assert(std::holds_alternative<BlobRef>(state.load(kSubgraphSummary)));
+        assert(
+            engine.state_store(run_id).blobs().read_string(std::get<BlobRef>(state.load(kSubgraphSummary))) ==
+            "subgraph-output=46"
+        );
+
+        const std::vector<const KnowledgeTriple*> propagated =
+            engine.knowledge_graph(run_id).match(std::nullopt, std::nullopt, std::nullopt);
+        assert(propagated.empty());
+
+        StreamCursor cursor;
+        const std::vector<StreamEvent> stream_events =
+            engine.stream_events(run_id, cursor, StreamReadOptions{true});
+        assert(!stream_events.empty());
+
+        std::size_t subgraph_event_count = 0U;
+        std::size_t root_event_count = 0U;
+        for (const StreamEvent& event : stream_events) {
+            if (event.namespaces.empty()) {
+                ++root_event_count;
+                assert(event.graph_id == 902U);
+            } else {
+                ++subgraph_event_count;
+                assert(event.graph_id == 901U);
+                assert(event.namespaces.size() == 1U);
+                assert(event.namespaces.front().graph_id == 902U);
+                assert(event.namespaces.front().node_name == "planner_subgraph");
+            }
+        }
+        assert(root_event_count == 3U);
+        assert(subgraph_event_count == 2U);
+
+        StreamCursor root_only_cursor;
+        const std::vector<StreamEvent> root_only_events =
+            engine.stream_events(run_id, root_only_cursor, StreamReadOptions{false});
+        assert(root_only_events.size() == root_event_count);
+        for (const StreamEvent& event : root_only_events) {
+            assert(event.namespaces.empty());
+            assert(event.graph_id == 902U);
+        }
+
+        const auto final_record = engine.checkpoints().get(result.last_checkpoint_id);
+        assert(final_record.has_value());
+        return compute_run_proof_digest(*final_record, engine.trace().events_for_run(run_id));
+    };
+
     const RunId run_id = engine.start(make_subgraph_parent_graph(), input);
     const RunResult result = engine.run_to_completion(run_id);
-    assert(result.status == ExecutionStatus::Completed);
-
-    const WorkflowState& state = engine.state(run_id);
-    assert(read_int_field(state, kSubgraphOutput) == 46);
-    assert(std::holds_alternative<BlobRef>(state.load(kSubgraphSummary)));
-    assert(
-        engine.state_store(run_id).blobs().read_string(std::get<BlobRef>(state.load(kSubgraphSummary))) ==
-        "subgraph-output=46"
-    );
-
-    const std::vector<const KnowledgeTriple*> propagated =
-        engine.knowledge_graph(run_id).match(std::nullopt, std::nullopt, std::nullopt);
-    assert(propagated.empty());
-
-    StreamCursor cursor;
-    const std::vector<StreamEvent> stream_events = engine.stream_events(run_id, cursor, StreamReadOptions{true});
-    assert(!stream_events.empty());
-
-    std::size_t subgraph_event_count = 0U;
-    std::size_t root_event_count = 0U;
-    for (const StreamEvent& event : stream_events) {
-        if (event.namespaces.empty()) {
-            ++root_event_count;
-            assert(event.graph_id == 902U);
-        } else {
-            ++subgraph_event_count;
-            assert(event.graph_id == 901U);
-            assert(event.namespaces.size() == 1U);
-            assert(event.namespaces.front().graph_id == 902U);
-            assert(event.namespaces.front().node_name == "planner_subgraph");
-        }
-    }
-    assert(root_event_count == 3U);
-    assert(subgraph_event_count == 2U);
-
-    StreamCursor root_only_cursor;
-    const std::vector<StreamEvent> root_only_events =
-        engine.stream_events(run_id, root_only_cursor, StreamReadOptions{false});
-    assert(root_only_events.size() == root_event_count);
-    for (const StreamEvent& event : root_only_events) {
-        assert(event.namespaces.empty());
-        assert(event.graph_id == 902U);
-    }
-
-    const auto final_record = engine.checkpoints().get(result.last_checkpoint_id);
-    assert(final_record.has_value());
-    const RunProofDigest first_digest = compute_run_proof_digest(
-        *final_record,
-        engine.trace().events_for_run(run_id)
-    );
+    const RunProofDigest first_digest = verify_parent_run(run_id, result);
     assert(first_digest.combined_digest != 0U);
+
+    const RunId repeated_run_id = engine.start(make_subgraph_parent_graph(), input);
+    const RunResult repeated_result = engine.run_to_completion(repeated_run_id);
+    const RunProofDigest repeated_digest = verify_parent_run(repeated_run_id, repeated_result);
+    assert(repeated_digest.combined_digest != 0U);
 
     ExecutionEngine second_engine(2);
     second_engine.register_graph(make_subgraph_child_graph());
@@ -2022,6 +2156,7 @@ void test_subgraph_composition_and_public_streaming() {
 }
 
 void test_resumable_subgraph_checkpoint_restart_equivalence() {
+    verbose_runtime_test_log("resumable_subgraph: build graphs");
     const GraphDefinition child_graph = make_resumable_subgraph_child_graph();
     const GraphDefinition parent_graph = make_resumable_subgraph_parent_graph();
 
@@ -2032,6 +2167,7 @@ void test_resumable_subgraph_checkpoint_restart_equivalence() {
     ExecutionEngine direct_engine(1);
     direct_engine.register_graph(child_graph);
     const RunId direct_run_id = direct_engine.start(parent_graph, input);
+    verbose_runtime_test_log("resumable_subgraph: direct first step");
     const StepResult direct_wait = direct_engine.step(direct_run_id);
     assert(direct_wait.progressed);
     assert(direct_wait.node_status == NodeResult::Waiting);
@@ -2055,6 +2191,7 @@ void test_resumable_subgraph_checkpoint_restart_equivalence() {
 
     const ResumeResult direct_resume = direct_engine.resume(direct_wait.checkpoint_id);
     assert(direct_resume.resumed);
+    verbose_runtime_test_log("resumable_subgraph: direct run_to_completion");
     const RunResult direct_result = direct_engine.run_to_completion(direct_run_id);
     assert(direct_result.status == ExecutionStatus::Completed);
     const WorkflowState& direct_state = direct_engine.state(direct_run_id);
@@ -2080,6 +2217,8 @@ void test_resumable_subgraph_checkpoint_restart_equivalence() {
 
     const auto direct_record = direct_engine.checkpoints().get(direct_result.last_checkpoint_id);
     assert(direct_record.has_value());
+    assert(direct_record->snapshot.has_value());
+    verbose_log_snapshot_summary("resumable_subgraph:direct", *direct_record->snapshot);
     const RunProofDigest direct_digest = compute_run_proof_digest(
         *direct_record,
         normalize_trace_for_resume_proof(direct_engine.trace().events_for_run(direct_run_id))
@@ -2092,11 +2231,13 @@ void test_resumable_subgraph_checkpoint_restart_equivalence() {
     CheckpointId resumed_checkpoint_id = 0U;
     std::vector<TraceEvent> prefix_trace;
     {
+        verbose_runtime_test_log("resumable_subgraph: persisted first engine start");
         ExecutionEngine first_engine(1);
         first_engine.register_graph(child_graph);
         first_engine.enable_checkpoint_persistence(checkpoint_path);
 
         resumed_run_id = first_engine.start(parent_graph, input);
+        verbose_runtime_test_log("resumable_subgraph: persisted first step");
         const StepResult first_wait = first_engine.step(resumed_run_id);
         assert(first_wait.progressed);
         assert(first_wait.node_status == NodeResult::Waiting);
@@ -2118,12 +2259,23 @@ void test_resumable_subgraph_checkpoint_restart_equivalence() {
     resumed_engine.register_graph(parent_graph);
     resumed_engine.register_graph(child_graph);
     resumed_engine.enable_checkpoint_persistence(checkpoint_path);
-    assert(resumed_engine.load_persisted_checkpoints() >= 1U);
+    const std::size_t loaded_records = resumed_engine.load_persisted_checkpoints();
+    verbose_runtime_test_log(
+        "resumable_subgraph: loaded_records=" + std::to_string(loaded_records)
+    );
+    assert(loaded_records >= 1U);
 
     const ResumeResult resume_result = resumed_engine.resume(resumed_checkpoint_id);
+    verbose_runtime_test_log(
+        "resumable_subgraph: resume_result resumed=" +
+        std::to_string(resume_result.resumed ? 1 : 0) +
+        " status=" + std::to_string(static_cast<uint32_t>(resume_result.status)) +
+        " run_id=" + std::to_string(resume_result.run_id)
+    );
     assert(resume_result.resumed);
     assert(resume_result.run_id == resumed_run_id);
 
+    verbose_runtime_test_log("resumable_subgraph: resumed run_to_completion");
     const RunResult resumed_result = resumed_engine.run_to_completion(resumed_run_id);
     assert(resumed_result.status == ExecutionStatus::Completed);
     const WorkflowState& resumed_state = resumed_engine.state(resumed_run_id);
@@ -2132,6 +2284,8 @@ void test_resumable_subgraph_checkpoint_restart_equivalence() {
     const auto resumed_record = resumed_engine.checkpoints().get(resumed_result.last_checkpoint_id);
     assert(resumed_record.has_value());
     assert(resumed_record->resumable());
+    assert(resumed_record->snapshot.has_value());
+    verbose_log_snapshot_summary("resumable_subgraph:resumed", *resumed_record->snapshot);
 
     const std::vector<TraceEvent> resumed_trace = append_trace_events(
         prefix_trace,
@@ -2149,6 +2303,7 @@ void test_resumable_subgraph_checkpoint_restart_equivalence() {
 }
 
 void test_async_subgraph_auto_resume_through_parent_scheduler() {
+    verbose_runtime_test_log("async_subgraph: build graphs");
     const GraphDefinition child_graph = make_async_subgraph_child_graph();
     const GraphDefinition parent_graph = make_async_subgraph_parent_graph();
 
@@ -2173,11 +2328,13 @@ void test_async_subgraph_auto_resume_through_parent_scheduler() {
     InputEnvelope input;
     input.initial_field_count = 2U;
 
+    verbose_runtime_test_log("async_subgraph: direct engine start");
     ExecutionEngine direct_engine(1);
     direct_engine.register_graph(child_graph);
     register_async_echo(direct_engine);
 
     const RunId direct_run_id = direct_engine.start(parent_graph, input);
+    verbose_runtime_test_log("async_subgraph: direct first step");
     const StepResult first_step = direct_engine.step(direct_run_id);
     assert(first_step.progressed);
     assert(first_step.node_status == NodeResult::Waiting);
@@ -2192,6 +2349,7 @@ void test_async_subgraph_auto_resume_through_parent_scheduler() {
     assert(waiting_record->snapshot->branches.front().pending_async.has_value());
     assert(waiting_record->snapshot->branches.front().pending_subgraph.has_value());
 
+    verbose_runtime_test_log("async_subgraph: direct run_to_completion");
     const RunResult direct_result = direct_engine.run_to_completion(direct_run_id);
     assert(direct_result.status == ExecutionStatus::Completed);
     const WorkflowState& direct_state = direct_engine.state(direct_run_id);
@@ -2234,12 +2392,14 @@ void test_async_subgraph_auto_resume_through_parent_scheduler() {
     CheckpointId resumed_checkpoint_id = 0U;
     std::vector<TraceEvent> prefix_trace;
     {
+        verbose_runtime_test_log("async_subgraph: persisted first engine start");
         ExecutionEngine first_engine(1);
         first_engine.register_graph(child_graph);
         first_engine.enable_checkpoint_persistence(checkpoint_path);
         register_async_echo(first_engine);
 
         resumed_run_id = first_engine.start(parent_graph, input);
+        verbose_runtime_test_log("async_subgraph: persisted first step");
         const StepResult resumed_wait = first_engine.step(resumed_run_id);
         assert(resumed_wait.progressed);
         assert(resumed_wait.node_status == NodeResult::Waiting);
@@ -2256,10 +2416,13 @@ void test_async_subgraph_auto_resume_through_parent_scheduler() {
     resumed_engine.register_graph(child_graph);
     resumed_engine.enable_checkpoint_persistence(checkpoint_path);
     register_async_echo(resumed_engine);
+    verbose_runtime_test_log("async_subgraph: load persisted checkpoints");
     assert(resumed_engine.load_persisted_checkpoints() >= 1U);
 
+    verbose_runtime_test_log("async_subgraph: resume persisted checkpoint");
     const ResumeResult resume_result = resumed_engine.resume(resumed_checkpoint_id);
     assert(resume_result.resumed);
+    verbose_runtime_test_log("async_subgraph: resumed run_to_completion");
     const RunResult resumed_result = resumed_engine.run_to_completion(resumed_run_id);
     assert(resumed_result.status == ExecutionStatus::Completed);
     const auto resumed_record = resumed_engine.checkpoints().get(resumed_result.last_checkpoint_id);
@@ -2874,6 +3037,46 @@ void test_proof_digest_determinism_across_parallelism() {
     assert(sequential_digest.combined_digest == parallel_digest.combined_digest);
 }
 
+void test_node_emitted_trace_determinism_across_parallelism() {
+    constexpr uint32_t kLeftTraceFlag = 1U << 18U;
+    constexpr uint32_t kRightTraceFlag = 1U << 17U;
+
+    auto run_once = [](std::size_t worker_count) {
+        InputEnvelope input;
+        input.initial_field_count = 4U;
+
+        ExecutionEngine engine(worker_count);
+        const RunId run_id = engine.start(make_parallel_trace_emission_graph(), input);
+        const RunResult result = engine.run_to_completion(run_id);
+        assert(result.status == ExecutionStatus::Completed);
+
+        StreamCursor cursor;
+        const std::vector<StreamEvent> stream_events =
+            engine.stream_events(run_id, cursor, StreamReadOptions{true});
+        std::vector<uint32_t> custom_trace_flags;
+        for (const StreamEvent& event : stream_events) {
+            if (event.flags == kLeftTraceFlag || event.flags == kRightTraceFlag) {
+                custom_trace_flags.push_back(event.flags);
+            }
+        }
+
+        return std::pair{
+            digest_for_result(engine, run_id, result.last_checkpoint_id),
+            custom_trace_flags
+        };
+    };
+
+    const auto [sequential_digest, sequential_custom_trace_flags] = run_once(1U);
+    const auto [parallel_digest, parallel_custom_trace_flags] = run_once(4U);
+    const std::vector<uint32_t> expected_custom_trace_flags{kLeftTraceFlag, kRightTraceFlag};
+
+    assert(sequential_digest.snapshot_digest == parallel_digest.snapshot_digest);
+    assert(sequential_digest.trace_digest == parallel_digest.trace_digest);
+    assert(sequential_digest.combined_digest == parallel_digest.combined_digest);
+    assert(sequential_custom_trace_flags == expected_custom_trace_flags);
+    assert(parallel_custom_trace_flags == sequential_custom_trace_flags);
+}
+
 void test_proof_digest_restart_equivalence() {
     ExecutionEngine direct_engine(2);
     direct_engine.tools().register_tool("async_echo", [](const ToolRequest& request, ToolInvocationContext& context) {
@@ -3307,37 +3510,107 @@ void test_interrupt_edit_resume_with_sqlite_checkpointer() {
 } // namespace agentcore
 
 int main() {
-    agentcore::test_resume_flow();
-    agentcore::test_knowledge_graph_integration();
-    agentcore::test_subgraph_composition_and_public_streaming();
-    agentcore::test_resumable_subgraph_checkpoint_restart_equivalence();
-    agentcore::test_async_subgraph_auto_resume_through_parent_scheduler();
-    agentcore::test_async_multi_wait_subgraph_checkpoint_resume_equivalence();
-    agentcore::test_knowledge_graph_reactive_frontier();
-    agentcore::test_knowledge_graph_duplicate_writes_do_not_retrigger_frontier();
-    agentcore::test_knowledge_graph_reactive_frontier_drains_stably();
-    agentcore::test_knowledge_graph_reactive_checkpoint_resume_preserves_pending_frontier();
-    agentcore::test_parallel_scheduler_fanout();
-    agentcore::test_join_scope_merges_branch_state_and_knowledge_graph();
-    agentcore::test_structural_join_validation();
-    agentcore::test_join_runtime_rejects_conflicting_writes_without_rule();
-    agentcore::test_hardened_adapters();
-    agentcore::test_durable_checkpoint_reload();
-    agentcore::test_async_tool_auto_resume();
-    agentcore::test_async_tool_checkpoint_resume_after_restart();
-    agentcore::test_async_model_snapshot_restore();
-    agentcore::test_proof_digest_determinism_across_parallelism();
-    agentcore::test_proof_digest_restart_equivalence();
-    agentcore::test_checkpoint_cadence_preserves_resumable_restore();
-    agentcore::test_recorded_effect_checkpoint_restart_equivalence_with_file_checkpointer();
+    const char* filter_env = std::getenv("AGENTCORE_RUNTIME_TEST_FILTER");
+    const std::string_view filter = filter_env == nullptr ? std::string_view{} : std::string_view{filter_env};
+    const auto should_run = [&](std::string_view name) {
+        return filter.empty() || name.find(filter) != std::string_view::npos;
+    };
+
+    struct NamedTest {
+        std::string_view name;
+        std::function<void()> fn;
+    };
+
+    const std::vector<NamedTest> tests = {
+        {"test_resume_flow", [] { agentcore::test_resume_flow(); }},
+        {"test_knowledge_graph_integration", [] { agentcore::test_knowledge_graph_integration(); }},
+        {"test_subgraph_composition_and_public_streaming", [] {
+             agentcore::test_subgraph_composition_and_public_streaming();
+         }},
+        {"test_resumable_subgraph_checkpoint_restart_equivalence", [] {
+             agentcore::test_resumable_subgraph_checkpoint_restart_equivalence();
+         }},
+        {"test_async_subgraph_auto_resume_through_parent_scheduler", [] {
+             agentcore::test_async_subgraph_auto_resume_through_parent_scheduler();
+         }},
+        {"test_async_multi_wait_subgraph_checkpoint_resume_equivalence", [] {
+             agentcore::test_async_multi_wait_subgraph_checkpoint_resume_equivalence();
+         }},
+        {"test_knowledge_graph_reactive_frontier", [] {
+             agentcore::test_knowledge_graph_reactive_frontier();
+         }},
+        {"test_knowledge_graph_duplicate_writes_do_not_retrigger_frontier", [] {
+             agentcore::test_knowledge_graph_duplicate_writes_do_not_retrigger_frontier();
+         }},
+        {"test_knowledge_graph_reactive_frontier_drains_stably", [] {
+             agentcore::test_knowledge_graph_reactive_frontier_drains_stably();
+         }},
+        {"test_knowledge_graph_reactive_checkpoint_resume_preserves_pending_frontier", [] {
+             agentcore::test_knowledge_graph_reactive_checkpoint_resume_preserves_pending_frontier();
+         }},
+        {"test_parallel_scheduler_fanout", [] { agentcore::test_parallel_scheduler_fanout(); }},
+        {"test_join_scope_merges_branch_state_and_knowledge_graph", [] {
+             agentcore::test_join_scope_merges_branch_state_and_knowledge_graph();
+         }},
+        {"test_structural_join_validation", [] { agentcore::test_structural_join_validation(); }},
+        {"test_join_runtime_rejects_conflicting_writes_without_rule", [] {
+             agentcore::test_join_runtime_rejects_conflicting_writes_without_rule();
+         }},
+        {"test_hardened_adapters", [] { agentcore::test_hardened_adapters(); }},
+        {"test_durable_checkpoint_reload", [] { agentcore::test_durable_checkpoint_reload(); }},
+        {"test_async_tool_auto_resume", [] { agentcore::test_async_tool_auto_resume(); }},
+        {"test_async_tool_checkpoint_resume_after_restart", [] {
+             agentcore::test_async_tool_checkpoint_resume_after_restart();
+         }},
+        {"test_async_model_snapshot_restore", [] { agentcore::test_async_model_snapshot_restore(); }},
+        {"test_proof_digest_determinism_across_parallelism", [] {
+             agentcore::test_proof_digest_determinism_across_parallelism();
+         }},
+        {"test_node_emitted_trace_determinism_across_parallelism", [] {
+             agentcore::test_node_emitted_trace_determinism_across_parallelism();
+         }},
+        {"test_proof_digest_restart_equivalence", [] {
+             agentcore::test_proof_digest_restart_equivalence();
+         }},
+        {"test_checkpoint_cadence_preserves_resumable_restore", [] {
+             agentcore::test_checkpoint_cadence_preserves_resumable_restore();
+         }},
+        {"test_recorded_effect_checkpoint_restart_equivalence_with_file_checkpointer", [] {
+             agentcore::test_recorded_effect_checkpoint_restart_equivalence_with_file_checkpointer();
+         }},
 #if defined(AGENTCORE_HAVE_SQLITE3)
-    agentcore::test_recorded_effect_checkpoint_restart_equivalence_with_sqlite_checkpointer();
+        {"test_recorded_effect_checkpoint_restart_equivalence_with_sqlite_checkpointer", [] {
+             agentcore::test_recorded_effect_checkpoint_restart_equivalence_with_sqlite_checkpointer();
+         }},
 #endif
-    agentcore::test_recorded_effect_request_mismatch_fails_fast();
-    agentcore::test_interrupt_edit_resume_with_file_checkpointer();
+        {"test_recorded_effect_request_mismatch_fails_fast", [] {
+             agentcore::test_recorded_effect_request_mismatch_fails_fast();
+         }},
+        {"test_interrupt_edit_resume_with_file_checkpointer", [] {
+             agentcore::test_interrupt_edit_resume_with_file_checkpointer();
+         }},
 #if defined(AGENTCORE_HAVE_SQLITE3)
-    agentcore::test_interrupt_edit_resume_with_sqlite_checkpointer();
+        {"test_interrupt_edit_resume_with_sqlite_checkpointer", [] {
+             agentcore::test_interrupt_edit_resume_with_sqlite_checkpointer();
+         }},
 #endif
+    };
+
+    bool ran_any = false;
+    for (const NamedTest& test : tests) {
+        if (!should_run(test.name)) {
+            continue;
+        }
+        ran_any = true;
+        std::cout << "[runtime_test] " << test.name << '\n';
+        test.fn();
+    }
+
+    if (!ran_any) {
+        std::cerr << "runtime test filter matched no tests\n";
+        return 1;
+    }
+
     std::cout << "runtime tests passed\n";
     return 0;
 }

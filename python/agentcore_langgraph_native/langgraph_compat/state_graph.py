@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import inspect
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 
@@ -15,6 +16,8 @@ _native = _LazyNative()
 
 START = "__start__"
 END = "__end__"
+
+_MISSING = object()
 
 
 @dataclass(frozen=True)
@@ -67,6 +70,75 @@ def _normalize_batch_configs(config: Any, size: int) -> list[dict[str, Any]]:
         return [_normalize_config(entry) for entry in config]
     normalized = _normalize_config(config)
     return [dict(normalized) for _ in range(size)]
+
+
+class _OverlayMapping(Mapping):
+    def __init__(self, base: Any, overlay: dict[str, Any]):
+        self._base = base
+        self._overlay = overlay
+
+    def __getitem__(self, key: str) -> Any:
+        if key in self._overlay:
+            return self._overlay[key]
+        return self._base[key]
+
+    def __iter__(self):
+        seen: set[str] = set()
+        for key in self._overlay:
+            seen.add(key)
+            yield key
+        for key in self._base.keys():
+            if key not in seen:
+                yield key
+
+    def __len__(self) -> int:
+        count = len(self._overlay)
+        for key in self._base.keys():
+            if key not in self._overlay:
+                count += 1
+        return count
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key in self._overlay:
+            return self._overlay[key]
+        return self._base.get(key, default)
+
+    def copy(self) -> dict[str, Any]:
+        copied = dict(self._base.items())
+        copied.update(self._overlay)
+        return copied
+
+
+class _StateView(Mapping):
+    def __init__(self, base: Any):
+        self._base = base
+
+    def __getitem__(self, key: str) -> Any:
+        value = self._base.get(key, _MISSING)
+        if value is _MISSING or value is None:
+            raise KeyError(key)
+        return value
+
+    def __iter__(self):
+        yield from self._base.keys()
+
+    def __len__(self) -> int:
+        return len(self._base.keys())
+
+    def get(self, key: str, default: Any = None) -> Any:
+        value = self._base.get(key, _MISSING)
+        if value is _MISSING or value is None:
+            return default
+        return value
+
+    def keys(self):
+        return self._base.keys()
+
+    def items(self):
+        return self._base.items()
+
+    def copy(self) -> dict[str, Any]:
+        return dict(self._base.items())
 
 
 class StateGraph:
@@ -135,10 +207,11 @@ class StateGraph:
         routing_spec = self._conditional_edges.get(node_name)
 
         def wrapped(state: dict[str, Any], config: dict[str, Any] | None = None) -> Any:
+            state_view = _StateView(state)
             updates: dict[str, Any] = {}
 
             if action is not None:
-                updates, explicit_goto, should_wait = _normalize_result(action(state, config))
+                updates, explicit_goto, should_wait = _normalize_result(action(state_view, config))
                 if should_wait:
                     return updates, None, True
                 if explicit_goto is not None:
@@ -148,8 +221,7 @@ class StateGraph:
                 return updates
 
             route_fn, route_map = routing_spec
-            merged_state = dict(state)
-            merged_state.update(updates)
+            merged_state = state_view if not updates else _OverlayMapping(state_view, updates)
             route_value = route_fn(merged_state, config)
             if route_map:
                 if route_value not in route_map:

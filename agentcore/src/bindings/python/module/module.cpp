@@ -220,6 +220,38 @@ bool parse_merge_rules(
     return true;
 }
 
+bool parse_string_sequence(
+    PyObject* object,
+    std::vector<std::string>* values,
+    std::string* error_message
+) {
+    values->clear();
+    if (object == nullptr || object == Py_None) {
+        return true;
+    }
+
+    PyObject* sequence = PySequence_Fast(object, "expected a sequence of strings");
+    if (sequence == nullptr) {
+        *error_message = GraphHandle::fetch_python_error();
+        return false;
+    }
+
+    const Py_ssize_t item_count = PySequence_Fast_GET_SIZE(sequence);
+    PyObject** item_values = PySequence_Fast_ITEMS(sequence);
+    values->reserve(static_cast<std::size_t>(item_count));
+    for (Py_ssize_t index = 0; index < item_count; ++index) {
+        std::string value;
+        if (!parse_python_string(item_values[index], &value, error_message)) {
+            Py_DECREF(sequence);
+            return false;
+        }
+        values->push_back(std::move(value));
+    }
+
+    Py_DECREF(sequence);
+    return true;
+}
+
 bool mapping_contains_key(PyObject* mapping, const char* key, std::string* error_message) {
     const int contains = PyMapping_HasKeyString(mapping, key);
     if (contains < 0) {
@@ -737,6 +769,9 @@ PyObject* py_add_node(PyObject*, PyObject* args, PyObject* kwargs) {
     int create_join_scope = 0;
     int join_incoming_branches = 0;
     PyObject* merge_rules_object = Py_None;
+    int deterministic = 0;
+    PyObject* read_keys_object = Py_None;
+    unsigned int cache_size = 16U;
     static const char* keywords[] = {
         "graph",
         "name",
@@ -747,12 +782,15 @@ PyObject* py_add_node(PyObject*, PyObject* args, PyObject* kwargs) {
         "create_join_scope",
         "join_incoming_branches",
         "merge_rules",
+        "deterministic",
+        "read_keys",
+        "cache_size",
         nullptr
     };
     if (!PyArg_ParseTupleAndKeywords(
             args,
             kwargs,
-            "Os|OOppppO",
+            "OsO|OppppOpOI",
             const_cast<char**>(keywords),
             &capsule,
             &name,
@@ -762,7 +800,10 @@ PyObject* py_add_node(PyObject*, PyObject* args, PyObject* kwargs) {
             &allow_fan_out,
             &create_join_scope,
             &join_incoming_branches,
-            &merge_rules_object
+            &merge_rules_object,
+            &deterministic,
+            &read_keys_object,
+            &cache_size
         )) {
         return nullptr;
     }
@@ -785,6 +826,28 @@ PyObject* py_add_node(PyObject*, PyObject* args, PyObject* kwargs) {
         return nullptr;
     }
 
+    std::vector<std::string> read_keys;
+    if (!parse_string_sequence(read_keys_object, &read_keys, &error_message)) {
+        PyErr_SetString(PyExc_ValueError, error_message.c_str());
+        return nullptr;
+    }
+    if (deterministic == 0 && !read_keys.empty()) {
+        PyErr_SetString(PyExc_ValueError, "read_keys require deterministic=True");
+        return nullptr;
+    }
+    if (cache_size == 0U) {
+        PyErr_SetString(PyExc_ValueError, "cache_size must be at least 1");
+        return nullptr;
+    }
+
+    NodeMemoizationPolicy memoization;
+    memoization.deterministic = deterministic != 0;
+    memoization.max_entries = cache_size;
+    memoization.read_keys.reserve(read_keys.size());
+    for (const std::string& read_key : read_keys) {
+        memoization.read_keys.push_back(handle->ensure_state_key(read_key));
+    }
+
     uint32_t policy_flags = 0U;
     if (stop_after != 0) {
         policy_flags |= node_policy_mask(NodePolicyFlag::StopAfterNode);
@@ -805,6 +868,7 @@ PyObject* py_add_node(PyObject*, PyObject* args, PyObject* kwargs) {
             callback == Py_None ? nullptr : callback,
             kind,
             policy_flags,
+            memoization,
             merge_rules,
             &error_message
         )) {

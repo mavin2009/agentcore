@@ -22,7 +22,7 @@ The benchmark entry point is [`../../python/benchmarks/langgraph_head_to_head.py
 
 ## Environment
 
-These numbers were generated on April 18, 2026 from this repository with:
+These numbers were generated on April 20, 2026 from this repository with:
 
 - Python `3.9.18`
 - Platform `Linux-5.15.167.4-microsoft-standard-WSL2-x86_64-with-glibc2.31`
@@ -37,11 +37,12 @@ This is the most relevant comparison if you want to benchmark an existing StateG
 
 | Metric | LangGraph | AgentCore compat | Relative |
 | --- | ---: | ---: | ---: |
-| Invoke avg latency | `4.793 ms` | `4.123 ms` | AgentCore compat `1.16x` faster |
-| Invoke throughput | `208.6/s` | `242.6/s` | - |
-| Stream avg latency | `3.547 ms` | `3.764 ms` | LangGraph `1.06x` faster on this workload |
-| Batch avg cost / item | `4.578 ms` | `5.043 ms` | LangGraph `1.10x` faster on this workload |
-| Batch throughput | `218.4 items/s` | `198.3 items/s` | - |
+| Invoke avg latency | `2.738 ms` | `1.354 ms` | AgentCore compat `2.02x` faster |
+| Invoke throughput | `365.3/s` | `738.5/s` | - |
+| Stream avg latency | `2.842 ms` | `1.428 ms` | AgentCore compat `1.99x` faster |
+| Stream throughput | `351.9/s` | `700.2/s` | - |
+| Batch avg cost / item | `3.609 ms` | `1.201 ms` | AgentCore compat `3.00x` faster |
+| Batch throughput | `277.1 items/s` | `832.7 items/s` | - |
 | Stream events / run | `10` | `10` | matched |
 
 ### 2. Native runtime features
@@ -50,22 +51,22 @@ This section exercises workloads where AgentCore's native API exposes capabiliti
 
 | Workload | LangGraph | AgentCore native | Relative |
 | --- | ---: | ---: | ---: |
-| Long-running persistent specialist memory: avg latency / round | `59.800 ms` | `40.571 ms` | AgentCore native `1.47x` faster |
-| Long-running persistent specialist memory: peak RSS | `109.6 MiB` | `51.6 MiB` | AgentCore native used `52.9%` less memory |
-| Pause + resume avg latency | `7.137 ms` | `1.770 ms` | AgentCore native `4.03x` faster |
-| Direct invoke avg latency | `1.135 ms` | `1.324 ms` | LangGraph `1.17x` faster on this workload |
+| Long-running persistent specialist memory: avg latency / round | `40.019 ms` | `4.006 ms` | AgentCore native `9.99x` faster |
+| Long-running persistent specialist memory: peak RSS | `108.6 MiB` | `42.4 MiB` | AgentCore native used `61.0%` less memory |
+| Pause + resume avg latency | `5.202 ms` | `367.815 us` | AgentCore native `14.14x` faster |
+| Direct invoke avg latency | `894.092 us` | `344.673 us` | AgentCore native `2.59x` faster |
 | Direct vs resumed final state | `True` | `True` | both preserved |
-| Persistent session fan-out (24 sessions) avg latency | `126.517 ms` | `114.382 ms` | AgentCore native `1.11x` faster |
+| Persistent session fan-out (24 sessions) avg latency | `94.910 ms` | `12.341 ms` | AgentCore native `7.69x` faster |
 | Session-tagged child events on fan-out run | `n/a` | `48` | AgentCore emits child-session identities |
 
 ## What These Numbers Mean
 
 The current picture is useful, but it is not one-dimensional.
 
-- On the same-code builder path, AgentCore's LangGraph-compatible surface is ahead on invoke latency for this workflow, while stream and batch are still slightly behind.
-- On native persistent-session workloads, AgentCore is materially stronger on memory footprint and pause/resume cost.
-- On the current 24-session pure-Python fan-out benchmark, AgentCore is now slightly ahead after the latest state and join-path optimizations.
-- The simplest direct-invoke native micro-workload is still a small optimization gap.
+- On the same-code builder path, AgentCore's LangGraph-compatible surface is ahead on invoke, stream, and batch for this workflow.
+- On native persistent-session workloads, AgentCore is materially ahead on latency, memory footprint, pause/resume cost, and direct invoke cost in this snapshot.
+- On the current 24-session pure-Python fan-out benchmark, AgentCore is no longer near parity. It is substantially ahead on latency while still emitting child-session identities directly in the public stream.
+- Both runtimes preserved final-state equivalence across the direct-vs-resumed pause workflow in this benchmark.
 
 That mix is exactly why the benchmark stays in the repo. It lets scheduler, state, and subgraph-session changes be measured against a stable comparison instead of argued about abstractly.
 
@@ -74,16 +75,16 @@ That mix is exactly why the benchmark stays in the repo. It lets scheduler, stat
 From the repository root:
 
 ```bash
-cmake -S . -B build -DAGENTCORE_BUILD_PYTHON_BINDINGS=ON
-cmake --build build -j
-python3 -m pip install langgraph
-python3 ./python/benchmarks/langgraph_head_to_head.py
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DAGENTCORE_BUILD_PYTHON_BINDINGS=ON -DAGENTCORE_BUILD_BENCHMARKS=ON
+cmake --build build -j4 --target _agentcore_native agentcore_python_package
+python3 -m pip install "langgraph==0.6.11"
+PYTHONPATH=./build/python python3 ./python/benchmarks/langgraph_head_to_head.py
 ```
 
 To capture structured output instead of markdown:
 
 ```bash
-python3 ./python/benchmarks/langgraph_head_to_head.py --format json
+PYTHONPATH=./build/python python3 ./python/benchmarks/langgraph_head_to_head.py --format json
 ```
 
 ## Notes On Fairness

@@ -27,6 +27,14 @@ At runtime, a run is an execution of one graph with one evolving state snapshot.
 
 The public engine surface for this lives in [`../../agentcore/include/agentcore/execution/engine.h`](../../agentcore/include/agentcore/execution/engine.h).
 
+`ExecutionEngineOptions` now makes durability and observability policy explicit through `ExecutionProfile`:
+
+- `Strict`: synchronous checkpoint persistence and unbounded trace retention
+- `Balanced`: deterministic commit semantics with background checkpoint persistence and per-run segmented traces
+- `Fast`: metadata-first checkpointing and bounded trace retention to reduce hot-path durability cost
+
+The point of exposing this at the engine boundary is not to create three different semantics for state mutation. State patches, routing, replay, persistent sessions, and public stream ordering remain explicit runtime behavior in every mode. What changes is how much durability and observability work stays directly on the step path.
+
 ## State Is Patch-Based
 
 Nodes do not mutate global workflow state directly. They return a `NodeResult` containing:
@@ -39,6 +47,23 @@ Nodes do not mutate global workflow state directly. They return a `NodeResult` c
 The engine applies that patch at a single commit point. That is what makes trace emission, replay, and checkpoint generation line up cleanly with state mutation.
 
 There is one deliberate operational exception at the node boundary: recorded synchronous effects. A node can ask `ExecutionContext` to run a keyed effect once and persist its outcome. The node still returns an ordinary `NodeResult`, but the effect record is committed by the engine together with the step. That keeps external once-only work inside the same checkpoint and proof model as patch application instead of scattering replay logic across node bodies.
+
+## Deterministic Node Memoization
+
+The runtime now includes a first incremental-execution seam for deterministic nodes.
+
+- `WorkflowState` tracks per-field revision counters.
+- Nodes may declare deterministic memoization metadata through `read_keys`.
+- The runtime caches deterministic compute/control/aggregate node results against the current revisions of those declared keys plus the runtime config payload.
+- When one of those keys changes, the branch-local memo entries that depend on it are invalidated.
+
+This is intentionally conservative.
+
+- knowledge-reactive nodes do not currently participate in deterministic memoization
+- knowledge-graph writes clear the branch-local memo cache rather than trying to derive a partial graph dependency key
+- subgraph/tool/model nodes are excluded from this first memoization seam
+
+The reason for this design is straightforward: the runtime gets an explicit invalidation model without weakening replay or smuggling hidden Python-side caches into execution.
 
 ## Hot State And Blob State
 
@@ -59,6 +84,16 @@ Concurrency is explicit rather than implicit.
 - The engine remains responsible for execution semantics.
 - Fan-out only happens when the graph definition makes it possible.
 - Async behavior is primarily for external work such as tools, models, or waiting nodes.
+
+The current scheduler keeps three distinct concerns separate:
+
+- per-run ready queues for immediately runnable work
+- a delayed-task heap for future `ready_at_ns` wakeups
+- async completion queues for tool/model waits
+
+That separation keeps the common dequeue path cache-friendly while still letting the engine wait on the next due task instead of polling.
+
+There is one additional determinism rule at the async boundary: a grouped async wait is treated as one checkpointed frontier, not as a race between unrelated handles. The scheduler only makes that task runnable once the full registered wait group is complete. This matters most for resumable subgraphs, where replay should follow the same child frontier after restore rather than depending on which external handle completed first.
 
 In the Python layer, `worker_count` controls native worker parallelism inside one compiled graph. Separately, `abatch(...)` allows multiple invocations to be active concurrently at the outer API layer.
 
@@ -161,6 +196,10 @@ Checkpoint persistence is now behind a storage backend seam. The runtime current
 
 - binary file-backed checkpoint storage
 - SQLite-backed checkpoint storage when SQLite support is enabled at build time
+
+In `Balanced` and `Fast`, persistence is decoupled from the hot step path through a background append-oriented writer. The engine still assigns checkpoint IDs and commits state synchronously, but durable writes are flushed behind that explicit seam instead of forcing a synchronous full persistence round-trip for every checkpoint record.
+
+Trace retention follows the same direction. Traces are stored per run rather than in one global append vector, which keeps stream reads scoped to one run and avoids unrelated-run scans during public event reads.
 
 Because `TaskJournal` is serialized as part of the state layer, a restored run can reuse previously committed synchronous outcomes without re-executing the underlying side effect. The runtime tests validate both the success path and the failure path where a resumed node presents a different request for the same recorded-effect key.
 

@@ -7,16 +7,38 @@ This page collects the commands that are most useful when you need to prove that
 From the repository root:
 
 ```bash
+cmake --preset release-perf
+cmake --build --preset release-perf -j
+ctest --preset release-perf
+./build/release-perf/agentcore_runtime_benchmark
+./build/release-perf/agentcore_persistent_subgraph_session_benchmark
 cmake -S . -B build -DAGENTCORE_BUILD_PYTHON_BINDINGS=ON -DAGENTCORE_BUILD_BENCHMARKS=ON
 cmake --build build -j
-ctest --test-dir build --output-on-failure
-./build/agentcore_runtime_benchmark
-./build/agentcore_persistent_subgraph_session_benchmark
 PYTHONPATH=./build/python python3 ./python/benchmarks/state_graph_api_benchmark.py
 PYTHONPATH=./build/python python3 ./python/benchmarks/langgraph_head_to_head.py
 ```
 
-That path builds the native runtime, examples, benchmarks, and Python bindings, runs the registered CTest suite, then executes the benchmark surfaces that cover persistent subgraph sessions and replay behavior.
+That path validates the optimized native runtime first, then runs the Python-facing benchmark surfaces. Published native numbers should come from `Release` builds only, so the `release-perf` preset is the default entry point for any benchmark or release-candidate validation pass.
+
+If you need a different native validation lane, the repository also provides:
+
+```bash
+cmake --list-presets
+```
+
+The current configure presets are:
+
+- `release-perf`
+- `relwithdebinfo-perf`
+- `asan`
+- `ubsan`
+- `tsan`
+
+When you want a structured artifact for documentation updates or CI-side parsing, rerun the comparison benchmark with:
+
+```bash
+PYTHONPATH=./build/python python3 ./python/benchmarks/langgraph_head_to_head.py --format json
+```
 
 This is also the release-candidate path used for the current published benchmark snapshot in [`../comparisons/langgraph-head-to-head.md`](../comparisons/langgraph-head-to-head.md).
 
@@ -34,6 +56,8 @@ PYTHONPATH=./build/python python3 ./python/tests/adapters_runtime_smoke.py
 What they cover:
 
 - graph construction and routing
+- deterministic node memoization on stable declared inputs
+- deterministic node cache invalidation when declared inputs change
 - async Python node callbacks
 - metadata and streaming surfaces
 - Python runtime helper injection and recorded-effect replay
@@ -48,6 +72,12 @@ What they cover:
 - parallel specialists targeting the same child graph with different session IDs
 - pause/resume preserving child-local memory and streamed session metadata
 - concurrent execution through `abatch(...)`
+
+The native runtime module test executable also includes direct scheduler coverage for:
+
+- delayed-task ordering and `next_task_ready_time_for_run(...)`
+- single-handle async waiter promotion
+- grouped async wait barriers that only promote after the full wait set is complete
 
 ## Wheel Packaging Smoke
 
@@ -112,8 +142,8 @@ What they cover:
 The native benchmark executables are:
 
 ```bash
-./build/agentcore_runtime_benchmark
-./build/agentcore_persistent_subgraph_session_benchmark
+./build/release-perf/agentcore_runtime_benchmark
+./build/release-perf/agentcore_persistent_subgraph_session_benchmark
 ```
 
 If the Python bindings were built, the Python benchmark entry point is:
@@ -129,6 +159,12 @@ python3 -m pip install langgraph
 PYTHONPATH=./build/python python3 ./python/benchmarks/langgraph_head_to_head.py
 ```
 
+For a machine-readable report that can be copied directly into documentation updates, use:
+
+```bash
+PYTHONPATH=./build/python python3 ./python/benchmarks/langgraph_head_to_head.py --format json
+```
+
 For a narrower stress test of wide fan-out/join behavior from Python, there is also:
 
 ```bash
@@ -137,12 +173,16 @@ PYTHONPATH=./build/python python3 ./python/benchmarks/massive_fanout_benchmark.p
 
 These benchmarks are most useful when comparing revisions on the same machine with the same build configuration. They should be treated as regression instruments and change-detection tools, not as universal performance claims.
 
+For native numbers, do not compare unspecified build types against `Release`. The performance contract for this runtime is now tracked against explicit `release-perf` builds, because durability and observability behavior are profile-dependent and published numbers should always name the profile and the build type.
+
 The current benchmark surfaces include:
 
 - native scheduler, routing, checkpoint, subgraph, and knowledge-frontier benchmarks
 - native persistent-session fan-out and resume determinism benchmarks
+- native deterministic-node memoization hit/invalidation benchmark with executor-invocation counters
 - native recorded-effect hit/miss cost for the task-journal seam
 - Python graph invocation cost
+- Python deterministic-node memoization hit/invalidation benchmark through the graph API binding layer
 - Python recorded-effect replay and miss cost through the binding layer
 - Python persistent-session fan-out, streamed session metadata, and pause/resume state validation
 - optional upstream LangGraph vs AgentCore comparison for same-code builder workloads and native persistent-session workloads
@@ -162,18 +202,27 @@ The Python benchmark mirrors the same workloads through the binding layer and as
 - equal final state between direct and resumed specialist flows
 - presence of namespaced and session-tagged events
 
-It also emits the direct/resumed proof digests so Python-side changes can be inspected alongside the native replay gate.
+It also emits the direct/resumed proof digests so Python-side changes can be inspected alongside the native replay gate. Those digests remain useful for spot checks, but the equality gate lives in the native benchmark because the public Python metadata exposes run-specific digests rather than a cross-run-normalized replay checksum.
+
+The deterministic memoization benchmark is the structural regression gate for this seam. It checks:
+
+- equal final output between the baseline run and the stable-input memoized run
+- executor invocations collapsing from the configured visit count to a single real node execution on stable declared inputs
+- executor invocations remaining at the visit count when a declared read key changes between visits
+- trace-event counts remaining fixed across baseline, stable-input, and invalidating variants so the benchmark measures skipped compute rather than altered control flow
 
 ## Suggested Workflow For Runtime Changes
 
 When changing scheduler, subgraph, or streaming behavior:
 
-1. Run `ctest --test-dir build --output-on-failure`.
-2. Run the four Python smoke scripts.
-3. Run `./build/agentcore_runtime_benchmark`.
-4. Run `./build/agentcore_persistent_subgraph_session_benchmark`.
-5. Run `PYTHONPATH=./build/python python3 ./python/benchmarks/langgraph_head_to_head.py` when the change affects scheduler, state, subgraph, or Python runtime behavior.
-6. If the change touched Python orchestration more broadly, also run `PYTHONPATH=./build/python python3 ./python/benchmarks/state_graph_api_benchmark.py`.
+1. Run `cmake --preset release-perf && cmake --build --preset release-perf -j`.
+2. Run `ctest --preset release-perf`.
+3. Run `./build/agentcore_runtime_module_tests` and `./build/release-perf/agentcore_runtime_module_tests` when the change affects queueing, async waits, or wakeup behavior.
+4. Run the four Python smoke scripts from the local `build` tree if the binding layer changed.
+5. Run `./build/release-perf/agentcore_runtime_benchmark`.
+6. Run `./build/release-perf/agentcore_persistent_subgraph_session_benchmark`.
+7. Run `PYTHONPATH=./build/python python3 ./python/benchmarks/langgraph_head_to_head.py` when the change affects scheduler, state, subgraph, or Python runtime behavior. Use `--format json` when you are refreshing the published comparison doc.
+8. If the change touched Python orchestration more broadly, also run `PYTHONPATH=./build/python python3 ./python/benchmarks/state_graph_api_benchmark.py`.
 
 That sequence gives fast signal on correctness first and performance second.
 

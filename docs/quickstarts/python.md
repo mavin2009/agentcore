@@ -61,6 +61,20 @@ The important pieces are:
 - `compile()` lowers the graph into the native runtime.
 - `invoke()` executes one run and returns the final state mapping.
 
+If a node is deterministic for a declared subset of state, you can opt into native memoization:
+
+```python
+graph.add_node(
+    "score",
+    score_candidate,
+    deterministic=True,
+    read_keys=["candidate_id", "rubric_version"],
+    cache_size=32,
+)
+```
+
+That cache lives in the native runtime, not in Python. The current implementation keys it by the declared `read_keys` plus the runtime config payload and invalidates cached entries when one of those state keys changes.
+
 ## Use Higher-Level Builders For Common Shapes
 
 `StateGraph` remains the core Python API, but the package now also includes an optional pattern layer for workflow shapes that otherwise require a lot of repetitive builder code.

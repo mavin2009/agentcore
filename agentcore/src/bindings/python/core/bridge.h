@@ -33,8 +33,10 @@ struct NodeBinding {
     NodeKind kind{NodeKind::Compute};
     uint32_t policy_flags{0U};
     std::vector<FieldMergeRule> merge_rules;
+    NodeMemoizationPolicy memoization;
     std::optional<SubgraphBinding> subgraph;
     GraphHandle* subgraph_handle{nullptr};
+    PyObject* patch_key_lookup{nullptr};
 };
 
 struct RunArtifacts {
@@ -60,6 +62,7 @@ public:
         PyObject* callback,
         NodeKind kind,
         uint32_t policy_flags,
+        const NodeMemoizationPolicy& memoization,
         const std::vector<std::pair<std::string, JoinMergeStrategy>>& merge_rules,
         std::string* error_message
     );
@@ -132,7 +135,14 @@ private:
     bool register_graph_hierarchy(ExecutionEngine& target_engine, std::string* error_message);
 
     bool build_initial_envelope(PyObject* input_state, PyObject* config, InputEnvelope* envelope, std::string* error_message);
-    bool convert_mapping_to_patch(PyObject* mapping, BlobStore& blobs, StringInterner& strings, StatePatch* patch, std::string* error_message);
+    bool convert_mapping_to_patch(
+        PyObject* mapping,
+        BlobStore& blobs,
+        StringInterner& strings,
+        StatePatch* patch,
+        std::string* error_message,
+        PyObject* fast_state_key_lookup = nullptr
+    );
 
     StateKey ensure_state_key_locked(std::string_view state_name);
 
@@ -146,6 +156,7 @@ private:
 
     std::unordered_map<std::string, NodeId> node_ids_by_name_;
     std::vector<NodeBinding> node_bindings_;
+    std::unordered_map<NodeId, std::size_t> node_binding_indices_;
     std::vector<std::pair<NodeId, NodeId>> edges_;
     std::optional<NodeId> entry_node_id_;
     NodeId next_node_id_{1};
@@ -154,6 +165,7 @@ private:
     mutable std::mutex mutex_;
     std::shared_ptr<std::vector<std::string>> state_names_;
     std::shared_ptr<std::unordered_map<std::string, StateKey>> state_keys_by_name_;
+    PyObject* state_key_lookup_{nullptr};
     std::unordered_map<RunId, PyObject*> active_configs_;
 };
 

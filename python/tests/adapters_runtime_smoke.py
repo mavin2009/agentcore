@@ -3,6 +3,8 @@ from agentcore import END, START, StateGraph
 
 custom_tool_calls = []
 custom_model_calls = []
+arity_tool_calls = {"zero": 0, "one": 0}
+arity_model_calls = {"one": 0, "two": 0}
 
 
 async def custom_tool_handler(request, metadata):
@@ -25,6 +27,26 @@ async def custom_model_handler(prompt, schema, metadata):
         "confidence": 0.75,
         "token_usage": len(str(prompt["topic"])),
     }
+
+
+def zero_arg_tool_handler():
+    arity_tool_calls["zero"] += 1
+    return {"mode": "zero"}
+
+
+def one_arg_tool_handler(request):
+    arity_tool_calls["one"] += 1
+    return {"echo": request["text"], "size": len(str(request["text"]))}
+
+
+def one_arg_model_handler(prompt):
+    arity_model_calls["one"] += 1
+    return {"prompt": prompt["topic"]}
+
+
+def two_arg_model_handler(prompt, schema):
+    arity_model_calls["two"] += 1
+    return {"summary": f"{prompt['topic']}::{schema['style']}"}
 
 
 def adapter_node(state, config, runtime):
@@ -118,6 +140,8 @@ compiled.tools.register(
         "response_format": "json",
     },
 )
+compiled.tools.register("py_zero", zero_arg_tool_handler, decode_input="json")
+compiled.tools.register("py_echo", one_arg_tool_handler, decode_input="json")
 compiled.models.register(
     "py_summarizer",
     custom_model_handler,
@@ -136,9 +160,16 @@ compiled.models.register(
         "response_format": "json",
     },
 )
+compiled.models.register("py_prompt_only", one_arg_model_handler, decode_prompt="json")
+compiled.models.register(
+    "py_prompt_schema",
+    two_arg_model_handler,
+    decode_prompt="json",
+    decode_schema="json",
+)
 
 tool_specs = {spec["name"]: spec for spec in compiled.tools.list()}
-assert {"kv_store", "py_upper"} <= set(tool_specs)
+assert {"kv_store", "py_upper", "py_zero", "py_echo"} <= set(tool_specs)
 tool_spec = compiled.tools.describe("kv_store")
 assert tool_spec is not None
 assert tool_spec["metadata"]["implementation"] == "sqlite_tool"
@@ -154,7 +185,14 @@ assert python_tool_spec["metadata"]["request_format"] == "json"
 assert "structured_request" in python_tool_spec["metadata"]["capabilities"]
 
 model_specs = {spec["name"]: spec for spec in compiled.models.list()}
-assert {"summarizer", "py_summarizer", "grok_builtin", "gemini_builtin"} <= set(model_specs)
+assert {
+    "summarizer",
+    "py_summarizer",
+    "py_prompt_only",
+    "py_prompt_schema",
+    "grok_builtin",
+    "gemini_builtin",
+} <= set(model_specs)
 model_spec = compiled.models.describe("summarizer")
 assert model_spec is not None
 assert model_spec["metadata"]["implementation"] == "local_model"
@@ -194,6 +232,11 @@ assert python_tool_probe == {
     "upper": "NATIVE-ADAPTERS",
     "adapter_name": "py_upper",
 }
+assert compiled.tools.invoke("py_zero", {"ignored": True}, decode="json") == {"mode": "zero"}
+assert compiled.tools.invoke("py_echo", {"text": "native-adapters"}, decode="json") == {
+    "echo": "native-adapters",
+    "size": len("native-adapters"),
+}
 python_model_probe_details = compiled.models.invoke_with_metadata(
     "py_summarizer",
     {"topic": "NATIVE-ADAPTERS"},
@@ -206,6 +249,17 @@ assert python_model_probe_details["output"] == {
 }
 assert python_model_probe_details["confidence"] == 0.75
 assert python_model_probe_details["token_usage"] == len("NATIVE-ADAPTERS")
+assert compiled.models.invoke("py_prompt_only", {"topic": "NATIVE-ADAPTERS"}, decode="json") == {
+    "prompt": "NATIVE-ADAPTERS",
+}
+assert compiled.models.invoke(
+    "py_prompt_schema",
+    {"topic": "NATIVE-ADAPTERS"},
+    schema={"style": "brief"},
+    decode="json",
+) == {
+    "summary": "NATIVE-ADAPTERS::brief",
+}
 
 final_state = compiled.invoke({"topic": "native-adapters"})
 assert final_state["stored"] == "ok"
@@ -224,6 +278,8 @@ assert final_state["custom_model_token_usage"] == len("NATIVE-ADAPTERS")
 
 assert len(custom_tool_calls) >= 2
 assert len(custom_model_calls) >= 2
+assert arity_tool_calls == {"zero": 1, "one": 1}
+assert arity_model_calls == {"one": 1, "two": 1}
 assert custom_tool_calls[0][0] == {"text": "native-adapters"}
 assert custom_tool_calls[0][1]["name"] == "py_upper"
 assert custom_model_calls[0][1] == {"style": "brief"}

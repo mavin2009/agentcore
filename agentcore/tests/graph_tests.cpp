@@ -175,6 +175,36 @@ int main() {
     error_message.clear();
     assert(valid_subgraph_graph.validate(&error_message));
 
+    GraphDefinition valid_memoization_graph = graph;
+    valid_memoization_graph.nodes[1].memoization = NodeMemoizationPolicy{
+        true,
+        std::vector<StateKey>{5U, 6U},
+        4U
+    };
+    error_message.clear();
+    assert(valid_memoization_graph.validate(&error_message));
+
+    GraphDefinition invalid_memoization_kind_graph = graph;
+    invalid_memoization_kind_graph.nodes[4].kind = NodeKind::Tool;
+    invalid_memoization_kind_graph.nodes[4].memoization = NodeMemoizationPolicy{
+        true,
+        std::vector<StateKey>{1U},
+        4U
+    };
+    error_message.clear();
+    assert(!invalid_memoization_kind_graph.validate(&error_message));
+    assert(contains(error_message, "deterministic memoization"));
+
+    GraphDefinition duplicate_memoization_key_graph = graph;
+    duplicate_memoization_key_graph.nodes[1].memoization = NodeMemoizationPolicy{
+        true,
+        std::vector<StateKey>{5U, 5U},
+        4U
+    };
+    error_message.clear();
+    assert(!duplicate_memoization_key_graph.validate(&error_message));
+    assert(contains(error_message, "duplicate memoization read dependency"));
+
     std::cout << "graph module tests passed" << std::endl;
     return 0;
 }

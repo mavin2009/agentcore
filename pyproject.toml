@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "agentcore-graph"
-version = "0.1.4"
+version = "0.1.5"
 description = "Native agent-graph runtime with C++ execution, explicit state patches, resumable checkpoints, and Python bindings."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -16,7 +16,7 @@ keywords = ["agents", "graphs", "workflows", "runtime", "llm"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
-  "License :: Other/Proprietary License",
+  "License :: OSI Approved :: MIT License",
   "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.9",

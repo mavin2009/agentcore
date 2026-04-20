@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(agentcore VERSION 0.1.4 LANGUAGES CXX)
+project(agentcore VERSION 0.1.5 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -42,6 +42,9 @@ set(AGENTCORE_EXECUTION_SOURCES
     agentcore/src/execution/checkpoint.cpp
     agentcore/src/execution/engine.cpp
     agentcore/src/execution/proof.cpp
+    agentcore/src/execution/reactive/memoization.cpp
+    agentcore/src/execution/subgraph/inline/runner.cpp
+    agentcore/src/execution/subgraph/reuse/engine_pool.cpp
     agentcore/src/execution/subgraph/session_runtime.cpp
     agentcore/src/execution/subgraph/subgraph_runtime.cpp
     agentcore/src/execution/streaming/public_stream.cpp
@@ -100,6 +103,14 @@ function(agentcore_configure_target target_name)
     )
     target_compile_features(${target_name} PUBLIC cxx_std_20)
     set_target_properties(${target_name} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endfunction()
+
+function(agentcore_enable_validation_asserts target_name)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU|AppleClang")
+        target_compile_options(${target_name} PRIVATE -UNDEBUG)
+    elseif(MSVC)
+        target_compile_definitions(${target_name} PRIVATE NDEBUG=0)
+    endif()
 endfunction()
 
 function(agentcore_source_group target_name)
@@ -180,11 +191,13 @@ if(AGENTCORE_BUILD_EXAMPLES)
 
     add_executable(runtime_proof_suite agentcore/examples/runtime_proof_suite.cpp)
     target_link_libraries(runtime_proof_suite PRIVATE agentcore::agentcore)
+    agentcore_enable_validation_asserts(runtime_proof_suite)
 endif()
 
 if(AGENTCORE_BUILD_BENCHMARKS)
     add_executable(agentcore_runtime_benchmark agentcore/benchmarks/runtime_benchmark.cpp)
     target_link_libraries(agentcore_runtime_benchmark PRIVATE agentcore::agentcore)
+    agentcore_enable_validation_asserts(agentcore_runtime_benchmark)
     add_executable(
         agentcore_persistent_subgraph_session_benchmark
         agentcore/benchmarks/persistent_subgraph_session_benchmark.cpp
@@ -194,6 +207,7 @@ if(AGENTCORE_BUILD_BENCHMARKS)
         PRIVATE
             agentcore::agentcore
     )
+    agentcore_enable_validation_asserts(agentcore_persistent_subgraph_session_benchmark)
 endif()
 
 if(AGENTCORE_BUILD_PYTHON_BINDINGS)
@@ -266,34 +280,42 @@ endif()
 if(BUILD_TESTING)
     add_executable(agentcore_graph_tests agentcore/tests/graph_tests.cpp)
     target_link_libraries(agentcore_graph_tests PRIVATE agentcore_graph)
+    agentcore_enable_validation_asserts(agentcore_graph_tests)
     add_test(NAME agentcore_graph_tests COMMAND agentcore_graph_tests)
 
     add_executable(agentcore_state_tests agentcore/tests/state_tests.cpp)
     target_link_libraries(agentcore_state_tests PRIVATE agentcore_state)
+    agentcore_enable_validation_asserts(agentcore_state_tests)
     add_test(NAME agentcore_state_tests COMMAND agentcore_state_tests)
 
     add_executable(agentcore_runtime_module_tests agentcore/tests/runtime_module_tests.cpp)
     target_link_libraries(agentcore_runtime_module_tests PRIVATE agentcore_runtime agentcore_state)
+    agentcore_enable_validation_asserts(agentcore_runtime_module_tests)
     add_test(NAME agentcore_runtime_module_tests COMMAND agentcore_runtime_module_tests)
 
     add_executable(agentcore_adapter_tests agentcore/tests/adapter_tests.cpp)
     target_link_libraries(agentcore_adapter_tests PRIVATE agentcore_adapters agentcore_state)
+    agentcore_enable_validation_asserts(agentcore_adapter_tests)
     add_test(NAME agentcore_adapter_tests COMMAND agentcore_adapter_tests)
 
     add_executable(agentcore_execution_module_tests agentcore/tests/execution_module_tests.cpp)
     target_link_libraries(agentcore_execution_module_tests PRIVATE agentcore_execution agentcore_adapters)
+    agentcore_enable_validation_asserts(agentcore_execution_module_tests)
     add_test(NAME agentcore_execution_module_tests COMMAND agentcore_execution_module_tests)
 
     add_executable(agentcore_control_flow_tests agentcore/tests/control_flow_tests.cpp)
     target_link_libraries(agentcore_control_flow_tests PRIVATE agentcore_execution)
+    agentcore_enable_validation_asserts(agentcore_control_flow_tests)
     add_test(NAME agentcore_control_flow_tests COMMAND agentcore_control_flow_tests)
 
     add_executable(agentcore_runtime_tests agentcore/tests/runtime_tests.cpp)
     target_link_libraries(agentcore_runtime_tests PRIVATE agentcore::agentcore)
+    agentcore_enable_validation_asserts(agentcore_runtime_tests)
     add_test(NAME agentcore_runtime_tests COMMAND agentcore_runtime_tests)
 
     add_executable(agentcore_subgraph_session_tests agentcore/tests/subgraph_session_tests.cpp)
     target_link_libraries(agentcore_subgraph_session_tests PRIVATE agentcore::agentcore)
+    agentcore_enable_validation_asserts(agentcore_subgraph_session_tests)
     add_test(NAME agentcore_subgraph_session_tests COMMAND agentcore_subgraph_session_tests)
 
     if(TARGET runtime_proof_suite)

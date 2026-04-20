@@ -34,14 +34,14 @@ NodeResult retrieve_node(ExecutionContext& context) {
 }
 
 NodeResult answer_node(ExecutionContext& context) {
-    const Value* documents_value = context.state.fields.size() > kDocuments ? &context.state.fields[kDocuments] : nullptr;
-    if (documents_value == nullptr || !std::holds_alternative<BlobRef>(*documents_value)) {
+    const Value documents_value = context.state.size() > kDocuments ? context.state.load(kDocuments) : Value{};
+    if (!std::holds_alternative<BlobRef>(documents_value)) {
         return NodeResult{NodeResult::HardFail};
     }
 
     ModelInvocationContext model_context{context.blobs, context.strings};
     const ModelResponse response = context.models.invoke(
-        ModelRequest{context.strings.intern("answerer"), std::get<BlobRef>(*documents_value), {}, 256U},
+        ModelRequest{context.strings.intern("answerer"), std::get<BlobRef>(documents_value), {}, 256U},
         model_context
     );
 
@@ -108,7 +108,7 @@ int main() {
     const RunResult result = engine.run_to_completion(run_id);
     const StateStore& state_store = engine.state_store(run_id);
     const WorkflowState& state = state_store.get_current_state();
-    const BlobRef answer_ref = std::get<BlobRef>(state.fields[kAnswer]);
+    const BlobRef answer_ref = std::get<BlobRef>(state.load(kAnswer));
 
     std::cout << "retrieval_graph\n";
     std::cout << "status=" << static_cast<int>(result.status) << "\n";

@@ -1,11 +1,14 @@
 #include "agentcore/execution/engine.h"
 
+#include "agentcore/execution/subgraph/inline/runner.h"
 #include "agentcore/execution/subgraph/subgraph_runtime.h"
+#include "agentcore/execution/subgraph/reuse/engine_pool.h"
 #include "agentcore/graph/composition/subgraph.h"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 #include <unordered_map>
@@ -15,6 +18,17 @@
 namespace agentcore {
 
 namespace {
+
+bool runtime_debug_enabled() {
+    static const bool enabled = std::getenv("AGENTCORE_RUNTIME_DEBUG") != nullptr;
+    return enabled;
+}
+
+void runtime_debug_log(const std::string& message) {
+    if (runtime_debug_enabled()) {
+        std::cerr << "[agentcore_runtime_debug] " << message << '\n';
+    }
+}
 
 constexpr uint32_t kTraceFlagJoinBarrier = 1U << 30;
 constexpr uint32_t kTraceFlagJoinMerged = 1U << 29;
@@ -28,6 +42,18 @@ struct BranchFieldWrite {
     const StateStore* source_state{nullptr};
     Value value;
 };
+
+CheckpointPolicy checkpoint_policy_for_profile(ExecutionProfile profile) {
+    switch (profile) {
+        case ExecutionProfile::Strict:
+            return CheckpointPolicy{64U, true, true, true, true};
+        case ExecutionProfile::Balanced:
+            return CheckpointPolicy{256U, true, true, true, true};
+        case ExecutionProfile::Fast:
+            return CheckpointPolicy{0U, true, true, true, false};
+    }
+    return CheckpointPolicy{};
+}
 
 bool contains_branch_id(const std::vector<uint32_t>& branch_ids, uint32_t branch_id) {
     return std::find(branch_ids.begin(), branch_ids.end(), branch_id) != branch_ids.end();
@@ -130,6 +156,77 @@ const AsyncModelSnapshot* find_pending_model_snapshot(const BranchSnapshot& bran
         }
     );
     return iterator == branch.pending_model_snapshots.end() ? nullptr : std::addressof(*iterator);
+}
+
+constexpr RunId kInlineSubgraphResumableRunId = 1U;
+
+std::pair<std::vector<AsyncToolSnapshot>, std::vector<AsyncModelSnapshot>>
+export_pending_async_snapshots(
+    const std::vector<PendingAsyncOperation>& pending_asyncs,
+    const ToolRegistry& tools,
+    const ModelRegistry& models
+) {
+    std::vector<AsyncToolSnapshot> pending_tool_snapshots;
+    std::vector<AsyncModelSnapshot> pending_model_snapshots;
+    pending_tool_snapshots.reserve(pending_asyncs.size());
+    pending_model_snapshots.reserve(pending_asyncs.size());
+
+    for (const PendingAsyncOperation& pending_async : pending_asyncs) {
+        switch (pending_async.kind) {
+            case AsyncOperationKind::Tool:
+                if (const auto pending_tool_snapshot =
+                        tools.export_async_operation(AsyncToolHandle{pending_async.handle_id});
+                    pending_tool_snapshot.has_value()) {
+                    pending_tool_snapshots.push_back(std::move(*pending_tool_snapshot));
+                }
+                break;
+            case AsyncOperationKind::Model:
+                if (const auto pending_model_snapshot =
+                        models.export_async_operation(AsyncModelHandle{pending_async.handle_id});
+                    pending_model_snapshot.has_value()) {
+                    pending_model_snapshots.push_back(std::move(*pending_model_snapshot));
+                }
+                break;
+            case AsyncOperationKind::None:
+                break;
+        }
+    }
+
+    return {std::move(pending_tool_snapshots), std::move(pending_model_snapshots)};
+}
+
+RunSnapshot build_inline_single_branch_subgraph_snapshot(
+    const GraphDefinition& graph,
+    const std::vector<std::byte>& runtime_config_payload,
+    const StateStore& state_store,
+    const ExecutionFrame& frame,
+    uint16_t retry_count,
+    std::optional<PendingAsyncOperation> pending_async,
+    const ToolRegistry& tools,
+    const ModelRegistry& models
+) {
+    RunSnapshot snapshot;
+    snapshot.graph = graph;
+    snapshot.status = frame.status;
+    snapshot.runtime_config_payload = runtime_config_payload;
+    snapshot.next_branch_id = 1U;
+    snapshot.next_split_id = 1U;
+
+    BranchSnapshot branch_snapshot;
+    branch_snapshot.frame = frame;
+    branch_snapshot.state_store = state_store;
+    branch_snapshot.retry_count = retry_count;
+    branch_snapshot.pending_async = pending_async;
+
+    const std::vector<PendingAsyncOperation> pending_asyncs =
+        collect_pending_async_operations(branch_snapshot);
+    auto [pending_tool_snapshots, pending_model_snapshots] =
+        export_pending_async_snapshots(pending_asyncs, tools, models);
+    branch_snapshot.pending_tool_snapshots = std::move(pending_tool_snapshots);
+    branch_snapshot.pending_model_snapshots = std::move(pending_model_snapshots);
+
+    snapshot.branches.push_back(std::move(branch_snapshot));
+    return snapshot;
 }
 
 bool subscription_pattern_matches(std::string_view actual, const std::string& expected) {
@@ -363,11 +460,11 @@ std::unordered_map<StateKey, std::vector<BranchFieldWrite>> collect_branch_field
         }
 
         std::unordered_map<StateKey, Value> last_writes_for_branch;
-        if (split_patch_log_offset > branch_iterator->second.state_store.patch_log().size()) {
+        if (split_patch_log_offset > branch_iterator->second->state_store.patch_log().size()) {
             throw std::runtime_error("invalid split patch offset while collecting join field writes");
         }
         const std::vector<PatchLogEntry> entries =
-            branch_iterator->second.state_store.patch_log().entries_from(split_patch_log_offset);
+            branch_iterator->second->state_store.patch_log().entries_from(split_patch_log_offset);
 
         for (const PatchLogEntry& entry : entries) {
             for (const FieldUpdate& update : entry.patch.updates) {
@@ -378,7 +475,7 @@ std::unordered_map<StateKey, std::vector<BranchFieldWrite>> collect_branch_field
         for (const auto& [key, value] : last_writes_for_branch) {
             writes_by_key[key].push_back(BranchFieldWrite{
                 branch_id,
-                &branch_iterator->second.state_store,
+                &branch_iterator->second->state_store,
                 value
             });
         }
@@ -723,21 +820,6 @@ bool graph_requires_runtime_rebind(const GraphDefinition& graph) {
            });
 }
 
-std::optional<GraphId> missing_subgraph_graph_id(
-    const GraphDefinition& graph,
-    const std::unordered_map<GraphId, GraphDefinition>& registry
-) {
-    for (const NodeDefinition& node : graph.nodes) {
-        if (node.kind != NodeKind::Subgraph || !node.subgraph.has_value()) {
-            continue;
-        }
-        if (registry.find(node.subgraph->graph_id) == registry.end()) {
-            return node.subgraph->graph_id;
-        }
-    }
-    return std::nullopt;
-}
-
 } // namespace
 
 ExecutionEngine::BranchRuntime::BranchRuntime(BranchRuntime&& other) noexcept
@@ -752,6 +834,7 @@ ExecutionEngine::BranchRuntime::BranchRuntime(BranchRuntime&& other) noexcept
       pending_subgraph(std::move(other.pending_subgraph)),
       join_stack(std::move(other.join_stack)),
       reactive_root_node_id(std::move(other.reactive_root_node_id)),
+      memo_cache(std::move(other.memo_cache)),
       last_subgraph_session_id(std::move(other.last_subgraph_session_id)),
       last_subgraph_session_revision(other.last_subgraph_session_revision) {}
 
@@ -768,6 +851,7 @@ ExecutionEngine::BranchRuntime& ExecutionEngine::BranchRuntime::operator=(Branch
         pending_subgraph = std::move(other.pending_subgraph);
         join_stack = std::move(other.join_stack);
         reactive_root_node_id = std::move(other.reactive_root_node_id);
+        memo_cache = std::move(other.memo_cache);
         last_subgraph_session_id = std::move(other.last_subgraph_session_id);
         last_subgraph_session_revision = other.last_subgraph_session_revision;
     }
@@ -817,8 +901,15 @@ ExecutionEngine::RunRuntime& ExecutionEngine::RunRuntime::operator=(RunRuntime&&
     return *this;
 }
 
-ExecutionEngine::ExecutionEngine(std::size_t worker_count, bool inline_scheduler)
- : scheduler_(worker_count, inline_scheduler) {
+ExecutionEngine::ExecutionEngine(const ExecutionEngineOptions& options)
+ : scheduler_(options.worker_count, options.inline_scheduler),
+   options_(options),
+   checkpoint_policy_(checkpoint_policy_for_profile(options.profile)) {
+    subgraph_engine_pool_ = std::make_unique<SubgraphChildEnginePool>(
+        SubgraphChildEnginePoolOptions{options.profile}
+    );
+    checkpoint_manager_.configure(options.profile);
+    trace_sink_.configure(options.profile);
     tool_registry_.set_async_completion_listener([this](AsyncToolHandle handle) {
         scheduler_.signal_async_completion(AsyncWaitKey{AsyncWaitKind::Tool, handle.id});
     });
@@ -826,6 +917,11 @@ ExecutionEngine::ExecutionEngine(std::size_t worker_count, bool inline_scheduler
         scheduler_.signal_async_completion(AsyncWaitKey{AsyncWaitKind::Model, handle.id});
     });
 }
+
+ExecutionEngine::ExecutionEngine(std::size_t worker_count, bool inline_scheduler)
+ : ExecutionEngine(ExecutionEngineOptions{worker_count, inline_scheduler, ExecutionProfile::Balanced}) {}
+
+ExecutionEngine::~ExecutionEngine() = default;
 
 NodeResult NodeResult::waiting_on_tool(
     AsyncToolHandle handle,
@@ -906,13 +1002,13 @@ void ExecutionEngine::rebuild_reactive_frontier_state(RunRuntime& run) {
     }
 
     for (const auto& [_, branch] : run.branches) {
-        if (!branch.reactive_root_node_id.has_value() ||
-            is_terminal_status(branch.frame.status)) {
+        if (!branch->reactive_root_node_id.has_value() ||
+            is_terminal_status(branch->frame.status)) {
             continue;
         }
 
-        ReactiveFrontierState& frontier = run.reactive_frontiers[*branch.reactive_root_node_id];
-        frontier.node_id = *branch.reactive_root_node_id;
+        ReactiveFrontierState& frontier = run.reactive_frontiers[*branch->reactive_root_node_id];
+        frontier.node_id = *branch->reactive_root_node_id;
         frontier.active_branch_count += 1U;
     }
 
@@ -940,17 +1036,17 @@ void ExecutionEngine::spawn_reactive_branch(
         return;
     }
 
-    BranchRuntime reactive_branch;
-    reactive_branch.frame = frame_seed;
-    reactive_branch.frame.active_branch_id = run.next_branch_id;
-    reactive_branch.frame.current_node = reactive_node_id;
-    reactive_branch.frame.status = ExecutionStatus::Running;
-    reactive_branch.state_store = state_seed;
-    reactive_branch.pending_async.reset();
-    reactive_branch.pending_async_group.clear();
-    reactive_branch.retry_count = 0;
-    reactive_branch.join_stack.clear();
-    reactive_branch.reactive_root_node_id = reactive_node_id;
+    auto reactive_branch = std::make_shared<BranchRuntime>();
+    reactive_branch->frame = frame_seed;
+    reactive_branch->frame.active_branch_id = run.next_branch_id;
+    reactive_branch->frame.current_node = reactive_node_id;
+    reactive_branch->frame.status = ExecutionStatus::Running;
+    reactive_branch->state_store = state_seed;
+    reactive_branch->pending_async.reset();
+    reactive_branch->pending_async_group.clear();
+    reactive_branch->retry_count = 0;
+    reactive_branch->join_stack.clear();
+    reactive_branch->reactive_root_node_id = reactive_node_id;
 
     const uint32_t reactive_branch_id = run.next_branch_id++;
     run.branches.emplace(reactive_branch_id, std::move(reactive_branch));
@@ -1088,11 +1184,15 @@ RunId ExecutionEngine::start(const GraphDefinition& graph, const InputEnvelope& 
     }
 
     register_graph(runtime_graph);
-    if (const auto missing_graph_id = missing_subgraph_graph_id(runtime_graph, graph_registry_);
-        missing_graph_id.has_value()) {
-        throw std::invalid_argument(
-            "subgraph target graph is not registered: " + std::to_string(*missing_graph_id)
-        );
+    for (const NodeDefinition& node : runtime_graph.nodes) {
+        if (node.kind != NodeKind::Subgraph || !node.subgraph.has_value()) {
+            continue;
+        }
+        if (registered_graph(node.subgraph->graph_id) == nullptr) {
+            throw std::invalid_argument(
+                "subgraph target graph is not registered: " + std::to_string(node.subgraph->graph_id)
+            );
+        }
     }
 
     const RunId run_id = next_run_id_++;
@@ -1103,16 +1203,16 @@ RunId ExecutionEngine::start(const GraphDefinition& graph, const InputEnvelope& 
     runtime.next_branch_id = 1;
     runtime.next_split_id = 1;
 
-    BranchRuntime root_branch;
-    root_branch.frame.graph_id = runtime_graph.id;
-    root_branch.frame.current_node = input.entry_override.value_or(runtime_graph.entry);
-    root_branch.frame.active_branch_id = 0;
-    root_branch.frame.status = ExecutionStatus::Running;
-    root_branch.state_store = StateStore(input.initial_field_count);
-    root_branch.state_store.blobs() = input.initial_blobs;
-    root_branch.state_store.strings() = input.initial_strings;
+    auto root_branch = std::make_shared<BranchRuntime>();
+    root_branch->frame.graph_id = runtime_graph.id;
+    root_branch->frame.current_node = input.entry_override.value_or(runtime_graph.entry);
+    root_branch->frame.active_branch_id = 0;
+    root_branch->frame.status = ExecutionStatus::Running;
+    root_branch->state_store = StateStore(input.initial_field_count);
+    root_branch->state_store.blobs() = input.initial_blobs;
+    root_branch->state_store.strings() = input.initial_strings;
     if (!input.initial_patch.empty()) {
-        static_cast<void>(root_branch.state_store.apply(input.initial_patch));
+        static_cast<void>(root_branch->state_store.apply(input.initial_patch));
     }
 
     runtime.branches.emplace(0U, std::move(root_branch));
@@ -1191,59 +1291,48 @@ RunResult ExecutionEngine::run_to_completion(RunId run_id) {
                 std::lock_guard<std::mutex> run_lock(*run.mutex);
                 run.in_flight_tasks += 1U;
             }
-            scheduler_.run_async([this, run_id, task]() {
-                RunRuntime* queued_run_ptr = nullptr;
-                {
-                    std::lock_guard<std::mutex> lock(runs_mutex_);
-                    const auto run_iterator = runs_.find(run_id);
-                    if (run_iterator == runs_.end()) {
-                        return;
-                    }
-                    queued_run_ptr = &run_iterator->second;
-                }
-                push_commit(run_id, execute_task(*queued_run_ptr, task));
-            });
         }
         return tasks;
     };
 
-    auto collect_batch_records = [this, run_id, &run](const std::vector<ScheduledTask>& tasks) {
-        std::vector<TaskExecutionRecord> unordered_records;
-        unordered_records.reserve(tasks.size());
+    auto execute_dispatched_tasks = [this, &run](const std::vector<ScheduledTask>& tasks) {
+        std::vector<TaskExecutionRecord> ordered_records(tasks.size());
+        std::vector<std::function<void()>> jobs;
+        jobs.reserve(tasks.size());
 
-        while (unordered_records.size() < tasks.size()) {
-            std::optional<TaskCommitRecord> commit_record =
-                pop_commit(run_id, std::chrono::milliseconds(50));
-            if (!commit_record.has_value()) {
-                continue;
-            }
-            {
-                std::lock_guard<std::mutex> run_lock(*run.mutex);
-                if (run.in_flight_tasks > 0U) {
-                    run.in_flight_tasks -= 1U;
+        for (std::size_t slot = 0; slot < tasks.size(); ++slot) {
+            const ScheduledTask task = tasks[slot];
+            jobs.push_back([this, &run, &ordered_records, task, slot]() {
+                TaskExecutionRecord record;
+                try {
+                    record = execute_task(run, task);
+                } catch (const std::exception& error) {
+                    record.task = task;
+                    record.started_at_ns = now_ns();
+                    record.ended_at_ns = record.started_at_ns;
+                    record.node_result.status = NodeResult::HardFail;
+                    record.node_result.flags = kToolFlagHandlerException;
+                    record.error_message = error.what();
+                } catch (...) {
+                    record.task = task;
+                    record.started_at_ns = now_ns();
+                    record.ended_at_ns = record.started_at_ns;
+                    record.node_result.status = NodeResult::HardFail;
+                    record.node_result.flags = kToolFlagHandlerException;
+                    record.error_message = "unexpected task execution failure";
                 }
-            }
-            unordered_records.push_back(std::move(commit_record->record));
+
+                {
+                    std::lock_guard<std::mutex> run_lock(*run.mutex);
+                    if (run.in_flight_tasks > 0U) {
+                        run.in_flight_tasks -= 1U;
+                    }
+                }
+                ordered_records[slot] = std::move(record);
+            });
         }
 
-        std::vector<TaskExecutionRecord> ordered_records;
-        ordered_records.reserve(tasks.size());
-        for (const ScheduledTask& task : tasks) {
-            const auto record_iterator = std::find_if(
-                unordered_records.begin(),
-                unordered_records.end(),
-                [&task](const TaskExecutionRecord& record) {
-                    return record.task.run_id == task.run_id &&
-                        record.task.node_id == task.node_id &&
-                        record.task.branch_id == task.branch_id;
-                }
-            );
-            if (record_iterator == unordered_records.end()) {
-                throw std::runtime_error("missing task execution record for dispatched batch task");
-            }
-            ordered_records.push_back(std::move(*record_iterator));
-            unordered_records.erase(record_iterator);
-        }
+        scheduler_.run_batch(jobs);
         return ordered_records;
     };
 
@@ -1252,15 +1341,39 @@ RunResult ExecutionEngine::run_to_completion(RunId run_id) {
         return std::pair{run.status, run.in_flight_tasks};
     };
 
+    auto wait_for_run_activity = [this, run_id]() {
+        const uint64_t observed_epoch = scheduler_.activity_epoch();
+        const uint64_t current_now = now_ns();
+        if (scheduler_.has_ready_for_run(run_id, current_now)) {
+            return;
+        }
+
+        std::chrono::steady_clock::time_point deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+        const std::optional<uint64_t> next_ready_time = scheduler_.next_task_ready_time_for_run(run_id);
+        if (next_ready_time.has_value()) {
+            if (*next_ready_time <= current_now) {
+                return;
+            }
+            deadline = std::min(
+                deadline,
+                std::chrono::steady_clock::now() +
+                    std::chrono::nanoseconds(*next_ready_time - current_now)
+            );
+        }
+
+        scheduler_.wait_for_activity(observed_epoch, deadline);
+    };
+
     while (true) {
         static_cast<void>(scheduler_.promote_ready_async_tasks(now_ns()));
         const std::vector<ScheduledTask> dispatched_tasks = dispatch_ready_tasks();
 
         if (!dispatched_tasks.empty()) {
-            const std::vector<TaskExecutionRecord> ordered_records =
-                collect_batch_records(dispatched_tasks);
-            for (const TaskExecutionRecord& record : ordered_records) {
-                const StepResult step_result = commit_task_execution(run_id, run, record);
+            std::vector<TaskExecutionRecord> ordered_records =
+                execute_dispatched_tasks(dispatched_tasks);
+            for (TaskExecutionRecord& record : ordered_records) {
+                const StepResult step_result = commit_task_execution(run_id, run, std::move(record));
                 result.status = step_result.status;
                 result.last_checkpoint_id = step_result.checkpoint_id;
                 if (step_result.progressed) {
@@ -1273,11 +1386,12 @@ RunResult ExecutionEngine::run_to_completion(RunId run_id) {
         update_run_status(run, run_id);
         auto [current_status, current_in_flight] = read_run_status();
         if (current_status == ExecutionStatus::Running) {
-            if (!scheduler_.has_tasks_for_run(run_id)) {
-                if (scheduler_.has_async_waiters_for_run(run_id)) {
-                    scheduler_.wait_for_async_activity(std::chrono::milliseconds(50));
-                } else if (current_in_flight == 0U) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            const uint64_t current_now = now_ns();
+            if (!scheduler_.has_ready_for_run(run_id, current_now)) {
+                const bool has_pending_tasks = scheduler_.has_tasks_for_run(run_id);
+                const bool has_async_waiters = scheduler_.has_async_waiters_for_run(run_id);
+                if (has_pending_tasks || has_async_waiters || current_in_flight != 0U) {
+                    wait_for_run_activity();
                 }
             }
             continue;
@@ -1419,9 +1533,9 @@ InterruptResult ExecutionEngine::interrupt(RunId run_id) {
 
     scheduler_.remove_run(run_id);
     for (auto& [_, branch] : run.branches) {
-        if (branch.frame.status == ExecutionStatus::Running ||
-            branch.frame.status == ExecutionStatus::NotStarted) {
-            branch.frame.status = ExecutionStatus::Paused;
+        if (branch->frame.status == ExecutionStatus::Running ||
+            branch->frame.status == ExecutionStatus::NotStarted) {
+            branch->frame.status = ExecutionStatus::Paused;
         }
     }
     update_run_status_locked(run, run_id);
@@ -1437,7 +1551,7 @@ InterruptResult ExecutionEngine::interrupt(RunId run_id) {
         );
     }
 
-    BranchRuntime& checkpoint_branch = checkpoint_branch_iterator->second;
+    BranchRuntime& checkpoint_branch = *checkpoint_branch_iterator->second;
     const CheckpointId checkpoint_id = static_cast<CheckpointId>(checkpoint_manager_.size() + 1U);
     checkpoint_branch.frame.checkpoint_id = checkpoint_id;
     const uint64_t patch_log_offset = static_cast<uint64_t>(checkpoint_branch.state_store.patch_log().size());
@@ -1514,8 +1628,13 @@ StateEditResult ExecutionEngine::apply_state_patch(RunId run_id, const StatePatc
         return result;
     }
 
-    BranchRuntime& branch = branch_iterator->second;
+    BranchRuntime& branch = *branch_iterator->second;
     const StateApplyResult apply_result = branch.state_store.apply_with_summary(patch);
+    if (apply_result.knowledge_graph_delta.empty()) {
+        branch.memo_cache.invalidate(apply_result.changed_keys);
+    } else {
+        branch.memo_cache.clear();
+    }
     uint32_t trace_flags = kTraceFlagManualStateEdit;
 
     if (!apply_result.knowledge_graph_delta.empty()) {
@@ -1613,7 +1732,7 @@ const StateStore& ExecutionEngine::state_store(RunId run_id, uint32_t branch_id)
         throw std::out_of_range("branch not found");
     }
 
-    return branch_iterator->second.state_store;
+    return branch_iterator->second->state_store;
 }
 
 const KnowledgeGraphStore& ExecutionEngine::knowledge_graph(RunId run_id, uint32_t branch_id) const {
@@ -1653,6 +1772,25 @@ const CheckpointManager& ExecutionEngine::checkpoints() const noexcept {
 void ExecutionEngine::borrow_runtime_registries(ToolRegistry& tools, ModelRegistry& models) noexcept {
     borrowed_tool_registry_ = &tools;
     borrowed_model_registry_ = &models;
+}
+
+void ExecutionEngine::borrow_graph_registry(const ExecutionEngine& provider) noexcept {
+    borrowed_graph_provider_ = &provider;
+}
+
+void ExecutionEngine::reset_reusable_subgraph_child_state() {
+    scheduler_.clear();
+    checkpoint_manager_.clear();
+    trace_sink_.clear();
+    {
+        std::lock_guard<std::mutex> lock(runs_mutex_);
+        runs_.clear();
+    }
+    graph_registry_.clear();
+    borrowed_graph_provider_ = nullptr;
+    borrowed_tool_registry_ = nullptr;
+    borrowed_model_registry_ = nullptr;
+    next_run_id_ = 1U;
 }
 
 ToolRegistry& ExecutionEngine::runtime_tools() noexcept {
@@ -1711,15 +1849,29 @@ bool ExecutionEngine::branch_is_join_blocked(const RunRuntime& run, const Branch
 
 void ExecutionEngine::re_register_run_async_waiters(RunId run_id, const RunRuntime& run) {
     for (const auto& [branch_id, branch] : run.branches) {
-        std::vector<PendingAsyncOperation> pending_asyncs;
-        if (branch.pending_async.has_value()) {
-            append_unique_pending_async(pending_asyncs, *branch.pending_async);
+        if (branch->pending_async.has_value()) {
+            re_register_async_waiter(run_id, branch_id, *branch->pending_async);
         }
-        for (const PendingAsyncOperation& pending_async : branch.pending_async_group) {
-            append_unique_pending_async(pending_asyncs, pending_async);
+
+        std::vector<AsyncWaitKey> group_wait_keys;
+        for (const PendingAsyncOperation& pending_async : branch->pending_async_group) {
+            const AsyncWaitKey wait_key = async_wait_key_for(pending_async);
+            if (!wait_key.valid() ||
+                std::find(group_wait_keys.begin(), group_wait_keys.end(), wait_key) != group_wait_keys.end()) {
+                continue;
+            }
+            group_wait_keys.push_back(wait_key);
         }
-        for (const PendingAsyncOperation& pending_async : pending_asyncs) {
-            re_register_async_waiter(run_id, branch_id, pending_async);
+        if (!group_wait_keys.empty()) {
+            scheduler_.register_async_wait_group(
+                group_wait_keys,
+                ScheduledTask{
+                    run_id,
+                    branch->frame.current_node,
+                    branch_id,
+                    0U
+                }
+            );
         }
     }
 }
@@ -1787,7 +1939,7 @@ std::size_t ExecutionEngine::enqueue_resumable_paused_branches(
             continue;
         }
 
-        BranchRuntime& branch = branch_iterator->second;
+        BranchRuntime& branch = *branch_iterator->second;
         if (branch.frame.status != ExecutionStatus::Paused ||
             branch.pending_async.has_value() ||
             !branch.pending_async_group.empty() ||
@@ -1828,7 +1980,7 @@ RunSnapshot ExecutionEngine::snapshot_run(RunId run_id, const RunRuntime& run) c
     std::sort(branch_ids.begin(), branch_ids.end());
 
     for (uint32_t branch_id : branch_ids) {
-        const BranchRuntime& branch = run.branches.at(branch_id);
+        const BranchRuntime& branch = *run.branches.at(branch_id);
         std::vector<PendingAsyncOperation> pending_asyncs;
         if (branch.pending_async.has_value()) {
             append_unique_pending_async(pending_asyncs, *branch.pending_async);
@@ -1937,12 +2089,17 @@ bool ExecutionEngine::restore_run_from_snapshot(
         }
         return false;
     }
-    if (const auto missing_graph_id = missing_subgraph_graph_id(runtime_graph, graph_registry_);
-        missing_graph_id.has_value()) {
-        if (error_message != nullptr) {
-            *error_message = "subgraph target graph is not registered: " + std::to_string(*missing_graph_id);
+    for (const NodeDefinition& node : runtime_graph.nodes) {
+        if (node.kind != NodeKind::Subgraph || !node.subgraph.has_value()) {
+            continue;
         }
-        return false;
+        if (registered_graph(node.subgraph->graph_id) == nullptr) {
+            if (error_message != nullptr) {
+                *error_message =
+                    "subgraph target graph is not registered: " + std::to_string(node.subgraph->graph_id);
+            }
+            return false;
+        }
     }
 
     RunRuntime runtime;
@@ -1954,31 +2111,31 @@ bool ExecutionEngine::restore_run_from_snapshot(
     restore_subgraph_session_table(runtime.committed_subgraph_sessions, snapshot.committed_subgraph_sessions);
 
     for (const BranchSnapshot& branch_snapshot : snapshot.branches) {
-        BranchRuntime branch;
-        branch.frame = branch_snapshot.frame;
-        branch.state_store = branch_snapshot.state_store;
-        branch.retry_count = branch_snapshot.retry_count;
-        branch.pending_async = branch_snapshot.pending_async;
-        branch.pending_async_group = branch_snapshot.pending_async_group;
-        branch.pending_subgraph = branch_snapshot.pending_subgraph;
-        branch.join_stack = branch_snapshot.join_stack;
-        branch.reactive_root_node_id = branch_snapshot.reactive_root_node_id;
-        if (branch.pending_subgraph.has_value()) {
-            branch.last_subgraph_session_id = branch.pending_subgraph->session_id;
-            branch.last_subgraph_session_revision = branch.pending_subgraph->session_revision;
+        auto branch = std::make_shared<BranchRuntime>();
+        branch->frame = branch_snapshot.frame;
+        branch->state_store = branch_snapshot.state_store;
+        branch->retry_count = branch_snapshot.retry_count;
+        branch->pending_async = branch_snapshot.pending_async;
+        branch->pending_async_group = branch_snapshot.pending_async_group;
+        branch->pending_subgraph = branch_snapshot.pending_subgraph;
+        branch->join_stack = branch_snapshot.join_stack;
+        branch->reactive_root_node_id = branch_snapshot.reactive_root_node_id;
+        if (branch->pending_subgraph.has_value()) {
+            branch->last_subgraph_session_id = branch->pending_subgraph->session_id;
+            branch->last_subgraph_session_revision = branch->pending_subgraph->session_revision;
         }
-        runtime.branches.emplace(branch.frame.active_branch_id, std::move(branch));
+        runtime.branches.emplace(branch->frame.active_branch_id, std::move(branch));
     }
 
     for (const auto& [branch_id, branch] : runtime.branches) {
-        if (!branch.pending_subgraph.has_value() || branch.pending_subgraph->session_id.empty()) {
+        if (!branch->pending_subgraph.has_value() || branch->pending_subgraph->session_id.empty()) {
             continue;
         }
         std::string lease_error;
         if (!acquire_subgraph_session_lease(
                 runtime.active_subgraph_session_leases,
-                branch.frame.current_node,
-                branch.pending_subgraph->session_id,
+                branch->frame.current_node,
+                branch->pending_subgraph->session_id,
                 branch_id,
                 &lease_error
             )) {
@@ -2030,7 +2187,8 @@ bool ExecutionEngine::restore_run_from_snapshot(
     std::size_t local_missing_async_handles = 0U;
     if (restore_async_waiters) {
         for (const BranchSnapshot& branch_snapshot : snapshot.branches) {
-            for (const PendingAsyncOperation& pending_async : collect_pending_async_operations(branch_snapshot)) {
+            if (branch_snapshot.pending_async.has_value()) {
+                const PendingAsyncOperation pending_async = *branch_snapshot.pending_async;
                 bool restored_async = false;
                 switch (pending_async.kind) {
                     case AsyncOperationKind::Tool:
@@ -2064,6 +2222,63 @@ bool ExecutionEngine::restore_run_from_snapshot(
                 } else {
                     local_missing_async_handles += 1U;
                 }
+            }
+
+            std::vector<AsyncWaitKey> group_wait_keys;
+            bool missing_group_handle = false;
+            for (const PendingAsyncOperation& pending_async : branch_snapshot.pending_async_group) {
+                bool restored_async = false;
+                switch (pending_async.kind) {
+                    case AsyncOperationKind::Tool:
+                        if (runtime_tools().has_async_handle(AsyncToolHandle{pending_async.handle_id})) {
+                            restored_async = true;
+                        } else if (const AsyncToolSnapshot* pending_tool_snapshot =
+                                       find_pending_tool_snapshot(branch_snapshot, pending_async.handle_id);
+                                   pending_tool_snapshot != nullptr) {
+                            const AsyncToolHandle restored_handle =
+                                runtime_tools().restore_async_operation(*pending_tool_snapshot);
+                            restored_async = (restored_handle.id == pending_async.handle_id);
+                        }
+                        break;
+                    case AsyncOperationKind::Model:
+                        if (runtime_models().has_async_handle(AsyncModelHandle{pending_async.handle_id})) {
+                            restored_async = true;
+                        } else if (const AsyncModelSnapshot* pending_model_snapshot =
+                                       find_pending_model_snapshot(branch_snapshot, pending_async.handle_id);
+                                   pending_model_snapshot != nullptr) {
+                            const AsyncModelHandle restored_handle =
+                                runtime_models().restore_async_operation(*pending_model_snapshot);
+                            restored_async = (restored_handle.id == pending_async.handle_id);
+                        }
+                        break;
+                    case AsyncOperationKind::None:
+                        break;
+                }
+
+                if (!restored_async) {
+                    local_missing_async_handles += 1U;
+                    missing_group_handle = true;
+                    continue;
+                }
+
+                const AsyncWaitKey wait_key = async_wait_key_for(pending_async);
+                if (!wait_key.valid() ||
+                    std::find(group_wait_keys.begin(), group_wait_keys.end(), wait_key) != group_wait_keys.end()) {
+                    continue;
+                }
+                group_wait_keys.push_back(wait_key);
+            }
+
+            if (!missing_group_handle && !group_wait_keys.empty()) {
+                scheduler_.register_async_wait_group(
+                    group_wait_keys,
+                    ScheduledTask{
+                        run_id,
+                        branch_snapshot.frame.current_node,
+                        branch_snapshot.frame.active_branch_id,
+                        0U
+                    }
+                );
             }
         }
     }
@@ -2140,7 +2355,6 @@ bool ExecutionEngine::should_capture_checkpoint_snapshot(
 
 ExecutionEngine::TaskExecutionRecord ExecutionEngine::execute_task(RunRuntime& run, const ScheduledTask& task) {
     std::unique_lock<std::mutex> lock(*run.mutex);
-    const NodeDefinition* node_ptr = run.graph.find_node(task.node_id);
     TaskExecutionRecord record;
     record.task = task;
     record.started_at_ns = now_ns();
@@ -2154,7 +2368,8 @@ ExecutionEngine::TaskExecutionRecord ExecutionEngine::execute_task(RunRuntime& r
         return record;
     }
 
-    BranchRuntime& branch = branch_iterator->second;
+    const BranchPtr branch_ptr = branch_iterator->second;
+    BranchRuntime& branch = *branch_ptr;
     const NodeDefinition* node = run.graph.find_node(task.node_id);
     if (node == nullptr || (node->executor == nullptr && node->kind != NodeKind::Subgraph)) {
         branch.frame.status = ExecutionStatus::Failed;
@@ -2197,12 +2412,31 @@ ExecutionEngine::TaskExecutionRecord ExecutionEngine::execute_task(RunRuntime& r
     // Capture necessary state before releasing the lock
     const std::vector<std::byte> runtime_config_payload = run.runtime_config_payload;
     const GraphId graph_id = branch.frame.graph_id;
+    TraceSink task_trace_sink;
+    if (node->kind != NodeKind::Subgraph &&
+        !branch.pending_async.has_value() &&
+        branch.pending_async_group.empty()) {
+        if (const std::optional<NodeResult> cached_result =
+                branch.memo_cache.lookup(*node, branch.state_store.get_current_state(), runtime_config_payload);
+            cached_result.has_value()) {
+            record.node_result = *cached_result;
+            record.ended_at_ns = now_ns();
+            record.progressed = true;
+            return record;
+        }
+    }
 
     lock.unlock();
 
     try {
         if (node->kind == NodeKind::Subgraph) {
-            record.node_result = execute_subgraph_node(record.task.run_id, run, *node, branch);
+            record.node_result = execute_subgraph_node(
+                record.task.run_id,
+                run,
+                *node,
+                branch_ptr,
+                &record.deferred_trace_events
+            );
         } else {
             std::vector<TaskRecord> recorded_effects;
             ExecutionContext context{
@@ -2219,7 +2453,7 @@ ExecutionEngine::TaskExecutionRecord ExecutionEngine::execute_task(RunRuntime& r
                 branch.state_store.task_journal(),
                 runtime_tools(),
                 runtime_models(),
-                trace_sink_,
+                task_trace_sink,
                 Deadline(
                     node->timeout_ms == 0U
                         ? 0U
@@ -2249,11 +2483,25 @@ ExecutionEngine::TaskExecutionRecord ExecutionEngine::execute_task(RunRuntime& r
         record.error_message = "unknown execution failure";
     }
 
+    if (node->kind != NodeKind::Subgraph) {
+        record.deferred_trace_events = task_trace_sink.events();
+    }
+
     lock.lock();
     record.ended_at_ns = now_ns();
 
     if (branch.cancel.is_cancelled()) {
         record.node_result.status = NodeResult::Cancelled;
+    }
+
+    if (node->kind != NodeKind::Subgraph &&
+        !branch.cancel.is_cancelled()) {
+        branch.memo_cache.store(
+            *node,
+            branch.state_store.get_current_state(),
+            runtime_config_payload,
+            record.node_result
+        );
     }
 
     record.progressed = true;
@@ -2264,21 +2512,28 @@ NodeResult ExecutionEngine::execute_subgraph_node(
     RunId run_id,
     RunRuntime& run,
     const NodeDefinition& node,
-    BranchRuntime& branch
+    const BranchPtr& branch_ptr,
+    std::vector<TraceEvent>* deferred_trace_events
 ) {
+    BranchRuntime& branch = *branch_ptr;
+    if (runtime_debug_enabled()) {
+        runtime_debug_log(
+            "execute_subgraph_node:start parent_run=" + std::to_string(run_id) +
+            " node=" + std::to_string(node.id) +
+            " branch=" + std::to_string(branch.frame.active_branch_id) +
+            " pending_async=" + std::to_string(branch.pending_async.has_value() ? branch.pending_async->handle_id : 0U) +
+            " pending_group=" + std::to_string(branch.pending_async_group.size()) +
+            " has_pending_subgraph=" + std::to_string(branch.pending_subgraph.has_value() ? 1 : 0)
+        );
+    }
     if (!node.subgraph.has_value() || !node.subgraph->valid()) {
         throw std::runtime_error("subgraph node is missing a valid binding");
     }
 
-    const auto target_graph_iterator = graph_registry_.find(node.subgraph->graph_id);
-    if (target_graph_iterator == graph_registry_.end()) {
+    const GraphDefinition* target_graph = registered_graph(node.subgraph->graph_id);
+    if (target_graph == nullptr) {
         throw std::runtime_error("subgraph target graph is not registered");
     }
-
-    ExecutionEngine child_engine(1U, true);
-    child_engine.set_checkpoint_policy(checkpoint_policy_);
-    child_engine.borrow_runtime_registries(runtime_tools(), runtime_models());
-    child_engine.graph_registry_ = graph_registry_;
 
     const bool persistent_session = is_persistent_subgraph_binding(*node.subgraph);
     std::string active_session_id;
@@ -2349,298 +2604,523 @@ NodeResult ExecutionEngine::execute_subgraph_node(
         );
     };
 
-    try {
-    RunId child_run_id = 0U;
-    if (branch.pending_subgraph.has_value()) {
-        if (!branch.pending_subgraph->valid()) {
-            throw std::runtime_error("pending subgraph snapshot is invalid");
+    SubgraphChildEnginePool::Lease child_engine_lease;
+    ExecutionEngine* child_engine_ptr = nullptr;
+    auto ensure_child_engine = [&]() -> ExecutionEngine& {
+        if (child_engine_ptr == nullptr) {
+            child_engine_lease = subgraph_engine_pool_->acquire(*this);
+            child_engine_ptr = &*child_engine_lease;
         }
-
-        const RunSnapshot child_snapshot =
-            deserialize_run_snapshot_bytes(branch.pending_subgraph->snapshot_bytes);
-        std::string restore_error;
-        std::size_t missing_async_handles = 0U;
-        child_run_id = branch.pending_subgraph->child_run_id;
-        if (!child_engine.restore_run_from_snapshot(
-                child_run_id,
-                child_snapshot,
-                &restore_error,
-                &missing_async_handles,
-                false,
-                !branch.pending_async.has_value() && branch.pending_async_group.empty()
-            )) {
-            throw std::runtime_error(
-                restore_error.empty()
-                    ? "failed to restore nested subgraph snapshot"
-                    : restore_error
-            );
-        }
-        if (missing_async_handles != 0U) {
-            throw std::runtime_error("nested subgraph restore lost async handles");
-        }
-    } else {
-        InputEnvelope child_input;
-        child_input.initial_field_count = infer_subgraph_initial_field_count(*node.subgraph);
-        child_input.runtime_config_payload = run.runtime_config_payload;
-
-        child_run_id = child_engine.start(target_graph_iterator->second, child_input);
-        BranchRuntime& child_root_branch = child_engine.runs_.at(child_run_id).branches.at(0U);
-        bool seed_knowledge_graph = node.subgraph->propagate_knowledge_graph;
-        if (committed_session_snapshot || committed_session_projection || !committed_session_snapshot_bytes.empty()) {
-            if (!committed_session_projection) {
-                const RunSnapshot committed_snapshot = committed_session_snapshot != nullptr
-                    ? *committed_session_snapshot
-                    : deserialize_run_snapshot_bytes(committed_session_snapshot_bytes);
-                std::string projection_error;
-                const std::optional<StateStore> committed_projection =
-                    project_subgraph_session_state(committed_snapshot, &projection_error);
-                if (!committed_projection.has_value()) {
-                    release_active_session_lease();
-                    NodeResult result;
-                    result.status = NodeResult::HardFail;
-                    result.flags = kToolFlagValidationError;
-                    return result;
-                }
-                committed_session_projection = std::make_shared<StateStore>(*committed_projection);
-            }
-            child_root_branch.state_store = *committed_session_projection;
-            seed_knowledge_graph = false;
-        }
-        const StatePatch child_input_patch =
-            build_subgraph_input_patch(
-                branch.state_store,
-                *node.subgraph,
-                child_root_branch.state_store,
-                seed_knowledge_graph
-            );
-        if (!child_input_patch.empty()) {
-            static_cast<void>(child_root_branch.state_store.apply(child_input_patch));
-        }
-    }
-
-    auto pending_async_ready = [this](const PendingAsyncOperation& pending_async) {
-        switch (pending_async.kind) {
-            case AsyncOperationKind::Tool:
-                return runtime_tools().is_async_ready(AsyncToolHandle{pending_async.handle_id});
-            case AsyncOperationKind::Model:
-                return runtime_models().is_async_ready(AsyncModelHandle{pending_async.handle_id});
-            case AsyncOperationKind::None:
-                return false;
-        }
-        return false;
+        return *child_engine_ptr;
     };
 
-    auto resume_child_branches = [&](const std::vector<PendingAsyncOperation>& ready_asyncs) {
-        RunRuntime& child_runtime = child_engine.runs_.at(child_run_id);
-        bool resumed_branch = false;
-        for (auto& [child_branch_id, child_branch] : child_runtime.branches) {
-            if (!child_branch.pending_async.has_value()) {
-                continue;
-            }
-
-            const bool matched_ready_async = std::any_of(
-                ready_asyncs.begin(),
-                ready_asyncs.end(),
-                [&child_branch](const PendingAsyncOperation& ready_async) {
-                    return pending_async_equal(*child_branch.pending_async, ready_async);
-                }
-            );
-            if (!matched_ready_async) {
-                continue;
-            }
-
-            child_engine.scheduler_.enqueue_task(ScheduledTask{
-                child_run_id,
-                child_branch.frame.current_node,
-                child_branch_id,
-                now_ns()
-            });
-            child_branch.frame.status = ExecutionStatus::Running;
-            resumed_branch = true;
-        }
-        return resumed_branch;
-    };
-
-    auto import_child_trace = [&]() -> std::vector<TraceEvent> {
+    auto import_child_trace = [&](std::vector<TraceEvent> child_trace, float default_confidence = 1.0F) -> float {
         const ExecutionNamespaceRef prefix{
             run.graph.id,
             node.id,
             active_session_id,
             active_session_revision
         };
-        std::vector<TraceEvent> child_trace = child_engine.trace().events_for_run(child_run_id);
-        for (TraceEvent child_event : child_trace) {
+        if (child_trace.empty()) {
+            return default_confidence;
+        }
+
+        const float confidence = child_trace.back().confidence;
+        for (TraceEvent& child_event : child_trace) {
             child_event.run_id = run_id;
             if (child_event.session_id.empty()) {
                 child_event.session_id = active_session_id;
                 child_event.session_revision = active_session_revision;
             }
             child_event.namespace_path = prefix_namespace_path(prefix, child_event.namespace_path);
-            trace_sink_.emit(child_event);
         }
-        return child_trace;
+        if (deferred_trace_events != nullptr) {
+            deferred_trace_events->insert(
+                deferred_trace_events->end(),
+                std::make_move_iterator(child_trace.begin()),
+                std::make_move_iterator(child_trace.end())
+            );
+        }
+        return confidence;
     };
 
-    auto snapshot_waiting_child = [&]() -> NodeResult {
-        RunRuntime& child_runtime = child_engine.runs_.at(child_run_id);
-        child_engine.scheduler_.remove_run(child_run_id);
-        child_engine.update_run_status(child_runtime, child_run_id);
-        const RunSnapshot child_snapshot = child_engine.snapshot_run(child_run_id, child_runtime);
-        branch.pending_subgraph = PendingSubgraphExecution{
-            child_run_id,
-            serialize_run_snapshot_bytes(child_snapshot),
-            active_session_id,
-            active_session_revision
+    try {
+        auto materialize_committed_session_projection = [&]() -> bool {
+            if (committed_session_projection != nullptr ||
+                (committed_session_snapshot == nullptr && committed_session_snapshot_bytes.empty())) {
+                return true;
+            }
+
+            const RunSnapshot committed_snapshot = committed_session_snapshot != nullptr
+                ? *committed_session_snapshot
+                : deserialize_run_snapshot_bytes(committed_session_snapshot_bytes);
+            std::string projection_error;
+            const std::optional<StateStore> committed_projection =
+                project_subgraph_session_state(committed_snapshot, &projection_error);
+            if (!committed_projection.has_value()) {
+                release_active_session_lease();
+                return false;
+            }
+            committed_session_projection = std::make_shared<StateStore>(*committed_projection);
+            return true;
         };
-        const std::vector<TraceEvent> child_trace = import_child_trace();
-        const float confidence = child_trace.empty() ? 1.0F : child_trace.back().confidence;
 
-        branch.pending_async_group.clear();
-        std::vector<PendingAsyncOperation> bubbled_waits;
-        for (const BranchSnapshot& child_branch_snapshot : child_snapshot.branches) {
-            for (const PendingAsyncOperation& pending_async : collect_pending_async_operations(child_branch_snapshot)) {
-                append_unique_pending_async(bubbled_waits, pending_async);
+        if (!branch.pending_subgraph.has_value() &&
+            inline_single_branch_subgraph_eligible(*target_graph)) {
+            if (runtime_debug_enabled()) {
+                runtime_debug_log(
+                    "execute_subgraph_node:inline child run parent_run=" + std::to_string(run_id) +
+                    " child_graph=" + std::to_string(target_graph->id)
+                );
+            }
+
+            StateStore inline_child_state(infer_subgraph_initial_field_count(*node.subgraph));
+            bool seed_knowledge_graph = node.subgraph->propagate_knowledge_graph;
+            if (committed_session_snapshot != nullptr ||
+                committed_session_projection != nullptr ||
+                !committed_session_snapshot_bytes.empty()) {
+                if (!materialize_committed_session_projection()) {
+                    NodeResult result;
+                    result.status = NodeResult::HardFail;
+                    result.flags = kToolFlagValidationError;
+                    return result;
+                }
+                inline_child_state = *committed_session_projection;
+                seed_knowledge_graph = false;
+            }
+
+            const StatePatch inline_input_patch = build_subgraph_input_patch(
+                branch.state_store,
+                *node.subgraph,
+                inline_child_state,
+                seed_knowledge_graph
+            );
+            if (!inline_input_patch.empty()) {
+                static_cast<void>(inline_child_state.apply(inline_input_patch));
+            }
+
+            InlineSingleBranchSubgraphResult inline_result = run_inline_single_branch_subgraph(
+                *target_graph,
+                target_graph->entry,
+                std::move(inline_child_state),
+                run.runtime_config_payload,
+                runtime_tools(),
+                runtime_models()
+            );
+            const float confidence =
+                import_child_trace(std::move(inline_result.trace_events), inline_result.confidence);
+
+            if (inline_result.outcome == InlineSingleBranchSubgraphOutcome::Waiting) {
+                const RunSnapshot child_snapshot = build_inline_single_branch_subgraph_snapshot(
+                    *target_graph,
+                    run.runtime_config_payload,
+                    inline_result.state_store,
+                    inline_result.frame,
+                    inline_result.retry_count,
+                    inline_result.pending_async,
+                    runtime_tools(),
+                    runtime_models()
+                );
+                branch.pending_subgraph = PendingSubgraphExecution{
+                    kInlineSubgraphResumableRunId,
+                    serialize_run_snapshot_bytes(child_snapshot),
+                    active_session_id,
+                    active_session_revision
+                };
+                branch.pending_async_group.clear();
+
+                NodeResult result = NodeResult::waiting({}, confidence);
+                if (inline_result.pending_async.has_value()) {
+                    result.pending_async = inline_result.pending_async;
+                }
+                if (runtime_debug_enabled()) {
+                    runtime_debug_log(
+                        "execute_subgraph_node:inline waiting parent_run=" + std::to_string(run_id) +
+                        " child_run=" + std::to_string(kInlineSubgraphResumableRunId) +
+                        " bubbled_waits=" + std::to_string(result.pending_async.has_value() ? 1U : 0U)
+                    );
+                }
+                return result;
+            }
+
+            branch.pending_subgraph.reset();
+            branch.pending_async_group.clear();
+
+            if (inline_result.outcome == InlineSingleBranchSubgraphOutcome::Failed) {
+                release_active_session_lease();
+                NodeResult result;
+                result.status = NodeResult::HardFail;
+                result.confidence = confidence;
+                result.flags = kToolFlagValidationError;
+                return result;
+            }
+            if (inline_result.outcome == InlineSingleBranchSubgraphOutcome::Cancelled) {
+                release_active_session_lease();
+                NodeResult result;
+                result.status = NodeResult::Cancelled;
+                result.confidence = confidence;
+                return result;
+            }
+            if (inline_result.outcome != InlineSingleBranchSubgraphOutcome::Completed) {
+                throw std::runtime_error("inline subgraph execution returned an unsupported outcome");
+            }
+
+            if (persistent_session) {
+                const RunSnapshot child_snapshot = build_inline_single_branch_subgraph_snapshot(
+                    *target_graph,
+                    run.runtime_config_payload,
+                    inline_result.state_store,
+                    inline_result.frame,
+                    inline_result.retry_count,
+                    std::nullopt,
+                    runtime_tools(),
+                    runtime_models()
+                );
+                std::lock_guard<std::mutex> session_guard(*run.subgraph_session_mutex);
+                store_committed_subgraph_session(
+                    run.committed_subgraph_sessions,
+                    node.id,
+                    active_session_id,
+                    active_session_revision,
+                    {},
+                    std::make_shared<RunSnapshot>(child_snapshot),
+                    std::make_shared<StateStore>(inline_result.state_store)
+                );
+                release_subgraph_session_lease(
+                    run.active_subgraph_session_leases,
+                    node.id,
+                    active_session_id,
+                    branch.frame.active_branch_id
+                );
+            }
+
+            StatePatch patch = build_subgraph_output_patch(
+                inline_result.state_store,
+                *node.subgraph,
+                branch.state_store
+            );
+            return NodeResult::success(std::move(patch), confidence);
+        }
+
+        RunId child_run_id = 0U;
+        if (branch.pending_subgraph.has_value()) {
+            if (runtime_debug_enabled()) {
+                runtime_debug_log(
+                    "execute_subgraph_node:restore child snapshot parent_run=" + std::to_string(run_id)
+                );
+            }
+            if (!branch.pending_subgraph->valid()) {
+                throw std::runtime_error("pending subgraph snapshot is invalid");
+            }
+
+            ExecutionEngine& child_engine = ensure_child_engine();
+            const RunSnapshot child_snapshot =
+                deserialize_run_snapshot_bytes(branch.pending_subgraph->snapshot_bytes);
+            std::string restore_error;
+            std::size_t missing_async_handles = 0U;
+            child_run_id = branch.pending_subgraph->child_run_id;
+            if (!child_engine.restore_run_from_snapshot(
+                    child_run_id,
+                    child_snapshot,
+                    &restore_error,
+                    &missing_async_handles,
+                    false,
+                    !branch.pending_async.has_value() && branch.pending_async_group.empty()
+                )) {
+                throw std::runtime_error(
+                    restore_error.empty()
+                        ? "failed to restore nested subgraph snapshot"
+                        : restore_error
+                );
+            }
+            if (missing_async_handles != 0U) {
+                throw std::runtime_error("nested subgraph restore lost async handles");
+            }
+        } else {
+            if (runtime_debug_enabled()) {
+                runtime_debug_log(
+                    "execute_subgraph_node:start child run parent_run=" + std::to_string(run_id) +
+                    " child_graph=" + std::to_string(target_graph->id)
+                );
+            }
+
+            ExecutionEngine& child_engine = ensure_child_engine();
+            InputEnvelope child_input;
+            child_input.initial_field_count = infer_subgraph_initial_field_count(*node.subgraph);
+            child_input.runtime_config_payload = run.runtime_config_payload;
+
+            child_run_id = child_engine.start(*target_graph, child_input);
+            if (runtime_debug_enabled()) {
+                runtime_debug_log(
+                    "execute_subgraph_node:child run started parent_run=" + std::to_string(run_id) +
+                    " child_run=" + std::to_string(child_run_id)
+                );
+            }
+            BranchRuntime& child_root_branch = *child_engine.runs_.at(child_run_id).branches.at(0U);
+            bool seed_knowledge_graph = node.subgraph->propagate_knowledge_graph;
+            if (committed_session_snapshot != nullptr ||
+                committed_session_projection != nullptr ||
+                !committed_session_snapshot_bytes.empty()) {
+                if (!materialize_committed_session_projection()) {
+                    NodeResult result;
+                    result.status = NodeResult::HardFail;
+                    result.flags = kToolFlagValidationError;
+                    return result;
+                }
+                child_root_branch.state_store = *committed_session_projection;
+                seed_knowledge_graph = false;
+            }
+            const StatePatch child_input_patch =
+                build_subgraph_input_patch(
+                    branch.state_store,
+                    *node.subgraph,
+                    child_root_branch.state_store,
+                    seed_knowledge_graph
+                );
+            if (!child_input_patch.empty()) {
+                static_cast<void>(child_root_branch.state_store.apply(child_input_patch));
             }
         }
 
-        NodeResult result = NodeResult::waiting({}, confidence);
-        if (bubbled_waits.size() == 1U) {
-            result.pending_async = bubbled_waits.front();
-        } else if (!bubbled_waits.empty()) {
-            branch.pending_async_group = std::move(bubbled_waits);
+        if (runtime_debug_enabled()) {
+            runtime_debug_log(
+                "execute_subgraph_node:enter child loop parent_run=" + std::to_string(run_id) +
+                " child_run=" + std::to_string(child_run_id)
+            );
         }
-        return result;
-    };
 
-    if (branch.pending_async.has_value()) {
-        if (!pending_async_ready(*branch.pending_async)) {
-            NodeResult result = NodeResult::waiting({}, 1.0F);
-            result.pending_async = branch.pending_async;
+        auto pending_async_ready = [this](const PendingAsyncOperation& pending_async) {
+            switch (pending_async.kind) {
+                case AsyncOperationKind::Tool:
+                    return runtime_tools().is_async_ready(AsyncToolHandle{pending_async.handle_id});
+                case AsyncOperationKind::Model:
+                    return runtime_models().is_async_ready(AsyncModelHandle{pending_async.handle_id});
+                case AsyncOperationKind::None:
+                    return false;
+            }
+            return false;
+        };
+
+        auto resume_child_branches = [&](const std::vector<PendingAsyncOperation>& ready_asyncs) {
+            ExecutionEngine& child_engine = ensure_child_engine();
+            RunRuntime& child_runtime = child_engine.runs_.at(child_run_id);
+            bool resumed_branch = false;
+            for (auto& [child_branch_id, child_branch] : child_runtime.branches) {
+                if (!child_branch->pending_async.has_value()) {
+                    continue;
+                }
+
+                const bool matched_ready_async = std::any_of(
+                    ready_asyncs.begin(),
+                    ready_asyncs.end(),
+                    [&child_branch](const PendingAsyncOperation& ready_async) {
+                        return pending_async_equal(*child_branch->pending_async, ready_async);
+                    }
+                );
+                if (!matched_ready_async) {
+                    continue;
+                }
+
+                child_engine.scheduler_.enqueue_task(ScheduledTask{
+                    child_run_id,
+                    child_branch->frame.current_node,
+                    child_branch_id,
+                    now_ns()
+                });
+                child_branch->frame.status = ExecutionStatus::Running;
+                resumed_branch = true;
+            }
+            return resumed_branch;
+        };
+
+        auto snapshot_waiting_child = [&]() -> NodeResult {
+            ExecutionEngine& child_engine = ensure_child_engine();
+            RunRuntime& child_runtime = child_engine.runs_.at(child_run_id);
+            child_engine.scheduler_.remove_run(child_run_id);
+            child_engine.update_run_status(child_runtime, child_run_id);
+            const RunSnapshot child_snapshot = child_engine.snapshot_run(child_run_id, child_runtime);
+            branch.pending_subgraph = PendingSubgraphExecution{
+                child_run_id,
+                serialize_run_snapshot_bytes(child_snapshot),
+                active_session_id,
+                active_session_revision
+            };
+            const float confidence =
+                import_child_trace(child_engine.trace().take_events_for_run(child_run_id));
+
+            branch.pending_async_group.clear();
+            std::vector<PendingAsyncOperation> bubbled_waits;
+            for (const BranchSnapshot& child_branch_snapshot : child_snapshot.branches) {
+                for (const PendingAsyncOperation& pending_async :
+                     collect_pending_async_operations(child_branch_snapshot)) {
+                    append_unique_pending_async(bubbled_waits, pending_async);
+                }
+            }
+
+            NodeResult result = NodeResult::waiting({}, confidence);
+            if (bubbled_waits.size() == 1U) {
+                result.pending_async = bubbled_waits.front();
+            } else if (!bubbled_waits.empty()) {
+                branch.pending_async_group = std::move(bubbled_waits);
+            }
+            if (runtime_debug_enabled()) {
+                runtime_debug_log(
+                    "execute_subgraph_node:waiting parent_run=" + std::to_string(run_id) +
+                    " child_run=" + std::to_string(child_run_id) +
+                    " child_status=" + std::to_string(static_cast<uint32_t>(child_runtime.status)) +
+                    " bubbled_waits=" + std::to_string(
+                        result.pending_async.has_value() ? 1U : branch.pending_async_group.size()
+                    )
+                );
+            }
             return result;
-        }
+        };
 
-        if (!resume_child_branches(std::vector<PendingAsyncOperation>{*branch.pending_async}) &&
-            !child_engine.scheduler_.has_tasks_for_run(child_run_id)) {
-            throw std::runtime_error("nested subgraph resume could not find an async continuation branch");
-        }
-        branch.pending_async.reset();
-        branch.pending_async_group.clear();
-    } else if (!branch.pending_async_group.empty()) {
-        std::vector<PendingAsyncOperation> ready_asyncs;
-        for (const PendingAsyncOperation& pending_async : branch.pending_async_group) {
-            if (pending_async_ready(pending_async)) {
-                append_unique_pending_async(ready_asyncs, pending_async);
+        if (branch.pending_async.has_value()) {
+            if (!pending_async_ready(*branch.pending_async)) {
+                NodeResult result = NodeResult::waiting({}, 1.0F);
+                result.pending_async = branch.pending_async;
+                return result;
             }
+
+            ExecutionEngine& child_engine = ensure_child_engine();
+            if (!resume_child_branches(std::vector<PendingAsyncOperation>{*branch.pending_async}) &&
+                !child_engine.scheduler_.has_tasks_for_run(child_run_id)) {
+                throw std::runtime_error("nested subgraph resume could not find an async continuation branch");
+            }
+            branch.pending_async.reset();
+            branch.pending_async_group.clear();
+        } else if (!branch.pending_async_group.empty()) {
+            std::vector<PendingAsyncOperation> ready_asyncs;
+            for (const PendingAsyncOperation& pending_async : branch.pending_async_group) {
+                if (pending_async_ready(pending_async)) {
+                    append_unique_pending_async(ready_asyncs, pending_async);
+                }
+            }
+
+            if (ready_asyncs.size() != branch.pending_async_group.size()) {
+                return NodeResult::waiting({}, 1.0F);
+            }
+
+            ExecutionEngine& child_engine = ensure_child_engine();
+            if (!resume_child_branches(ready_asyncs) &&
+                !child_engine.scheduler_.has_tasks_for_run(child_run_id)) {
+                throw std::runtime_error(
+                    "nested subgraph multi-wait resume found no runnable continuation branch"
+                );
+            }
+            branch.pending_async_group.clear();
         }
 
-        if (ready_asyncs.empty()) {
-            return NodeResult::waiting({}, 1.0F);
-        }
+        ExecutionEngine& child_engine = ensure_child_engine();
+        while (true) {
+            const StepResult child_step = child_engine.step(child_run_id);
+            if (runtime_debug_enabled()) {
+                runtime_debug_log(
+                    "execute_subgraph_node:child_step parent_run=" + std::to_string(run_id) +
+                    " child_run=" + std::to_string(child_run_id) +
+                    " progressed=" + std::to_string(child_step.progressed ? 1 : 0) +
+                    " waiting=" + std::to_string(child_step.waiting ? 1 : 0) +
+                    " status=" + std::to_string(static_cast<uint32_t>(child_step.status)) +
+                    " node_status=" + std::to_string(static_cast<uint32_t>(child_step.node_status)) +
+                    " checkpoint=" + std::to_string(child_step.checkpoint_id)
+                );
+            }
+            if (!child_step.progressed) {
+                if (child_step.waiting) {
+                    return snapshot_waiting_child();
+                }
+                if (child_step.status == ExecutionStatus::Running) {
+                    throw std::runtime_error("subgraph runtime stalled without progress");
+                }
+                break;
+            }
 
-        if (!resume_child_branches(ready_asyncs) &&
-            !child_engine.scheduler_.has_tasks_for_run(child_run_id)) {
-            throw std::runtime_error("nested subgraph multi-wait resume found no runnable continuation branch");
-        }
-        branch.pending_async_group.clear();
-    }
+            if (child_step.status == ExecutionStatus::Completed ||
+                child_step.status == ExecutionStatus::Failed ||
+                child_step.status == ExecutionStatus::Cancelled) {
+                break;
+            }
 
-    while (true) {
-        const StepResult child_step = child_engine.step(child_run_id);
-        if (!child_step.progressed) {
+            if (child_step.waiting &&
+                child_engine.scheduler_.has_ready_for_run(child_run_id, now_ns())) {
+                continue;
+            }
             if (child_step.waiting) {
                 return snapshot_waiting_child();
             }
-            if (child_step.status == ExecutionStatus::Running) {
-                throw std::runtime_error("subgraph runtime stalled without progress");
-            }
-            break;
         }
 
-        if (child_step.status == ExecutionStatus::Completed ||
-            child_step.status == ExecutionStatus::Failed ||
-            child_step.status == ExecutionStatus::Cancelled) {
-            break;
+        const RunRuntime& child_run = child_engine.runs_.at(child_run_id);
+        const RunSnapshot child_snapshot = child_engine.snapshot_run(child_run_id, child_run);
+        const float confidence =
+            import_child_trace(child_engine.trace().take_events_for_run(child_run_id));
+        branch.pending_subgraph.reset();
+        branch.pending_async_group.clear();
+
+        if (child_run.status == ExecutionStatus::Failed) {
+            release_active_session_lease();
+            NodeResult result;
+            result.status = NodeResult::HardFail;
+            result.confidence = confidence;
+            result.flags = kToolFlagValidationError;
+            return result;
+        }
+        if (child_run.status == ExecutionStatus::Cancelled) {
+            release_active_session_lease();
+            NodeResult result;
+            result.status = NodeResult::Cancelled;
+            result.confidence = confidence;
+            return result;
+        }
+        if (child_run.status != ExecutionStatus::Completed) {
+            throw std::runtime_error("subgraph execution did not reach a terminal state");
         }
 
-        if (child_step.waiting &&
-            child_engine.scheduler_.has_ready_for_run(child_run_id, now_ns())) {
-            continue;
+        std::string projection_error;
+        const std::optional<StateStore> projected_child_state =
+            project_subgraph_session_state(child_snapshot, &projection_error);
+        if (!projected_child_state.has_value()) {
+            release_active_session_lease();
+            NodeResult result;
+            result.status = NodeResult::HardFail;
+            result.confidence = confidence;
+            result.flags = kToolFlagValidationError;
+            return result;
         }
-        if (child_step.waiting) {
-            return snapshot_waiting_child();
+
+        if (persistent_session) {
+            std::lock_guard<std::mutex> session_guard(*run.subgraph_session_mutex);
+            store_committed_subgraph_session(
+                run.committed_subgraph_sessions,
+                node.id,
+                active_session_id,
+                active_session_revision,
+                {},
+                std::make_shared<RunSnapshot>(child_snapshot),
+                std::make_shared<StateStore>(*projected_child_state)
+            );
+            release_subgraph_session_lease(
+                run.active_subgraph_session_leases,
+                node.id,
+                active_session_id,
+                branch.frame.active_branch_id
+            );
         }
-    }
 
-    const RunRuntime& child_run = child_engine.runs_.at(child_run_id);
-    const RunSnapshot child_snapshot = child_engine.snapshot_run(child_run_id, child_run);
-    const std::vector<TraceEvent> child_trace = import_child_trace();
-    const float confidence = child_trace.empty() ? 1.0F : child_trace.back().confidence;
-    branch.pending_subgraph.reset();
-    branch.pending_async_group.clear();
-
-    if (child_run.status == ExecutionStatus::Failed) {
-        release_active_session_lease();
-        NodeResult result;
-        result.status = NodeResult::HardFail;
-        result.confidence = confidence;
-        result.flags = kToolFlagValidationError;
-        return result;
-    }
-    if (child_run.status == ExecutionStatus::Cancelled) {
-        release_active_session_lease();
-        NodeResult result;
-        result.status = NodeResult::Cancelled;
-        result.confidence = confidence;
-        return result;
-    }
-    if (child_run.status != ExecutionStatus::Completed) {
-        throw std::runtime_error("subgraph execution did not reach a terminal state");
-    }
-
-    std::string projection_error;
-    const std::optional<StateStore> projected_child_state =
-        project_subgraph_session_state(child_snapshot, &projection_error);
-    if (!projected_child_state.has_value()) {
-        release_active_session_lease();
-        NodeResult result;
-        result.status = NodeResult::HardFail;
-        result.confidence = confidence;
-        result.flags = kToolFlagValidationError;
-        return result;
-    }
-
-    if (persistent_session) {
-        std::lock_guard<std::mutex> session_guard(*run.subgraph_session_mutex);
-        store_committed_subgraph_session(
-            run.committed_subgraph_sessions,
-            node.id,
-            active_session_id,
-            active_session_revision,
-            {},
-            std::make_shared<RunSnapshot>(child_snapshot),
-            std::make_shared<StateStore>(*projected_child_state)
+        StatePatch patch = build_subgraph_output_patch(
+            *projected_child_state,
+            *node.subgraph,
+            branch.state_store
         );
-        release_subgraph_session_lease(
-            run.active_subgraph_session_leases,
-            node.id,
-            active_session_id,
-            branch.frame.active_branch_id
-        );
-    }
-
-    StatePatch patch = build_subgraph_output_patch(
-        *projected_child_state,
-        *node.subgraph,
-        branch.state_store
-    );
-    return NodeResult::success(std::move(patch), confidence);
+        return NodeResult::success(std::move(patch), confidence);
     } catch (...) {
         release_active_session_lease();
         throw;
     }
 }
 
-StepResult ExecutionEngine::commit_task_execution(RunId run_id, RunRuntime& run, const TaskExecutionRecord& record) {
+StepResult ExecutionEngine::commit_task_execution(RunId run_id, RunRuntime& run, TaskExecutionRecord record) {
     std::lock_guard<std::mutex> lock(*run.mutex);
     const NodeDefinition* node_ptr = run.graph.find_node(record.task.node_id);
     StepResult result;
@@ -2658,7 +3138,7 @@ StepResult ExecutionEngine::commit_task_execution(RunId run_id, RunRuntime& run,
         return result;
     }
 
-    BranchRuntime& branch = branch_iterator->second;
+    BranchRuntime& branch = *branch_iterator->second;
     const NodeDefinition* node = run.graph.find_node(record.task.node_id);
     if (node == nullptr) {
         branch.frame.status = ExecutionStatus::Failed;
@@ -2747,11 +3227,11 @@ StepResult ExecutionEngine::commit_task_execution(RunId run_id, RunRuntime& run,
                     return result;
                 }
 
-                if (arrived_branch_iterator->second.reactive_root_node_id.has_value()) {
+                if (arrived_branch_iterator->second->reactive_root_node_id.has_value()) {
                     if (!merged_reactive_root_node_id.has_value()) {
-                        merged_reactive_root_node_id = arrived_branch_iterator->second.reactive_root_node_id;
+                        merged_reactive_root_node_id = arrived_branch_iterator->second->reactive_root_node_id;
                     } else if (*merged_reactive_root_node_id !=
-                               *arrived_branch_iterator->second.reactive_root_node_id) {
+                               *arrived_branch_iterator->second->reactive_root_node_id) {
                         branch.frame.status = ExecutionStatus::Failed;
                         run.status = ExecutionStatus::Failed;
                         result.status = ExecutionStatus::Failed;
@@ -2761,13 +3241,13 @@ StepResult ExecutionEngine::commit_task_execution(RunId run_id, RunRuntime& run,
                 }
 
                 replay_branch_knowledge_graph_delta(
-                    arrived_branch_iterator->second.state_store,
+                    arrived_branch_iterator->second->state_store,
                     join_scope.split_patch_log_offset,
                     merged_state
                 );
                 merged_step_index = std::max(
                     merged_step_index,
-                    arrived_branch_iterator->second.frame.step_index
+                    arrived_branch_iterator->second->frame.step_index
                 );
             }
 
@@ -2811,11 +3291,12 @@ StepResult ExecutionEngine::commit_task_execution(RunId run_id, RunRuntime& run,
                 checkpoint_patch_offset = static_cast<uint64_t>(merged_state.patch_log().size());
             }
 
-            BranchRuntime& survivor_branch = run.branches.at(survivor_branch_id);
+            BranchRuntime& survivor_branch = *run.branches.at(survivor_branch_id);
             survivor_branch.state_store = std::move(merged_state);
             survivor_branch.pending_async.reset();
             survivor_branch.pending_async_group.clear();
             survivor_branch.pending_subgraph.reset();
+            survivor_branch.memo_cache.clear();
             survivor_branch.retry_count = 0;
             survivor_branch.frame.current_node = record.task.node_id;
             survivor_branch.frame.step_index = merged_step_index;
@@ -2847,13 +3328,18 @@ StepResult ExecutionEngine::commit_task_execution(RunId run_id, RunRuntime& run,
             });
             enqueued_tasks = 1U;
             checkpoint_branch_id = survivor_branch_id;
-            checkpoint_branch = &run.branches.at(survivor_branch_id);
+            checkpoint_branch = run.branches.at(survivor_branch_id).get();
             trace_flags |= kTraceFlagJoinMerged;
         } else {
             checkpoint_patch_offset = static_cast<uint64_t>(checkpoint_branch->state_store.patch_log().size());
         }
     } else {
         const StateApplyResult apply_result = branch.state_store.apply_with_summary(record.node_result.patch);
+        if (apply_result.knowledge_graph_delta.empty()) {
+            branch.memo_cache.invalidate(apply_result.changed_keys);
+        } else {
+            branch.memo_cache.clear();
+        }
         checkpoint_patch_offset = apply_result.patch_log_offset;
         const std::vector<uint32_t> reactive_node_indices = collect_reactive_node_indices(
             run.graph,
@@ -2872,10 +3358,36 @@ StepResult ExecutionEngine::commit_task_execution(RunId run_id, RunRuntime& run,
                 branch.pending_async_group.clear();
             }
             if (branch.pending_async.has_value()) {
-                re_register_async_waiter(run_id, record.task.branch_id, *branch.pending_async);
+                re_register_async_waiter_locked(
+                    run_id,
+                    run,
+                    record.task.branch_id,
+                    *branch.pending_async
+                );
             }
-            for (const PendingAsyncOperation& pending_async : branch.pending_async_group) {
-                re_register_async_waiter(run_id, record.task.branch_id, pending_async);
+            if (!branch.pending_async_group.empty()) {
+                std::vector<AsyncWaitKey> wait_group_keys;
+                wait_group_keys.reserve(branch.pending_async_group.size());
+                for (const PendingAsyncOperation& pending_async : branch.pending_async_group) {
+                    const AsyncWaitKey wait_key = async_wait_key_for(pending_async);
+                    if (!wait_key.valid() ||
+                        std::find(wait_group_keys.begin(), wait_group_keys.end(), wait_key) !=
+                            wait_group_keys.end()) {
+                        continue;
+                    }
+                    wait_group_keys.push_back(wait_key);
+                }
+                if (!wait_group_keys.empty()) {
+                    scheduler_.register_async_wait_group(
+                        wait_group_keys,
+                        ScheduledTask{
+                            run_id,
+                            branch.frame.current_node,
+                            record.task.branch_id,
+                            0U
+                        }
+                    );
+                }
             }
         } else if ((record.node_result.status == NodeResult::SoftFail ||
                     record.node_result.status == NodeResult::HardFail) &&
@@ -2969,15 +3481,16 @@ StepResult ExecutionEngine::commit_task_execution(RunId run_id, RunRuntime& run,
                         const uint64_t branch_subgraph_session_revision_template =
                             branch.last_subgraph_session_revision;
                         for (std::size_t index = 1; index < next_edges.size(); ++index) {
-                            BranchRuntime cloned_branch;
-                            cloned_branch.frame = branch_frame_template;
-                            cloned_branch.frame.active_branch_id = run.next_branch_id;
-                            cloned_branch.state_store = branch_state_template;
-                            cloned_branch.retry_count = branch_retry_template;
-                            cloned_branch.join_stack = branch_join_stack_template;
-                            cloned_branch.reactive_root_node_id = branch_reactive_root_template;
-                            cloned_branch.last_subgraph_session_id = branch_subgraph_session_id_template;
-                            cloned_branch.last_subgraph_session_revision =
+                            auto cloned_branch = std::make_shared<BranchRuntime>();
+                            cloned_branch->frame = branch_frame_template;
+                            cloned_branch->frame.active_branch_id = run.next_branch_id;
+                            cloned_branch->state_store = branch_state_template;
+                            cloned_branch->retry_count = branch_retry_template;
+                            cloned_branch->join_stack = branch_join_stack_template;
+                            cloned_branch->reactive_root_node_id = branch_reactive_root_template;
+                            cloned_branch->memo_cache = branch.memo_cache;
+                            cloned_branch->last_subgraph_session_id = branch_subgraph_session_id_template;
+                            cloned_branch->last_subgraph_session_revision =
                                 branch_subgraph_session_revision_template;
                             run.branches.emplace(run.next_branch_id, std::move(cloned_branch));
                             scheduler_.enqueue_task(ScheduledTask{
@@ -3020,7 +3533,7 @@ StepResult ExecutionEngine::commit_task_execution(RunId run_id, RunRuntime& run,
 
     rebuild_reactive_frontier_state(run);
 
-    checkpoint_branch = &run.branches.at(checkpoint_branch_id);
+    checkpoint_branch = run.branches.at(checkpoint_branch_id).get();
 
     if (!checkpoint_branch->join_stack.empty() &&
         (checkpoint_branch->frame.status == ExecutionStatus::Completed ||
@@ -3060,6 +3573,10 @@ StepResult ExecutionEngine::commit_task_execution(RunId run_id, RunRuntime& run,
         checkpoint,
         capture_snapshot ? std::optional<RunSnapshot>{snapshot_run(run_id, run)} : std::nullopt
     );
+
+    if (!record.deferred_trace_events.empty()) {
+        trace_sink_.emit_batch(std::move(record.deferred_trace_events));
+    }
 
     trace_sink_.emit(TraceEvent{
         0U,
@@ -3105,7 +3622,7 @@ void ExecutionEngine::update_run_status_locked(RunRuntime& run, RunId run_id) {
     bool has_active_branch = false;
 
     for (const auto& [_, branch] : run.branches) {
-        switch (branch.frame.status) {
+        switch (branch->frame.status) {
             case ExecutionStatus::Failed:
                 has_failed_branch = true;
                 break;
@@ -3152,9 +3669,9 @@ void ExecutionEngine::update_run_status_locked(RunRuntime& run, RunId run_id) {
 }
 
 GraphDefinition ExecutionEngine::resolve_runtime_graph(const RunSnapshot& snapshot) const {
-    const auto iterator = graph_registry_.find(snapshot.graph.id);
-    if (iterator != graph_registry_.end()) {
-        return iterator->second;
+    if (const GraphDefinition* runtime_graph = registered_graph(snapshot.graph.id);
+        runtime_graph != nullptr) {
+        return *runtime_graph;
     }
     GraphDefinition runtime_graph = snapshot.graph;
     runtime_graph.compile_runtime();
@@ -3165,6 +3682,13 @@ const GraphDefinition* ExecutionEngine::registered_graph(GraphId graph_id) const
     const auto iterator = graph_registry_.find(graph_id);
     if (iterator != graph_registry_.end()) {
         return &iterator->second;
+    }
+
+    if (borrowed_graph_provider_ != nullptr) {
+        if (const GraphDefinition* borrowed = borrowed_graph_provider_->registered_graph(graph_id);
+            borrowed != nullptr) {
+            return borrowed;
+        }
     }
 
     {
@@ -3193,14 +3717,24 @@ void ExecutionEngine::re_register_async_waiter(
         }
         run_ptr = &run_iterator->second;
     }
-    const auto branch_iterator = run_ptr->branches.find(branch_id);
-    if (branch_iterator == run_ptr->branches.end()) {
+    std::lock_guard<std::mutex> run_lock(*run_ptr->mutex);
+    re_register_async_waiter_locked(run_id, *run_ptr, branch_id, pending_async);
+}
+
+void ExecutionEngine::re_register_async_waiter_locked(
+    RunId run_id,
+    const RunRuntime& run,
+    uint32_t branch_id,
+    const PendingAsyncOperation& pending_async
+) {
+    const auto branch_iterator = run.branches.find(branch_id);
+    if (branch_iterator == run.branches.end()) {
         return;
     }
 
     const ScheduledTask task{
         run_id,
-        branch_iterator->second.frame.current_node,
+        branch_iterator->second->frame.current_node,
         branch_id,
         0U
     };
@@ -3225,35 +3759,6 @@ void ExecutionEngine::re_register_async_waiter(
         case AsyncOperationKind::None:
             break;
     }
-}
-
-void ExecutionEngine::push_commit(RunId run_id, TaskExecutionRecord record) {
-    {
-        std::lock_guard<std::mutex> lock(commit_mutex_);
-        commit_queue_.push_back(TaskCommitRecord{run_id, std::move(record)});
-    }
-    commit_cv_.notify_one();
-}
-
-std::optional<ExecutionEngine::TaskCommitRecord> ExecutionEngine::pop_commit(RunId run_id, std::chrono::milliseconds timeout) {
-    std::unique_lock<std::mutex> lock(commit_mutex_);
-    const bool found = commit_cv_.wait_for(lock, timeout, [this, run_id]() {
-        return std::any_of(commit_queue_.begin(), commit_queue_.end(), [run_id](const auto& entry) {
-            return entry.run_id == run_id;
-        });
-    });
-
-    if (!found) {
-        return std::nullopt;
-    }
-
-    const auto iterator = std::find_if(commit_queue_.begin(), commit_queue_.end(), [run_id](const auto& entry) {
-        return entry.run_id == run_id;
-    });
-
-    TaskCommitRecord result = std::move(*iterator);
-    commit_queue_.erase(iterator);
-    return result;
 }
 
 } // namespace agentcore

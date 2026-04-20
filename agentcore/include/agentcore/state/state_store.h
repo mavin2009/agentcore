@@ -27,7 +27,16 @@ struct WorkflowState {
         }
     };
 
+    struct RevisionSegment {
+        std::array<uint64_t, kSegmentSize> values;
+
+        RevisionSegment() {
+            values.fill(0U);
+        }
+    };
+
     std::vector<std::shared_ptr<Segment>> segments;
+    std::vector<std::shared_ptr<RevisionSegment>> revision_segments;
     std::atomic<std::size_t> total_capacity{0};
     std::atomic<uint64_t> version{0};
 
@@ -40,7 +49,10 @@ struct WorkflowState {
     void resize(std::size_t new_size);
     [[nodiscard]] std::size_t size() const noexcept { return total_capacity.load(std::memory_order_acquire); }
     [[nodiscard]] Value load(StateKey key) const noexcept;
+    [[nodiscard]] uint64_t field_revision(StateKey key) const noexcept;
     void store(StateKey key, Value value) noexcept;
+    void set_field_revision(StateKey key, uint64_t revision) noexcept;
+    void bump_field_revision(StateKey key) noexcept;
 };
 
 struct FieldUpdate {
@@ -63,6 +75,7 @@ struct StatePatch {
 struct StateApplyResult {
     uint64_t patch_log_offset{0};
     bool state_changed{false};
+    std::vector<StateKey> changed_keys;
     KnowledgeGraphDeltaSummary knowledge_graph_delta;
 };
 

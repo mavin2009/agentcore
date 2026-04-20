@@ -63,36 +63,44 @@ public:
         uint64_t now_ns,
         std::size_t max_tasks
     );
-    [[nodiscard]] bool has_ready(uint64_t now_ns) const;
-    [[nodiscard]] bool has_ready_for_run(RunId run_id, uint64_t now_ns) const;
+    [[nodiscard]] bool has_ready(uint64_t now_ns);
+    [[nodiscard]] bool has_ready_for_run(RunId run_id, uint64_t now_ns);
     [[nodiscard]] bool has_tasks_for_run(RunId run_id) const;
     [[nodiscard]] std::size_t task_count_for_run(RunId run_id) const;
+    [[nodiscard]] std::optional<uint64_t> next_task_ready_time_for_run(RunId run_id) const;
     void remove_run(RunId run_id);
+    void clear();
     [[nodiscard]] std::vector<ScheduledTask> tasks_for_run(RunId run_id) const;
     [[nodiscard]] bool empty() const noexcept;
     [[nodiscard]] std::size_t size() const noexcept;
 
 private:
-    struct ScheduledTaskOrder {
-        [[nodiscard]] bool operator()(const ScheduledTask& left, const ScheduledTask& right) const noexcept;
+    struct ReadyRunFront {
+        RunId run_id{0};
+        ScheduledTask task;
     };
 
-    using TaskSet = std::multiset<ScheduledTask, ScheduledTaskOrder>;
-    using TaskIterator = TaskSet::iterator;
-
-    struct TaskIteratorOrder {
-        [[nodiscard]] bool operator()(const TaskIterator& left, const TaskIterator& right) const noexcept;
+    struct ReadyRunFrontOrder {
+        [[nodiscard]] bool operator()(const ReadyRunFront& left, const ReadyRunFront& right) const noexcept;
     };
 
     [[nodiscard]] static bool task_ready_before(const ScheduledTask& left, const ScheduledTask& right) noexcept;
-    [[nodiscard]] std::optional<TaskIterator> find_ready_iterator(std::optional<RunId> run_id_filter, uint64_t now_ns);
-    [[nodiscard]] std::optional<ScheduledTask> pop_iterator(TaskIterator iterator);
+    [[nodiscard]] static bool delayed_task_later(const ScheduledTask& left, const ScheduledTask& right) noexcept;
+    void promote_ready_locked(uint64_t now_ns);
+    void enqueue_ready_locked(const ScheduledTask& task);
+    void refresh_ready_front_locked(RunId run_id);
+    [[nodiscard]] std::optional<ScheduledTask> pop_ready_locked(RunId run_id);
+    [[nodiscard]] std::optional<uint64_t> next_task_ready_time_for_run_locked(RunId run_id) const;
     void remove_run_locked(RunId run_id);
 
     mutable std::mutex mutex_;
-    TaskSet tasks_;
-    std::unordered_map<RunId, std::set<TaskIterator, TaskIteratorOrder>> run_index_;
+    std::unordered_map<RunId, std::deque<ScheduledTask>> ready_by_run_;
+    std::vector<ScheduledTask> delayed_heap_;
+    std::set<ReadyRunFront, ReadyRunFrontOrder> ready_fronts_;
+    std::unordered_map<RunId, std::set<ReadyRunFront, ReadyRunFrontOrder>::iterator> ready_front_index_;
     std::unordered_map<RunId, std::size_t> run_task_counts_;
+    std::size_t total_task_count_{0};
+    uint64_t last_observed_now_ns_{0};
 };
 
 class WorkerPool {
@@ -135,10 +143,12 @@ private:
 class AsyncCompletionQueue {
 public:
     void register_waiter(const AsyncWaitKey& key, const ScheduledTask& task);
+    void register_wait_group(const std::vector<AsyncWaitKey>& keys, const ScheduledTask& task);
     void signal_completion(const AsyncWaitKey& key);
     [[nodiscard]] std::size_t promote_ready(WorkQueue& work_queue, uint64_t now_ns);
     void remove_waiters_for_task(const ScheduledTask& task);
     void remove_run(RunId run_id);
+    void clear();
     [[nodiscard]] bool has_waiters_for_run(RunId run_id) const;
     [[nodiscard]] bool empty() const noexcept;
     [[nodiscard]] std::size_t size() const noexcept;
@@ -156,15 +166,23 @@ private:
     [[nodiscard]] static ScheduledTaskKey task_key_for(const ScheduledTask& task) noexcept;
     void enqueue_ready_task_locked(const ScheduledTask& task);
     void erase_waiter_registration_locked(const AsyncWaitKey& key, const ScheduledTask& task);
+    void erase_wait_group_locked(const ScheduledTaskKey& task_key);
 
     mutable std::mutex mutex_;
     std::condition_variable cv_;
+    struct WaitGroupState {
+        ScheduledTask task;
+        std::vector<AsyncWaitKey> pending_keys;
+    };
     std::unordered_map<AsyncWaitKey, std::vector<ScheduledTask>, AsyncWaitKeyHash> waiters_;
+    std::unordered_map<AsyncWaitKey, std::vector<ScheduledTaskKey>, AsyncWaitKeyHash> wait_group_tasks_by_key_;
     std::unordered_map<RunId, std::size_t> waiters_by_run_;
     std::unordered_map<ScheduledTaskKey, std::vector<AsyncWaitKey>, ScheduledTaskKeyHash> wait_keys_by_task_;
+    std::unordered_map<ScheduledTaskKey, WaitGroupState, ScheduledTaskKeyHash> wait_groups_by_task_;
     std::unordered_set<AsyncWaitKey, AsyncWaitKeyHash> completed_without_waiters_;
     std::unordered_set<ScheduledTaskKey, ScheduledTaskKeyHash> signaled_task_keys_;
     std::deque<ScheduledTask> ready_tasks_;
+    std::unordered_map<RunId, std::size_t> ready_tasks_by_run_;
     std::size_t waiter_count_{0};
 };
 
@@ -180,11 +198,13 @@ public:
         uint64_t now_ns,
         std::size_t max_tasks
     );
-    [[nodiscard]] bool has_ready(uint64_t now_ns) const;
-    [[nodiscard]] bool has_ready_for_run(RunId run_id, uint64_t now_ns) const;
+    [[nodiscard]] bool has_ready(uint64_t now_ns);
+    [[nodiscard]] bool has_ready_for_run(RunId run_id, uint64_t now_ns);
     [[nodiscard]] bool has_tasks_for_run(RunId run_id) const;
     [[nodiscard]] std::size_t task_count_for_run(RunId run_id) const;
+    [[nodiscard]] std::optional<uint64_t> next_task_ready_time_for_run(RunId run_id) const;
     void remove_run(RunId run_id);
+    void clear();
     [[nodiscard]] std::vector<ScheduledTask> tasks_for_run(RunId run_id) const;
     [[nodiscard]] bool empty() const noexcept;
     [[nodiscard]] std::size_t queue_size() const noexcept;
@@ -193,17 +213,25 @@ public:
     void run_batch(const std::vector<std::function<void()>>& jobs);
     void run_async(std::function<void()> job);
     void register_async_waiter(const AsyncWaitKey& key, const ScheduledTask& task);
+    void register_async_wait_group(const std::vector<AsyncWaitKey>& keys, const ScheduledTask& task);
     void signal_async_completion(const AsyncWaitKey& key);
     [[nodiscard]] std::size_t promote_ready_async_tasks(uint64_t now_ns);
     void remove_async_waiters_for_task(const ScheduledTask& task);
     [[nodiscard]] bool has_async_waiters_for_run(RunId run_id) const;
     [[nodiscard]] bool has_async_waiters() const noexcept;
+    [[nodiscard]] uint64_t activity_epoch() const;
+    void wait_for_activity(uint64_t observed_epoch, std::chrono::steady_clock::time_point deadline);
     void wait_for_async_activity(std::chrono::milliseconds timeout);
 
 private:
+    void notify_activity();
+
     WorkQueue work_queue_;
     WorkerPool worker_pool_;
     AsyncCompletionQueue async_completion_queue_;
+    mutable std::mutex activity_mutex_;
+    std::condition_variable activity_cv_;
+    uint64_t activity_epoch_{0};
 };
 
 } // namespace agentcore

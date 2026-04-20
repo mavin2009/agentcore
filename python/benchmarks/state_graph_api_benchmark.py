@@ -20,7 +20,15 @@ graph.add_conditional_edges("counter", route, {END: END, "counter": "counter"})
 compiled = graph.compile()
 config = {"configurable": {"target_count": 64}, "tags": ["benchmark"]}
 
+PATCH_MARSHALLING_ITERATIONS = 200
+PAYLOAD_BENCHMARK_ITERATIONS = 100
+MEMO_BENCHMARK_ITERATIONS = 64
+MEMO_BENCHMARK_VISITS = 64
+MEMO_BENCHMARK_ROUNDS = 768
+MEMO_BENCHMARK_MASK = (1 << 64) - 1
+
 record_once_calls = {"miss": 0, "hit": 0}
+memo_benchmark_calls = {"baseline": 0, "hit": 0, "invalidated": 0}
 
 
 def produce_record_once_hit_payload():
@@ -64,6 +72,129 @@ record_once_miss_graph.add_node("counter", record_once_miss_counter)
 record_once_miss_graph.add_edge(START, "counter")
 record_once_miss_graph.add_conditional_edges("counter", route, {END: END, "counter": "counter"})
 record_once_miss_compiled = record_once_miss_graph.compile()
+
+
+def patch_counter(state, config):
+    count = int(state.get("count", 0)) + 1
+    return {
+        "count": count,
+        "score": count * 3,
+        "window_start": count,
+        "window_end": count + 7,
+        "fanout_width": 4,
+        "priority": count % 5,
+        "ready": (count % 2) == 0,
+        "attempts": count,
+        "successes": count - 1,
+        "failures": 1,
+        "label": f"step-{count}",
+        "namespace": "patch-benchmark",
+    }
+
+
+def patch_route(state, config):
+    target_count = int(dict(config.get("configurable", {})).get("target_count", 64))
+    return END if int(state["count"]) >= target_count else "patch_counter"
+
+
+patch_graph = StateGraph(dict, name="python_patch_marshalling_benchmark", worker_count=2)
+patch_graph.add_node("patch_counter", patch_counter)
+patch_graph.add_edge(START, "patch_counter")
+patch_graph.add_conditional_edges("patch_counter", patch_route, {END: END, "patch_counter": "patch_counter"})
+patch_compiled = patch_graph.compile()
+
+
+def payload_counter(state, config):
+    payload = state["payload"]
+    items = payload["items"]
+    count = int(state.get("count", 0)) + 1
+    return {
+        "count": count,
+        "payload_sum": int(sum(items)),
+        "payload_span": int(items[-1] - items[0]),
+    }
+
+
+def payload_route(state, config):
+    materialized = state.copy()
+    target_count = int(dict(config.get("configurable", {})).get("target_count", 64))
+    if int(materialized["payload_sum"]) != 2016:
+        raise AssertionError("payload materialization returned an unexpected checksum")
+    if int(materialized["payload_span"]) != 63:
+        raise AssertionError("payload materialization returned an unexpected span")
+    return END if int(materialized["count"]) >= target_count else "payload_counter"
+
+
+payload_graph = StateGraph(dict, name="python_payload_materialization_benchmark", worker_count=2)
+payload_graph.add_node("payload_counter", payload_counter)
+payload_graph.add_edge(START, "payload_counter")
+payload_graph.add_conditional_edges(
+    "payload_counter",
+    payload_route,
+    {END: END, "payload_counter": "payload_counter"},
+)
+payload_compiled = payload_graph.compile()
+
+
+def memo_mix(value: int) -> int:
+    mixed = (int(value) ^ 0x9E3779B97F4A7C15) & MEMO_BENCHMARK_MASK
+    for round_index in range(MEMO_BENCHMARK_ROUNDS):
+        mixed ^= mixed >> 33
+        mixed &= MEMO_BENCHMARK_MASK
+        mixed = (mixed * 0xFF51AFD7ED558CCD) & MEMO_BENCHMARK_MASK
+        mixed ^= mixed >> 33
+        mixed &= MEMO_BENCHMARK_MASK
+        mixed = (mixed + 0x9E3779B97F4A7C15 + round_index) & MEMO_BENCHMARK_MASK
+    return mixed & ((1 << 63) - 1)
+
+
+def build_memoization_benchmark_graph(*, name: str, counter_bucket: str, deterministic: bool, invalidates_input: bool):
+    def memoized_node(state, config):
+        memo_benchmark_calls[counter_bucket] += 1
+        return {"memo_output": memo_mix(int(state.get("memo_input", 0)))}
+
+    def router(state, config):
+        visits = int(state.get("memo_visits", 0)) + 1
+        updates = {"memo_visits": visits}
+        if visits < MEMO_BENCHMARK_VISITS:
+            if invalidates_input:
+                updates["memo_input"] = int(state.get("memo_input", 0)) + 1
+            return Command(update=updates, goto="memoized")
+        return Command(update=updates, goto=END)
+
+    graph = StateGraph(dict, name=name, worker_count=2)
+    node_kwargs = {}
+    if deterministic:
+        node_kwargs = {
+            "deterministic": True,
+            "read_keys": ("memo_input",),
+            "cache_size": 64,
+        }
+    graph.add_node("memoized", memoized_node, **node_kwargs)
+    graph.add_node("router", router, kind="control")
+    graph.add_edge(START, "memoized")
+    graph.add_edge("memoized", "router")
+    return graph.compile()
+
+
+memo_baseline_compiled = build_memoization_benchmark_graph(
+    name="python_deterministic_memo_baseline_benchmark",
+    counter_bucket="baseline",
+    deterministic=False,
+    invalidates_input=False,
+)
+memo_hit_compiled = build_memoization_benchmark_graph(
+    name="python_deterministic_memo_hit_benchmark",
+    counter_bucket="hit",
+    deterministic=True,
+    invalidates_input=False,
+)
+memo_invalidated_compiled = build_memoization_benchmark_graph(
+    name="python_deterministic_memo_invalidation_benchmark",
+    counter_bucket="invalidated",
+    deterministic=True,
+    invalidates_input=True,
+)
 
 
 def make_persistent_memo_producer(counter_store: dict[str, int], bucket: str, session_id: str):
@@ -257,6 +388,42 @@ for _ in range(iterations):
     record_once_miss_result = record_once_miss_compiled.invoke({"count": 0}, config=config)
 record_once_miss_end_ns = time.perf_counter_ns()
 
+patch_start_ns = time.perf_counter_ns()
+for _ in range(PATCH_MARSHALLING_ITERATIONS):
+    patch_result = patch_compiled.invoke({"count": 0}, config=config)
+patch_end_ns = time.perf_counter_ns()
+
+payload_input = {
+    "count": 0,
+    "payload": {
+        "items": list(range(64)),
+        "metadata": {
+            "kind": "python-payload-materialization",
+            "tags": ["benchmark", "payload"],
+        },
+    },
+}
+payload_start_ns = time.perf_counter_ns()
+for _ in range(PAYLOAD_BENCHMARK_ITERATIONS):
+    payload_result = payload_compiled.invoke(dict(payload_input), config=config)
+payload_end_ns = time.perf_counter_ns()
+
+memo_benchmark_input = {"memo_input": 7, "memo_visits": 0}
+memo_baseline_start_ns = time.perf_counter_ns()
+for _ in range(MEMO_BENCHMARK_ITERATIONS):
+    memo_baseline_result = memo_baseline_compiled.invoke(dict(memo_benchmark_input))
+memo_baseline_end_ns = time.perf_counter_ns()
+
+memo_hit_start_ns = time.perf_counter_ns()
+for _ in range(MEMO_BENCHMARK_ITERATIONS):
+    memo_hit_result = memo_hit_compiled.invoke(dict(memo_benchmark_input))
+memo_hit_end_ns = time.perf_counter_ns()
+
+memo_invalidated_start_ns = time.perf_counter_ns()
+for _ in range(MEMO_BENCHMARK_ITERATIONS):
+    memo_invalidated_result = memo_invalidated_compiled.invoke(dict(memo_benchmark_input))
+memo_invalidated_end_ns = time.perf_counter_ns()
+
 
 async def run_async_benchmark():
     async_iterations = 100
@@ -333,6 +500,25 @@ assert record_once_miss_result["count"] == 64
 assert record_once_miss_result["memoized"] == 64
 assert record_once_calls["hit"] == iterations
 assert record_once_calls["miss"] == iterations * 64
+assert patch_result["count"] == 64
+assert patch_result["score"] == 192
+assert patch_result["window_start"] == 64
+assert patch_result["window_end"] == 71
+assert patch_result["label"] == "step-64"
+assert patch_result["namespace"] == "patch-benchmark"
+assert payload_result["count"] == 64
+assert payload_result["payload_sum"] == 2016
+assert payload_result["payload_span"] == 63
+assert memo_baseline_result["memo_visits"] == MEMO_BENCHMARK_VISITS
+assert memo_hit_result["memo_visits"] == MEMO_BENCHMARK_VISITS
+assert memo_baseline_result["memo_output"] == memo_hit_result["memo_output"]
+assert memo_baseline_result == memo_hit_result
+assert memo_invalidated_result["memo_visits"] == MEMO_BENCHMARK_VISITS
+assert memo_invalidated_result["memo_input"] == 7 + MEMO_BENCHMARK_VISITS - 1
+assert memo_invalidated_result["memo_output"] == memo_mix(memo_invalidated_result["memo_input"])
+assert memo_benchmark_calls["baseline"] == MEMO_BENCHMARK_ITERATIONS * MEMO_BENCHMARK_VISITS
+assert memo_benchmark_calls["hit"] == MEMO_BENCHMARK_ITERATIONS
+assert memo_benchmark_calls["invalidated"] == MEMO_BENCHMARK_ITERATIONS * MEMO_BENCHMARK_VISITS
 
 assert parallel_details is not None
 assert parallel_details["summary"]["status"] == "completed"
@@ -399,6 +585,11 @@ assert max(event["session_revision"] for event in paused_resume_session_events) 
 invoke_elapsed_ns = invoke_end_ns - start_ns
 record_once_hit_elapsed_ns = record_once_hit_end_ns - record_once_hit_start_ns
 record_once_miss_elapsed_ns = record_once_miss_end_ns - record_once_miss_start_ns
+patch_elapsed_ns = patch_end_ns - patch_start_ns
+payload_elapsed_ns = payload_end_ns - payload_start_ns
+memo_baseline_elapsed_ns = memo_baseline_end_ns - memo_baseline_start_ns
+memo_hit_elapsed_ns = memo_hit_end_ns - memo_hit_start_ns
+memo_invalidated_elapsed_ns = memo_invalidated_end_ns - memo_invalidated_start_ns
 parallel_elapsed_ns = parallel_end_ns - parallel_start_ns
 resume_direct_elapsed_ns = resume_direct_end_ns - resume_direct_start_ns
 resume_paused_elapsed_ns = resume_paused_end_ns - resume_paused_start_ns
@@ -417,6 +608,58 @@ print(f"python_state_graph_record_once_hit_producer_calls={record_once_calls['hi
 print(f"python_state_graph_record_once_miss_total_ns={record_once_miss_elapsed_ns}")
 print(f"python_state_graph_record_once_miss_avg_ns={record_once_miss_elapsed_ns // iterations}")
 print(f"python_state_graph_record_once_miss_producer_calls={record_once_calls['miss']}")
+print(f"python_state_graph_patch_marshalling_total_ns={patch_elapsed_ns}")
+print(
+    "python_state_graph_patch_marshalling_avg_ns="
+    f"{patch_elapsed_ns // PATCH_MARSHALLING_ITERATIONS}"
+)
+print(
+    "python_state_graph_patch_marshalling_result="
+    f"{patch_result['count']}:{patch_result['score']}:{patch_result['label']}"
+)
+print(f"python_state_graph_payload_materialization_total_ns={payload_elapsed_ns}")
+print(
+    "python_state_graph_payload_materialization_avg_ns="
+    f"{payload_elapsed_ns // PAYLOAD_BENCHMARK_ITERATIONS}"
+)
+print(
+    "python_state_graph_payload_materialization_result="
+    f"{payload_result['payload_sum']}:{payload_result['payload_span']}"
+)
+print(f"python_deterministic_memo_iterations={MEMO_BENCHMARK_ITERATIONS}")
+print(f"python_deterministic_memo_visits={MEMO_BENCHMARK_VISITS}")
+print(f"python_deterministic_memo_rounds={MEMO_BENCHMARK_ROUNDS}")
+print(f"python_deterministic_memo_baseline_total_ns={memo_baseline_elapsed_ns}")
+print(f"python_deterministic_memo_baseline_avg_ns={memo_baseline_elapsed_ns // MEMO_BENCHMARK_ITERATIONS}")
+print(f"python_deterministic_memo_hit_total_ns={memo_hit_elapsed_ns}")
+print(f"python_deterministic_memo_hit_avg_ns={memo_hit_elapsed_ns // MEMO_BENCHMARK_ITERATIONS}")
+print(
+    "python_deterministic_memo_hit_speedup_x="
+    f"{(memo_baseline_elapsed_ns / memo_hit_elapsed_ns) if memo_hit_elapsed_ns else 0.0}"
+)
+print(f"python_deterministic_memo_invalidated_total_ns={memo_invalidated_elapsed_ns}")
+print(
+    "python_deterministic_memo_invalidated_avg_ns="
+    f"{memo_invalidated_elapsed_ns // MEMO_BENCHMARK_ITERATIONS}"
+)
+print(
+    "python_deterministic_memo_invalidation_vs_hit_x="
+    f"{(memo_invalidated_elapsed_ns / memo_hit_elapsed_ns) if memo_hit_elapsed_ns else 0.0}"
+)
+print(
+    "python_deterministic_memo_baseline_executor_calls="
+    f"{memo_benchmark_calls['baseline']}"
+)
+print(f"python_deterministic_memo_hit_executor_calls={memo_benchmark_calls['hit']}")
+print(
+    "python_deterministic_memo_invalidated_executor_calls="
+    f"{memo_benchmark_calls['invalidated']}"
+)
+print(
+    "python_deterministic_memo_output_equal="
+    f"{int(memo_baseline_result['memo_output'] == memo_hit_result['memo_output'])}"
+)
+print(f"python_deterministic_memo_invalidated_final_input={memo_invalidated_result['memo_input']}")
 print(f"python_persistent_session_parallel_total_ns={parallel_elapsed_ns}")
 print(f"python_persistent_session_parallel_avg_ns={parallel_elapsed_ns // parallel_iterations}")
 print(f"python_persistent_session_parallel_committed_sessions={parallel_session_count}")
@@ -455,10 +698,6 @@ print(
 print(
     f"python_persistent_session_resume_state_equal="
     f"{int(direct_resume_details['state'] == paused_resume_details['state'])}"
-)
-print(
-    f"python_persistent_session_resume_proof_equal="
-    f"{int(direct_resume_digest == paused_resume_digest)}"
 )
 print(f"python_persistent_session_resume_direct_digest={direct_resume_digest}")
 print(f"python_persistent_session_resume_resumed_digest={paused_resume_digest}")

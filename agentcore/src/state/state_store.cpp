@@ -80,6 +80,13 @@ bool blob_refs_equal(const BlobStore& blobs, BlobRef left, BlobRef right) {
     return blobs.read_bytes(left) == blobs.read_bytes(right);
 }
 
+bool values_equal(const Value& left, const Value& right) {
+    if (left.index() != right.index()) {
+        return false;
+    }
+    return left == right;
+}
+
 struct TripleDeltaKey {
     InternedStringId subject_label{0};
     InternedStringId relation{0};
@@ -254,6 +261,7 @@ void write_workflow_state(std::ostream& output, const WorkflowState& state) {
     write_pod(output, field_count);
     for (uint64_t index = 0; index < field_count; ++index) {
         write_value(output, state.load(static_cast<StateKey>(index)));
+        write_pod(output, state.field_revision(static_cast<StateKey>(index)));
     }
 }
 
@@ -264,7 +272,9 @@ WorkflowState read_workflow_state(std::istream& input) {
     state.resize(static_cast<std::size_t>(field_count));
     state.version.store(version, std::memory_order_release);
     for (uint64_t index = 0; index < field_count; ++index) {
-        state.store(static_cast<StateKey>(index), read_value(input));
+        const StateKey key = static_cast<StateKey>(index);
+        state.store(key, read_value(input));
+        state.set_field_revision(key, read_pod<uint64_t>(input));
     }
     return state;
 }
@@ -281,6 +291,7 @@ WorkflowState& WorkflowState::operator=(const WorkflowState& other) {
         return *this;
     }
     segments = other.segments;
+    revision_segments = other.revision_segments;
     total_capacity.store(other.total_capacity.load(std::memory_order_acquire), std::memory_order_release);
     version.store(other.version.load(std::memory_order_acquire), std::memory_order_release);
     return *this;
@@ -290,6 +301,7 @@ void WorkflowState::resize(std::size_t new_size) {
     std::size_t current_capacity = total_capacity.load(std::memory_order_acquire);
     while (current_capacity < new_size) {
         segments.emplace_back(std::make_shared<Segment>());
+        revision_segments.emplace_back(std::make_shared<RevisionSegment>());
         current_capacity += kSegmentSize;
     }
     total_capacity.store(current_capacity, std::memory_order_release);
@@ -304,6 +316,15 @@ Value WorkflowState::load(StateKey key) const noexcept {
     return segments[segment_index]->values[element_index];
 }
 
+uint64_t WorkflowState::field_revision(StateKey key) const noexcept {
+    const std::size_t segment_index = key / kSegmentSize;
+    const std::size_t element_index = key % kSegmentSize;
+    if (segment_index >= revision_segments.size()) {
+        return 0U;
+    }
+    return revision_segments[segment_index]->values[element_index];
+}
+
 void WorkflowState::store(StateKey key, Value value) noexcept {
     const std::size_t segment_index = key / kSegmentSize;
     const std::size_t element_index = key % kSegmentSize;
@@ -314,6 +335,23 @@ void WorkflowState::store(StateKey key, Value value) noexcept {
         segments[segment_index] = std::make_shared<Segment>(*segments[segment_index]);
     }
     segments[segment_index]->values[element_index] = std::move(value);
+}
+
+void WorkflowState::set_field_revision(StateKey key, uint64_t revision) noexcept {
+    const std::size_t segment_index = key / kSegmentSize;
+    const std::size_t element_index = key % kSegmentSize;
+    if (segment_index >= revision_segments.size()) {
+        resize(static_cast<std::size_t>(key) + 1U);
+    }
+    if (!revision_segments[segment_index].unique()) {
+        revision_segments[segment_index] = std::make_shared<RevisionSegment>(*revision_segments[segment_index]);
+    }
+    revision_segments[segment_index]->values[element_index] = revision;
+}
+
+void WorkflowState::bump_field_revision(StateKey key) noexcept {
+    const uint64_t current_revision = field_revision(key);
+    set_field_revision(key, current_revision + 1U);
 }
 
 struct StringInterner::Storage {
@@ -636,7 +674,16 @@ StateApplyResult StateStore::apply_with_summary(const StatePatch& patch) {
     }
 
     for (const FieldUpdate& update : patch.updates) {
+        const Value existing_value = current_state_.load(update.key);
+        if (values_equal(existing_value, update.value)) {
+            continue;
+        }
         current_state_.store(update.key, update.value);
+        current_state_.bump_field_revision(update.key);
+        if (std::find(result.changed_keys.begin(), result.changed_keys.end(), update.key) ==
+            result.changed_keys.end()) {
+            result.changed_keys.push_back(update.key);
+        }
     }
 
     if (!patch.knowledge_graph.empty()) {
@@ -772,7 +819,7 @@ StateApplyResult StateStore::apply_with_summary(const StatePatch& patch) {
 
     const bool task_journal_changed = task_journal_.apply(patch.task_records);
     result.state_changed =
-        !patch.updates.empty() ||
+        !result.changed_keys.empty() ||
         !patch.new_blobs.empty() ||
         !result.knowledge_graph_delta.empty() ||
         task_journal_changed;
