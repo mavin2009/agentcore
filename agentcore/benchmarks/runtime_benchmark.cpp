@@ -1,6 +1,7 @@
 #include "agentcore/execution/engine.h"
 #include "agentcore/execution/proof.h"
 #include "agentcore/graph/graph_ir.h"
+#include "agentcore/state/intelligence/ops.h"
 
 #include <algorithm>
 #include <atomic>
@@ -108,6 +109,8 @@ constexpr std::size_t kSubgraphBenchmarkRuns = 64U;
 constexpr std::size_t kRecordedEffectBenchmarkIterations = 4096U;
 constexpr std::size_t kMemoizationBenchmarkVisitLimit = 64U;
 constexpr std::size_t kMemoizationBenchmarkMixRounds = 262144U;
+constexpr std::size_t kIntelligenceBenchmarkRecords = 4096U;
+constexpr std::size_t kIntelligenceBenchmarkIterations = 4096U;
 
 std::atomic<uint64_t> g_memoization_baseline_invocations{0U};
 std::atomic<uint64_t> g_memoization_hit_invocations{0U};
@@ -1616,6 +1619,40 @@ struct MemoizationBenchmarkRun {
     int64_t final_visits{0};
 };
 
+struct IntelligenceQueryBenchmarkRun {
+    uint64_t records{0};
+    uint64_t iterations{0};
+    uint64_t task_query_ns{0};
+    uint64_t claim_semantic_query_ns{0};
+    uint64_t supporting_claims_query_ns{0};
+    uint64_t action_candidates_query_ns{0};
+    uint64_t agenda_query_ns{0};
+    uint64_t recall_query_ns{0};
+    uint64_t focus_query_ns{0};
+    uint64_t related_query_ns{0};
+    uint64_t related_hops2_query_ns{0};
+    uint64_t route_select_ns{0};
+    uint64_t task_matches{0};
+    uint64_t claim_semantic_matches{0};
+    uint64_t supporting_claims_matches{0};
+    uint64_t action_candidates_matches{0};
+    uint64_t agenda_matches{0};
+    uint64_t recall_matches{0};
+    uint64_t focus_total_records{0};
+    uint64_t related_total_records{0};
+    uint64_t related_hops2_total_records{0};
+    bool route_matched{false};
+    bool claim_semantic_matched{false};
+    bool supporting_claims_top_matched{false};
+    bool action_candidates_top_matched{false};
+    bool agenda_top_matched{false};
+    bool recall_top_matched{false};
+    bool focus_claim_top_matched{false};
+    bool focus_task_top_matched{false};
+    bool focus_memory_top_matched{false};
+    bool related_hops2_expanded{false};
+};
+
 BenchmarkRun run_parallel_benchmark_once(const GraphDefinition& graph, std::size_t worker_count) {
     ExecutionEngine engine = make_benchmark_engine(worker_count);
     const RunId run_id = engine.start(graph, InputEnvelope{2U});
@@ -1812,6 +1849,7 @@ RecordedEffectBenchmarkRun run_recorded_effect_benchmark_once() {
             miss_store.blobs(),
             miss_store.strings(),
             miss_store.knowledge_graph(),
+            miss_store.intelligence(),
             miss_store.task_journal(),
             tools,
             models,
@@ -1859,6 +1897,7 @@ RecordedEffectBenchmarkRun run_recorded_effect_benchmark_once() {
             hit_store.blobs(),
             hit_store.strings(),
             hit_store.knowledge_graph(),
+            hit_store.intelligence(),
             hit_store.task_journal(),
             tools,
             models,
@@ -1897,6 +1936,7 @@ RecordedEffectBenchmarkRun run_recorded_effect_benchmark_once() {
             hit_store.blobs(),
             hit_store.strings(),
             hit_store.knowledge_graph(),
+            hit_store.intelligence(),
             hit_store.task_journal(),
             tools,
             models,
@@ -1964,6 +2004,820 @@ MemoizationBenchmarkRun run_memoization_benchmark_once(
         read_int_field(state, kMemoizationBenchmarkInput),
         read_int_field(state, kMemoizationBenchmarkOutput),
         read_int_field(state, kMemoizationBenchmarkVisits)
+    };
+}
+
+IntelligenceQueryBenchmarkRun run_intelligence_query_benchmark_once() {
+    StateStore store(1U);
+    BlobStore& blobs = store.blobs();
+    StringInterner& strings = store.strings();
+
+    const InternedStringId benchmark_relation = strings.intern("supports");
+    const InternedStringId benchmark_subject = strings.intern("agentcore");
+    const InternedStringId benchmark_object = strings.intern("intelligence");
+    const InternedStringId semantic_subject = strings.intern("agentcore-focus");
+    const InternedStringId semantic_relation = strings.intern("supports");
+    const InternedStringId semantic_object = strings.intern("intelligence-focus");
+    const InternedStringId benchmark_source = strings.intern("native-benchmark");
+    const InternedStringId benchmark_scope = strings.intern("scope:2");
+    const InternedStringId benchmark_owner = strings.intern("specialist:2");
+    const InternedStringId focus_task_key = strings.intern("task:bench:focus");
+    const InternedStringId focus_claim_key = strings.intern("claim:bench:focus");
+    const InternedStringId focus_evidence_key = strings.intern("evidence:bench:focus");
+    const InternedStringId focus_decision_key = strings.intern("decision:bench:focus");
+    const InternedStringId focus_memory_key = strings.intern("memory:bench:focus");
+    const InternedStringId supporting_task_key = strings.intern("task:bench:supporting");
+    const InternedStringId supporting_claim_strong_key = strings.intern("claim:bench:supporting:strong");
+    const InternedStringId supporting_claim_weak_key = strings.intern("claim:bench:supporting:weak");
+    const InternedStringId supporting_evidence_strong_key = strings.intern("evidence:bench:supporting:strong");
+    const InternedStringId supporting_evidence_weak_key = strings.intern("evidence:bench:supporting:weak");
+    const InternedStringId supporting_decision_strong_key = strings.intern("decision:bench:supporting:strong");
+    const InternedStringId supporting_memory_strong_key = strings.intern("memory:bench:supporting:strong");
+    const InternedStringId action_owner = strings.intern("action-owner");
+    const InternedStringId action_object = strings.intern("action-ranking");
+    const InternedStringId action_task_strong_key = strings.intern("task:bench:action:strong");
+    const InternedStringId action_task_weak_key = strings.intern("task:bench:action:weak");
+    const InternedStringId action_claim_strong_key = strings.intern("claim:bench:action:strong");
+    const InternedStringId action_claim_weak_key = strings.intern("claim:bench:action:weak");
+    const InternedStringId action_evidence_strong_key = strings.intern("evidence:bench:action:strong");
+    const InternedStringId action_evidence_weak_key = strings.intern("evidence:bench:action:weak");
+    const InternedStringId action_decision_strong_key = strings.intern("decision:bench:action:strong");
+    const InternedStringId action_memory_strong_key = strings.intern("memory:bench:action:strong");
+    const InternedStringId related_hops2_task_key = strings.intern("task:bench:related:seed");
+    const InternedStringId related_hops2_claim_key = strings.intern("claim:bench:related:shared");
+    const InternedStringId related_hops2_task_second_key = strings.intern("task:bench:related:second");
+    const InternedStringId related_hops2_evidence_key = strings.intern("evidence:bench:related:seed");
+    const InternedStringId related_hops2_memory_key = strings.intern("memory:bench:related:second");
+
+    StatePatch patch;
+    patch.intelligence.tasks.reserve(kIntelligenceBenchmarkRecords);
+    patch.intelligence.claims.reserve(kIntelligenceBenchmarkRecords);
+    patch.intelligence.evidence.reserve(kIntelligenceBenchmarkRecords);
+    patch.intelligence.decisions.reserve(kIntelligenceBenchmarkRecords);
+    patch.intelligence.memories.reserve(kIntelligenceBenchmarkRecords);
+
+    for (std::size_t index = 0; index < kIntelligenceBenchmarkRecords; ++index) {
+        const std::string suffix = std::to_string(index);
+        const InternedStringId task_key = strings.intern("task:bench:" + suffix);
+        const InternedStringId claim_key = strings.intern("claim:bench:" + suffix);
+        const InternedStringId evidence_key = strings.intern("evidence:bench:" + suffix);
+        const InternedStringId decision_key = strings.intern("decision:bench:" + suffix);
+        const InternedStringId memory_key = strings.intern("memory:bench:" + suffix);
+        const InternedStringId owner = strings.intern("specialist:" + std::to_string(index % 16U));
+        const InternedStringId scope = strings.intern("scope:" + std::to_string(index % 8U));
+        const IntelligenceTaskStatus task_status =
+            index % 2U == 0U ? IntelligenceTaskStatus::Completed : IntelligenceTaskStatus::InProgress;
+        const IntelligenceClaimStatus claim_status =
+            index % 2U == 0U ? IntelligenceClaimStatus::Supported : IntelligenceClaimStatus::Proposed;
+        const IntelligenceDecisionStatus decision_status =
+            index % 2U == 0U ? IntelligenceDecisionStatus::Selected : IntelligenceDecisionStatus::Pending;
+        const IntelligenceMemoryLayer memory_layer =
+            index % 2U == 0U ? IntelligenceMemoryLayer::Semantic : IntelligenceMemoryLayer::Working;
+
+        patch.intelligence.tasks.push_back(IntelligenceTaskWrite{
+            task_key,
+            strings.intern("Task " + suffix),
+            owner,
+            blobs.append_string("{\"task\":" + suffix + "}"),
+            {},
+            task_status,
+            static_cast<int32_t>(index % 5U),
+            0.8F,
+            intelligence_fields::kTaskTitle |
+                intelligence_fields::kTaskOwner |
+                intelligence_fields::kTaskPayload |
+                intelligence_fields::kTaskStatus |
+                intelligence_fields::kTaskPriority |
+                intelligence_fields::kTaskConfidence
+        });
+        patch.intelligence.claims.push_back(IntelligenceClaimWrite{
+            claim_key,
+            benchmark_subject,
+            benchmark_relation,
+            benchmark_object,
+            blobs.append_string("{\"claim\":" + suffix + "}"),
+            claim_status,
+            0.75F,
+            intelligence_fields::kClaimSubject |
+                intelligence_fields::kClaimRelation |
+                intelligence_fields::kClaimObject |
+                intelligence_fields::kClaimStatement |
+                intelligence_fields::kClaimStatus |
+                intelligence_fields::kClaimConfidence
+        });
+        patch.intelligence.evidence.push_back(IntelligenceEvidenceWrite{
+            evidence_key,
+            strings.intern("benchmark"),
+            benchmark_source,
+            blobs.append_string("{\"evidence\":" + suffix + "}"),
+            task_key,
+            claim_key,
+            0.7F,
+            intelligence_fields::kEvidenceKind |
+                intelligence_fields::kEvidenceSource |
+                intelligence_fields::kEvidenceContent |
+                intelligence_fields::kEvidenceTaskKey |
+                intelligence_fields::kEvidenceClaimKey |
+                intelligence_fields::kEvidenceConfidence
+        });
+        patch.intelligence.decisions.push_back(IntelligenceDecisionWrite{
+            decision_key,
+            task_key,
+            claim_key,
+            blobs.append_string("{\"decision\":" + suffix + "}"),
+            decision_status,
+            0.7F,
+            intelligence_fields::kDecisionTaskKey |
+                intelligence_fields::kDecisionClaimKey |
+                intelligence_fields::kDecisionSummary |
+                intelligence_fields::kDecisionStatus |
+                intelligence_fields::kDecisionConfidence
+        });
+        patch.intelligence.memories.push_back(IntelligenceMemoryWrite{
+            memory_key,
+            memory_layer,
+            scope,
+            blobs.append_string("{\"memory\":" + suffix + "}"),
+            task_key,
+            claim_key,
+            0.6F,
+            intelligence_fields::kMemoryLayer |
+                intelligence_fields::kMemoryScope |
+                intelligence_fields::kMemoryContent |
+                intelligence_fields::kMemoryTaskKey |
+                intelligence_fields::kMemoryClaimKey |
+                intelligence_fields::kMemoryImportance
+        });
+    }
+    static_cast<void>(store.apply(patch));
+
+    StatePatch focus_patch;
+    focus_patch.intelligence.tasks.push_back(IntelligenceTaskWrite{
+        focus_task_key,
+        strings.intern("Focus benchmark"),
+        benchmark_owner,
+        blobs.append_string("{\"task\":\"focus\"}"),
+        {},
+        IntelligenceTaskStatus::InProgress,
+        100,
+        0.99F,
+        intelligence_fields::kTaskTitle |
+            intelligence_fields::kTaskOwner |
+            intelligence_fields::kTaskPayload |
+            intelligence_fields::kTaskStatus |
+            intelligence_fields::kTaskPriority |
+            intelligence_fields::kTaskConfidence
+    });
+    focus_patch.intelligence.claims.push_back(IntelligenceClaimWrite{
+        focus_claim_key,
+        semantic_subject,
+        semantic_relation,
+        semantic_object,
+        blobs.append_string("{\"claim\":\"focus\"}"),
+        IntelligenceClaimStatus::Supported,
+        0.98F,
+        intelligence_fields::kClaimSubject |
+            intelligence_fields::kClaimRelation |
+            intelligence_fields::kClaimObject |
+            intelligence_fields::kClaimStatement |
+            intelligence_fields::kClaimStatus |
+            intelligence_fields::kClaimConfidence
+    });
+    focus_patch.intelligence.evidence.push_back(IntelligenceEvidenceWrite{
+        focus_evidence_key,
+        strings.intern("benchmark"),
+        benchmark_source,
+        blobs.append_string("{\"evidence\":\"focus\"}"),
+        focus_task_key,
+        focus_claim_key,
+        0.98F,
+        intelligence_fields::kEvidenceKind |
+            intelligence_fields::kEvidenceSource |
+            intelligence_fields::kEvidenceContent |
+            intelligence_fields::kEvidenceTaskKey |
+            intelligence_fields::kEvidenceClaimKey |
+            intelligence_fields::kEvidenceConfidence
+    });
+    focus_patch.intelligence.decisions.push_back(IntelligenceDecisionWrite{
+        focus_decision_key,
+        focus_task_key,
+        focus_claim_key,
+        blobs.append_string("{\"decision\":\"focus\"}"),
+        IntelligenceDecisionStatus::Selected,
+        0.96F,
+        intelligence_fields::kDecisionTaskKey |
+            intelligence_fields::kDecisionClaimKey |
+            intelligence_fields::kDecisionSummary |
+            intelligence_fields::kDecisionStatus |
+            intelligence_fields::kDecisionConfidence
+    });
+    focus_patch.intelligence.memories.push_back(IntelligenceMemoryWrite{
+        focus_memory_key,
+        IntelligenceMemoryLayer::Semantic,
+        benchmark_scope,
+        blobs.append_string("{\"memory\":\"focus\"}"),
+        focus_task_key,
+        strings.intern("claim:bench:0"),
+        1.0F,
+        intelligence_fields::kMemoryLayer |
+            intelligence_fields::kMemoryScope |
+            intelligence_fields::kMemoryContent |
+            intelligence_fields::kMemoryTaskKey |
+            intelligence_fields::kMemoryClaimKey |
+            intelligence_fields::kMemoryImportance
+    });
+    focus_patch.intelligence.tasks.push_back(IntelligenceTaskWrite{
+        supporting_task_key,
+        strings.intern("Supporting benchmark"),
+        strings.intern("support-owner"),
+        blobs.append_string("{\"task\":\"supporting\"}"),
+        {},
+        IntelligenceTaskStatus::InProgress,
+        8,
+        0.88F,
+        intelligence_fields::kTaskTitle |
+            intelligence_fields::kTaskOwner |
+            intelligence_fields::kTaskPayload |
+            intelligence_fields::kTaskStatus |
+            intelligence_fields::kTaskPriority |
+            intelligence_fields::kTaskConfidence
+    });
+    focus_patch.intelligence.claims.push_back(IntelligenceClaimWrite{
+        supporting_claim_strong_key,
+        benchmark_subject,
+        benchmark_relation,
+        strings.intern("support-ranking"),
+        blobs.append_string("{\"claim\":\"support-strong\"}"),
+        IntelligenceClaimStatus::Supported,
+        0.9F,
+        intelligence_fields::kClaimSubject |
+            intelligence_fields::kClaimRelation |
+            intelligence_fields::kClaimObject |
+            intelligence_fields::kClaimStatement |
+            intelligence_fields::kClaimStatus |
+            intelligence_fields::kClaimConfidence
+    });
+    focus_patch.intelligence.claims.push_back(IntelligenceClaimWrite{
+        supporting_claim_weak_key,
+        benchmark_subject,
+        benchmark_relation,
+        strings.intern("support-ranking"),
+        blobs.append_string("{\"claim\":\"support-weak\"}"),
+        IntelligenceClaimStatus::Supported,
+        0.7F,
+        intelligence_fields::kClaimSubject |
+            intelligence_fields::kClaimRelation |
+            intelligence_fields::kClaimObject |
+            intelligence_fields::kClaimStatement |
+            intelligence_fields::kClaimStatus |
+            intelligence_fields::kClaimConfidence
+    });
+    focus_patch.intelligence.evidence.push_back(IntelligenceEvidenceWrite{
+        supporting_evidence_strong_key,
+        strings.intern("benchmark"),
+        strings.intern("supporting"),
+        blobs.append_string("{\"support\":\"strong\"}"),
+        supporting_task_key,
+        supporting_claim_strong_key,
+        0.96F,
+        intelligence_fields::kEvidenceKind |
+            intelligence_fields::kEvidenceSource |
+            intelligence_fields::kEvidenceContent |
+            intelligence_fields::kEvidenceTaskKey |
+            intelligence_fields::kEvidenceClaimKey |
+            intelligence_fields::kEvidenceConfidence
+    });
+    focus_patch.intelligence.evidence.push_back(IntelligenceEvidenceWrite{
+        supporting_evidence_weak_key,
+        strings.intern("benchmark"),
+        strings.intern("supporting"),
+        blobs.append_string("{\"support\":\"weak\"}"),
+        supporting_task_key,
+        supporting_claim_weak_key,
+        0.42F,
+        intelligence_fields::kEvidenceKind |
+            intelligence_fields::kEvidenceSource |
+            intelligence_fields::kEvidenceContent |
+            intelligence_fields::kEvidenceTaskKey |
+            intelligence_fields::kEvidenceClaimKey |
+            intelligence_fields::kEvidenceConfidence
+    });
+    focus_patch.intelligence.decisions.push_back(IntelligenceDecisionWrite{
+        supporting_decision_strong_key,
+        supporting_task_key,
+        supporting_claim_strong_key,
+        blobs.append_string("{\"selected\":true}"),
+        IntelligenceDecisionStatus::Selected,
+        0.94F,
+        intelligence_fields::kDecisionTaskKey |
+            intelligence_fields::kDecisionClaimKey |
+            intelligence_fields::kDecisionSummary |
+            intelligence_fields::kDecisionStatus |
+            intelligence_fields::kDecisionConfidence
+    });
+    focus_patch.intelligence.memories.push_back(IntelligenceMemoryWrite{
+        supporting_memory_strong_key,
+        IntelligenceMemoryLayer::Semantic,
+        strings.intern("scope:supporting"),
+        blobs.append_string("{\"support\":\"memory\"}"),
+        supporting_task_key,
+        supporting_claim_strong_key,
+        0.9F,
+        intelligence_fields::kMemoryLayer |
+            intelligence_fields::kMemoryScope |
+            intelligence_fields::kMemoryContent |
+            intelligence_fields::kMemoryTaskKey |
+            intelligence_fields::kMemoryClaimKey |
+            intelligence_fields::kMemoryImportance
+    });
+    focus_patch.intelligence.tasks.push_back(IntelligenceTaskWrite{
+        action_task_strong_key,
+        strings.intern("Action benchmark strong"),
+        action_owner,
+        blobs.append_string("{\"task\":\"action-strong\"}"),
+        {},
+        IntelligenceTaskStatus::Open,
+        4,
+        0.8F,
+        intelligence_fields::kTaskTitle |
+            intelligence_fields::kTaskOwner |
+            intelligence_fields::kTaskPayload |
+            intelligence_fields::kTaskStatus |
+            intelligence_fields::kTaskPriority |
+            intelligence_fields::kTaskConfidence
+    });
+    focus_patch.intelligence.tasks.push_back(IntelligenceTaskWrite{
+        action_task_weak_key,
+        strings.intern("Action benchmark weak"),
+        action_owner,
+        blobs.append_string("{\"task\":\"action-weak\"}"),
+        {},
+        IntelligenceTaskStatus::Open,
+        4,
+        0.8F,
+        intelligence_fields::kTaskTitle |
+            intelligence_fields::kTaskOwner |
+            intelligence_fields::kTaskPayload |
+            intelligence_fields::kTaskStatus |
+            intelligence_fields::kTaskPriority |
+            intelligence_fields::kTaskConfidence
+    });
+    focus_patch.intelligence.claims.push_back(IntelligenceClaimWrite{
+        action_claim_strong_key,
+        benchmark_subject,
+        benchmark_relation,
+        action_object,
+        blobs.append_string("{\"claim\":\"action-strong\"}"),
+        IntelligenceClaimStatus::Supported,
+        0.9F,
+        intelligence_fields::kClaimSubject |
+            intelligence_fields::kClaimRelation |
+            intelligence_fields::kClaimObject |
+            intelligence_fields::kClaimStatement |
+            intelligence_fields::kClaimStatus |
+            intelligence_fields::kClaimConfidence
+    });
+    focus_patch.intelligence.claims.push_back(IntelligenceClaimWrite{
+        action_claim_weak_key,
+        benchmark_subject,
+        benchmark_relation,
+        action_object,
+        blobs.append_string("{\"claim\":\"action-weak\"}"),
+        IntelligenceClaimStatus::Supported,
+        0.7F,
+        intelligence_fields::kClaimSubject |
+            intelligence_fields::kClaimRelation |
+            intelligence_fields::kClaimObject |
+            intelligence_fields::kClaimStatement |
+            intelligence_fields::kClaimStatus |
+            intelligence_fields::kClaimConfidence
+    });
+    focus_patch.intelligence.evidence.push_back(IntelligenceEvidenceWrite{
+        action_evidence_strong_key,
+        strings.intern("benchmark"),
+        strings.intern("action-candidates"),
+        blobs.append_string("{\"action\":\"strong\"}"),
+        action_task_strong_key,
+        action_claim_strong_key,
+        0.95F,
+        intelligence_fields::kEvidenceKind |
+            intelligence_fields::kEvidenceSource |
+            intelligence_fields::kEvidenceContent |
+            intelligence_fields::kEvidenceTaskKey |
+            intelligence_fields::kEvidenceClaimKey |
+            intelligence_fields::kEvidenceConfidence
+    });
+    focus_patch.intelligence.evidence.push_back(IntelligenceEvidenceWrite{
+        action_evidence_weak_key,
+        strings.intern("benchmark"),
+        strings.intern("action-candidates"),
+        blobs.append_string("{\"action\":\"weak\"}"),
+        action_task_weak_key,
+        action_claim_weak_key,
+        0.42F,
+        intelligence_fields::kEvidenceKind |
+            intelligence_fields::kEvidenceSource |
+            intelligence_fields::kEvidenceContent |
+            intelligence_fields::kEvidenceTaskKey |
+            intelligence_fields::kEvidenceClaimKey |
+            intelligence_fields::kEvidenceConfidence
+    });
+    focus_patch.intelligence.decisions.push_back(IntelligenceDecisionWrite{
+        action_decision_strong_key,
+        action_task_strong_key,
+        action_claim_strong_key,
+        blobs.append_string("{\"selected\":true}"),
+        IntelligenceDecisionStatus::Selected,
+        0.94F,
+        intelligence_fields::kDecisionTaskKey |
+            intelligence_fields::kDecisionClaimKey |
+            intelligence_fields::kDecisionSummary |
+            intelligence_fields::kDecisionStatus |
+            intelligence_fields::kDecisionConfidence
+    });
+    focus_patch.intelligence.memories.push_back(IntelligenceMemoryWrite{
+        action_memory_strong_key,
+        IntelligenceMemoryLayer::Semantic,
+        strings.intern("scope:action"),
+        blobs.append_string("{\"action\":\"memory\"}"),
+        action_task_strong_key,
+        action_claim_strong_key,
+        0.9F,
+        intelligence_fields::kMemoryLayer |
+            intelligence_fields::kMemoryScope |
+            intelligence_fields::kMemoryContent |
+            intelligence_fields::kMemoryTaskKey |
+            intelligence_fields::kMemoryClaimKey |
+            intelligence_fields::kMemoryImportance
+    });
+    focus_patch.intelligence.tasks.push_back(IntelligenceTaskWrite{
+        related_hops2_task_key,
+        strings.intern("Related seed benchmark"),
+        strings.intern("related-owner"),
+        blobs.append_string("{\"task\":\"related-seed\"}"),
+        {},
+        IntelligenceTaskStatus::InProgress,
+        2,
+        0.85F,
+        intelligence_fields::kTaskTitle |
+            intelligence_fields::kTaskOwner |
+            intelligence_fields::kTaskPayload |
+            intelligence_fields::kTaskStatus |
+            intelligence_fields::kTaskPriority |
+            intelligence_fields::kTaskConfidence
+    });
+    focus_patch.intelligence.tasks.push_back(IntelligenceTaskWrite{
+        related_hops2_task_second_key,
+        strings.intern("Related second benchmark"),
+        strings.intern("related-owner"),
+        blobs.append_string("{\"task\":\"related-second\"}"),
+        {},
+        IntelligenceTaskStatus::Open,
+        1,
+        0.7F,
+        intelligence_fields::kTaskTitle |
+            intelligence_fields::kTaskOwner |
+            intelligence_fields::kTaskPayload |
+            intelligence_fields::kTaskStatus |
+            intelligence_fields::kTaskPriority |
+            intelligence_fields::kTaskConfidence
+    });
+    focus_patch.intelligence.claims.push_back(IntelligenceClaimWrite{
+        related_hops2_claim_key,
+        benchmark_subject,
+        benchmark_relation,
+        benchmark_object,
+        blobs.append_string("{\"claim\":\"related\"}"),
+        IntelligenceClaimStatus::Supported,
+        0.82F,
+        intelligence_fields::kClaimSubject |
+            intelligence_fields::kClaimRelation |
+            intelligence_fields::kClaimObject |
+            intelligence_fields::kClaimStatement |
+            intelligence_fields::kClaimStatus |
+            intelligence_fields::kClaimConfidence
+    });
+    focus_patch.intelligence.evidence.push_back(IntelligenceEvidenceWrite{
+        related_hops2_evidence_key,
+        strings.intern("bridge"),
+        benchmark_source,
+        blobs.append_string("{\"edge\":\"related-seed\"}"),
+        related_hops2_task_key,
+        related_hops2_claim_key,
+        0.78F,
+        intelligence_fields::kEvidenceKind |
+            intelligence_fields::kEvidenceSource |
+            intelligence_fields::kEvidenceContent |
+            intelligence_fields::kEvidenceTaskKey |
+            intelligence_fields::kEvidenceClaimKey |
+            intelligence_fields::kEvidenceConfidence
+    });
+    focus_patch.intelligence.memories.push_back(IntelligenceMemoryWrite{
+        related_hops2_memory_key,
+        IntelligenceMemoryLayer::Semantic,
+        strings.intern("scope:related"),
+        blobs.append_string("{\"edge\":\"related-second\"}"),
+        related_hops2_task_second_key,
+        related_hops2_claim_key,
+        0.66F,
+        intelligence_fields::kMemoryLayer |
+            intelligence_fields::kMemoryScope |
+            intelligence_fields::kMemoryContent |
+            intelligence_fields::kMemoryTaskKey |
+            intelligence_fields::kMemoryClaimKey |
+            intelligence_fields::kMemoryImportance
+    });
+    static_cast<void>(store.apply(focus_patch));
+
+    const InternedStringId anchor_task_key =
+        strings.intern("task:bench:" + std::to_string(kIntelligenceBenchmarkRecords / 2U));
+    const InternedStringId related_hops2_anchor_task_key = related_hops2_task_key;
+    IntelligenceQuery task_query;
+    task_query.kind = IntelligenceRecordKind::Tasks;
+    task_query.owner = benchmark_owner;
+    task_query.task_status = IntelligenceTaskStatus::Completed;
+    task_query.min_confidence = 0.75F;
+
+    IntelligenceQuery supported_claim_query;
+    supported_claim_query.kind = IntelligenceRecordKind::Claims;
+    supported_claim_query.claim_status = IntelligenceClaimStatus::Supported;
+    supported_claim_query.min_confidence = 0.7F;
+
+    IntelligenceQuery semantic_claim_query;
+    semantic_claim_query.kind = IntelligenceRecordKind::Claims;
+    semantic_claim_query.subject_label = semantic_subject;
+    semantic_claim_query.relation = semantic_relation;
+    semantic_claim_query.object_label = semantic_object;
+    semantic_claim_query.limit = 1U;
+
+    IntelligenceQuery supporting_claims_query;
+    supporting_claims_query.kind = IntelligenceRecordKind::Claims;
+    supporting_claims_query.task_key = supporting_task_key;
+    supporting_claims_query.limit = 2U;
+
+    IntelligenceQuery action_candidates_query;
+    action_candidates_query.owner = action_owner;
+    action_candidates_query.subject_label = benchmark_subject;
+    action_candidates_query.relation = benchmark_relation;
+    action_candidates_query.object_label = action_object;
+    action_candidates_query.limit = 2U;
+
+    IntelligenceQuery agenda_query;
+    agenda_query.owner = benchmark_owner;
+    agenda_query.limit = 8U;
+
+    IntelligenceQuery recall_query;
+    recall_query.scope = benchmark_scope;
+    recall_query.memory_layer = IntelligenceMemoryLayer::Semantic;
+    recall_query.limit = 8U;
+
+    IntelligenceQuery focus_query;
+    focus_query.owner = benchmark_owner;
+    focus_query.scope = benchmark_scope;
+    focus_query.limit = 8U;
+
+    const std::size_t expected_task_matches = kIntelligenceBenchmarkRecords / 16U;
+    const auto task_query_started_at = std::chrono::steady_clock::now();
+    std::size_t task_matches = 0U;
+    for (std::size_t iteration = 0; iteration < kIntelligenceBenchmarkIterations; ++iteration) {
+        const IntelligenceSnapshot result =
+            query_intelligence_records(store.intelligence(), store.strings(), task_query);
+        task_matches += result.tasks.size();
+    }
+    const auto task_query_ended_at = std::chrono::steady_clock::now();
+
+    const auto claim_semantic_query_started_at = std::chrono::steady_clock::now();
+    std::size_t claim_semantic_matches = 0U;
+    bool claim_semantic_matched = true;
+    for (std::size_t iteration = 0; iteration < kIntelligenceBenchmarkIterations; ++iteration) {
+        const IntelligenceSnapshot result =
+            query_intelligence_records(store.intelligence(), store.strings(), semantic_claim_query);
+        claim_semantic_matches += result.claims.size();
+        claim_semantic_matched = claim_semantic_matched &&
+            result.claims.size() == 1U &&
+            result.claims.front().key == focus_claim_key;
+    }
+    const auto claim_semantic_query_ended_at = std::chrono::steady_clock::now();
+
+    const auto supporting_claims_query_started_at = std::chrono::steady_clock::now();
+    std::size_t supporting_claims_matches = 0U;
+    bool supporting_claims_top_matched = true;
+    for (std::size_t iteration = 0; iteration < kIntelligenceBenchmarkIterations; ++iteration) {
+        const IntelligenceSnapshot result =
+            supporting_intelligence_claims(store.intelligence(), store.strings(), supporting_claims_query);
+        supporting_claims_matches += result.claims.size();
+        supporting_claims_top_matched = supporting_claims_top_matched &&
+            result.claims.size() == 2U &&
+            result.claims.front().key == supporting_claim_strong_key &&
+            result.claims[1].key == supporting_claim_weak_key;
+    }
+    const auto supporting_claims_query_ended_at = std::chrono::steady_clock::now();
+
+    const auto action_candidates_query_started_at = std::chrono::steady_clock::now();
+    std::size_t action_candidates_matches = 0U;
+    bool action_candidates_top_matched = true;
+    for (std::size_t iteration = 0; iteration < kIntelligenceBenchmarkIterations; ++iteration) {
+        const IntelligenceSnapshot result =
+            action_intelligence_tasks(store.intelligence(), store.strings(), action_candidates_query);
+        action_candidates_matches += result.tasks.size();
+        action_candidates_top_matched = action_candidates_top_matched &&
+            result.tasks.size() == 2U &&
+            result.tasks.front().key == action_task_strong_key &&
+            result.tasks[1].key == action_task_weak_key;
+    }
+    const auto action_candidates_query_ended_at = std::chrono::steady_clock::now();
+
+    const auto agenda_query_started_at = std::chrono::steady_clock::now();
+    std::size_t agenda_matches = 0U;
+    bool agenda_top_matched = true;
+    for (std::size_t iteration = 0; iteration < kIntelligenceBenchmarkIterations; ++iteration) {
+        const IntelligenceSnapshot agenda =
+            agenda_intelligence_tasks(store.intelligence(), store.strings(), agenda_query);
+        agenda_matches += agenda.tasks.size();
+        agenda_top_matched = agenda_top_matched &&
+            !agenda.tasks.empty() &&
+            agenda.tasks.front().key == focus_task_key;
+    }
+    const auto agenda_query_ended_at = std::chrono::steady_clock::now();
+
+    const auto recall_query_started_at = std::chrono::steady_clock::now();
+    std::size_t recall_matches = 0U;
+    bool recall_top_matched = true;
+    for (std::size_t iteration = 0; iteration < kIntelligenceBenchmarkIterations; ++iteration) {
+        const IntelligenceSnapshot recall =
+            recall_intelligence_memories(store.intelligence(), store.strings(), recall_query);
+        recall_matches += recall.memories.size();
+        recall_top_matched = recall_top_matched &&
+            !recall.memories.empty() &&
+            recall.memories.front().key == focus_memory_key;
+    }
+    const auto recall_query_ended_at = std::chrono::steady_clock::now();
+
+    const auto focus_query_started_at = std::chrono::steady_clock::now();
+    std::size_t focus_total_records = 0U;
+    bool focus_claim_top_matched = true;
+    bool focus_task_top_matched = true;
+    bool focus_memory_top_matched = true;
+    for (std::size_t iteration = 0; iteration < kIntelligenceBenchmarkIterations; ++iteration) {
+        const IntelligenceSnapshot focus =
+            focus_intelligence_records(store.intelligence(), store.strings(), focus_query);
+        focus_total_records += focus.tasks.size() +
+            focus.claims.size() +
+            focus.evidence.size() +
+            focus.decisions.size() +
+            focus.memories.size();
+        focus_claim_top_matched = focus_claim_top_matched &&
+            !focus.claims.empty() &&
+            focus.claims.front().key == focus_claim_key;
+        focus_task_top_matched = focus_task_top_matched &&
+            !focus.tasks.empty() &&
+            focus.tasks.front().key == focus_task_key;
+        focus_memory_top_matched = focus_memory_top_matched &&
+            !focus.memories.empty() &&
+            focus.memories.front().key == focus_memory_key;
+    }
+    const auto focus_query_ended_at = std::chrono::steady_clock::now();
+
+    const auto related_query_started_at = std::chrono::steady_clock::now();
+    std::size_t related_total_records = 0U;
+    for (std::size_t iteration = 0; iteration < kIntelligenceBenchmarkIterations; ++iteration) {
+        const IntelligenceSnapshot related =
+            related_intelligence_records(store.intelligence(), anchor_task_key, 0U);
+        related_total_records += related.tasks.size() +
+            related.claims.size() +
+            related.evidence.size() +
+            related.decisions.size() +
+            related.memories.size();
+    }
+    const auto related_query_ended_at = std::chrono::steady_clock::now();
+
+    const auto related_hops2_query_started_at = std::chrono::steady_clock::now();
+    std::size_t related_hops2_total_records = 0U;
+    bool related_hops2_expanded = true;
+    for (std::size_t iteration = 0; iteration < kIntelligenceBenchmarkIterations; ++iteration) {
+        const IntelligenceSnapshot related =
+            related_intelligence_records(store.intelligence(), related_hops2_anchor_task_key, 0U, 0U, 2U);
+        related_hops2_total_records += related.tasks.size() +
+            related.claims.size() +
+            related.evidence.size() +
+            related.decisions.size() +
+            related.memories.size();
+        related_hops2_expanded = related_hops2_expanded &&
+            related.tasks.size() == 2U &&
+            related.tasks[1].key == related_hops2_task_second_key &&
+            related.claims.size() == 1U &&
+            related.evidence.size() == 1U &&
+            related.memories.size() == 1U;
+    }
+    const auto related_hops2_query_ended_at = std::chrono::steady_clock::now();
+
+    const auto route_started_at = std::chrono::steady_clock::now();
+    std::optional<std::string> selected_route;
+    for (std::size_t iteration = 0; iteration < kIntelligenceBenchmarkIterations; ++iteration) {
+        selected_route = select_intelligence_route(
+            store.intelligence(),
+            store.strings(),
+            {
+                IntelligenceRouteRule{supported_claim_query, 1U, std::nullopt, "publish"},
+                IntelligenceRouteRule{IntelligenceQuery{}, 1U, std::nullopt, "fallback"}
+            }
+        );
+    }
+    const auto route_ended_at = std::chrono::steady_clock::now();
+
+    assert(task_matches == expected_task_matches * kIntelligenceBenchmarkIterations);
+    assert(claim_semantic_matches == kIntelligenceBenchmarkIterations);
+    assert(supporting_claims_matches == 2U * kIntelligenceBenchmarkIterations);
+    assert(action_candidates_matches == 2U * kIntelligenceBenchmarkIterations);
+    assert(agenda_matches == 8U * kIntelligenceBenchmarkIterations);
+    assert(recall_matches == 8U * kIntelligenceBenchmarkIterations);
+    assert(focus_total_records == 40U * kIntelligenceBenchmarkIterations);
+    assert(related_total_records == 5U * kIntelligenceBenchmarkIterations);
+    assert(related_hops2_total_records == 5U * kIntelligenceBenchmarkIterations);
+    assert(selected_route.has_value());
+    assert(*selected_route == "publish");
+    assert(claim_semantic_matched);
+    assert(supporting_claims_top_matched);
+    assert(action_candidates_top_matched);
+    assert(agenda_top_matched);
+    assert(recall_top_matched);
+    assert(focus_claim_top_matched);
+    assert(focus_task_top_matched);
+    assert(focus_memory_top_matched);
+    assert(related_hops2_expanded);
+
+    return IntelligenceQueryBenchmarkRun{
+        static_cast<uint64_t>(kIntelligenceBenchmarkRecords),
+        static_cast<uint64_t>(kIntelligenceBenchmarkIterations),
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                task_query_ended_at - task_query_started_at
+            ).count()
+        ),
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                claim_semantic_query_ended_at - claim_semantic_query_started_at
+            ).count()
+        ),
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                supporting_claims_query_ended_at - supporting_claims_query_started_at
+            ).count()
+        ),
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                action_candidates_query_ended_at - action_candidates_query_started_at
+            ).count()
+        ),
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                agenda_query_ended_at - agenda_query_started_at
+            ).count()
+        ),
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                recall_query_ended_at - recall_query_started_at
+            ).count()
+        ),
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                focus_query_ended_at - focus_query_started_at
+            ).count()
+        ),
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                related_query_ended_at - related_query_started_at
+            ).count()
+        ),
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                related_hops2_query_ended_at - related_hops2_query_started_at
+            ).count()
+        ),
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                route_ended_at - route_started_at
+            ).count()
+        ),
+        static_cast<uint64_t>(task_matches),
+        static_cast<uint64_t>(claim_semantic_matches),
+        static_cast<uint64_t>(supporting_claims_matches),
+        static_cast<uint64_t>(action_candidates_matches),
+        static_cast<uint64_t>(agenda_matches),
+        static_cast<uint64_t>(recall_matches),
+        static_cast<uint64_t>(focus_total_records),
+        static_cast<uint64_t>(related_total_records),
+        static_cast<uint64_t>(related_hops2_total_records),
+        selected_route.has_value() && *selected_route == "publish",
+        claim_semantic_matched,
+        supporting_claims_top_matched,
+        action_candidates_top_matched,
+        agenda_top_matched,
+        recall_top_matched,
+        focus_claim_top_matched,
+        focus_task_top_matched,
+        focus_memory_top_matched,
+        related_hops2_expanded
     };
 }
 
@@ -2451,6 +3305,41 @@ int main() {
         ? 0.0
         : static_cast<double>(memoization_invalidation.elapsed_ns) /
             static_cast<double>(memoization_hit.elapsed_ns);
+    const IntelligenceQueryBenchmarkRun intelligence_query_benchmark =
+        run_intelligence_query_benchmark_once();
+    assert(intelligence_query_benchmark.records == kIntelligenceBenchmarkRecords);
+    assert(intelligence_query_benchmark.iterations == kIntelligenceBenchmarkIterations);
+    assert(intelligence_query_benchmark.route_matched);
+    assert(intelligence_query_benchmark.claim_semantic_matched);
+    assert(intelligence_query_benchmark.supporting_claims_top_matched);
+    assert(intelligence_query_benchmark.action_candidates_top_matched);
+    assert(intelligence_query_benchmark.agenda_top_matched);
+    assert(intelligence_query_benchmark.recall_top_matched);
+    assert(intelligence_query_benchmark.focus_claim_top_matched);
+    assert(intelligence_query_benchmark.focus_task_top_matched);
+    assert(intelligence_query_benchmark.focus_memory_top_matched);
+    assert(intelligence_query_benchmark.related_hops2_expanded);
+    assert(
+        intelligence_query_benchmark.task_matches ==
+        (kIntelligenceBenchmarkRecords / 16U) * kIntelligenceBenchmarkIterations
+    );
+    assert(
+        intelligence_query_benchmark.claim_semantic_matches ==
+        kIntelligenceBenchmarkIterations
+    );
+    assert(
+        intelligence_query_benchmark.supporting_claims_matches ==
+        2U * kIntelligenceBenchmarkIterations
+    );
+    assert(
+        intelligence_query_benchmark.action_candidates_matches ==
+        2U * kIntelligenceBenchmarkIterations
+    );
+    assert(intelligence_query_benchmark.agenda_matches == 8U * kIntelligenceBenchmarkIterations);
+    assert(intelligence_query_benchmark.recall_matches == 8U * kIntelligenceBenchmarkIterations);
+    assert(intelligence_query_benchmark.focus_total_records == 40U * kIntelligenceBenchmarkIterations);
+    assert(intelligence_query_benchmark.related_total_records == 5U * kIntelligenceBenchmarkIterations);
+    assert(intelligence_query_benchmark.related_hops2_total_records == 5U * kIntelligenceBenchmarkIterations);
 
     const SubgraphBenchmarkRun subgraph_benchmark =
         run_subgraph_benchmark_once(subgraph_parent_graph, subgraph_child_graph);
@@ -2545,6 +3434,46 @@ int main() {
                     memoization_baseline.final_output == memoization_hit.final_output
                  ) << '\n'
               << "memoization_invalidation_final_input=" << memoization_invalidation.final_input << '\n'
+              << "intelligence_benchmark_records=" << intelligence_query_benchmark.records << '\n'
+              << "intelligence_benchmark_iterations=" << intelligence_query_benchmark.iterations << '\n'
+              << "intelligence_task_query_ns=" << intelligence_query_benchmark.task_query_ns << '\n'
+              << "intelligence_claim_semantic_query_ns="
+              << intelligence_query_benchmark.claim_semantic_query_ns << '\n'
+              << "intelligence_supporting_claims_query_ns="
+              << intelligence_query_benchmark.supporting_claims_query_ns << '\n'
+              << "intelligence_action_candidates_query_ns="
+              << intelligence_query_benchmark.action_candidates_query_ns << '\n'
+              << "intelligence_agenda_query_ns=" << intelligence_query_benchmark.agenda_query_ns << '\n'
+              << "intelligence_recall_query_ns=" << intelligence_query_benchmark.recall_query_ns << '\n'
+              << "intelligence_focus_query_ns=" << intelligence_query_benchmark.focus_query_ns << '\n'
+              << "intelligence_related_query_ns=" << intelligence_query_benchmark.related_query_ns << '\n'
+              << "intelligence_related_hops2_query_ns=" << intelligence_query_benchmark.related_hops2_query_ns << '\n'
+              << "intelligence_route_select_ns=" << intelligence_query_benchmark.route_select_ns << '\n'
+              << "intelligence_task_matches=" << intelligence_query_benchmark.task_matches << '\n'
+              << "intelligence_claim_semantic_matches="
+              << intelligence_query_benchmark.claim_semantic_matches << '\n'
+              << "intelligence_supporting_claims_matches="
+              << intelligence_query_benchmark.supporting_claims_matches << '\n'
+              << "intelligence_action_candidates_matches="
+              << intelligence_query_benchmark.action_candidates_matches << '\n'
+              << "intelligence_agenda_matches=" << intelligence_query_benchmark.agenda_matches << '\n'
+              << "intelligence_recall_matches=" << intelligence_query_benchmark.recall_matches << '\n'
+              << "intelligence_focus_total_records=" << intelligence_query_benchmark.focus_total_records << '\n'
+              << "intelligence_related_total_records=" << intelligence_query_benchmark.related_total_records << '\n'
+              << "intelligence_related_hops2_total_records=" << intelligence_query_benchmark.related_hops2_total_records << '\n'
+              << "intelligence_route_matched=" << static_cast<int>(intelligence_query_benchmark.route_matched) << '\n'
+              << "intelligence_claim_semantic_matched="
+              << static_cast<int>(intelligence_query_benchmark.claim_semantic_matched) << '\n'
+              << "intelligence_supporting_claims_top_matched="
+              << static_cast<int>(intelligence_query_benchmark.supporting_claims_top_matched) << '\n'
+              << "intelligence_action_candidates_top_matched="
+              << static_cast<int>(intelligence_query_benchmark.action_candidates_top_matched) << '\n'
+              << "intelligence_agenda_top_matched=" << static_cast<int>(intelligence_query_benchmark.agenda_top_matched) << '\n'
+              << "intelligence_recall_top_matched=" << static_cast<int>(intelligence_query_benchmark.recall_top_matched) << '\n'
+              << "intelligence_focus_claim_top_matched=" << static_cast<int>(intelligence_query_benchmark.focus_claim_top_matched) << '\n'
+              << "intelligence_focus_task_top_matched=" << static_cast<int>(intelligence_query_benchmark.focus_task_top_matched) << '\n'
+              << "intelligence_focus_memory_top_matched=" << static_cast<int>(intelligence_query_benchmark.focus_memory_top_matched) << '\n'
+              << "intelligence_related_hops2_expanded=" << static_cast<int>(intelligence_query_benchmark.related_hops2_expanded) << '\n'
               << "subgraph_benchmark_runs=" << kSubgraphBenchmarkRuns << '\n'
               << "subgraph_benchmark_ns=" << subgraph_benchmark.elapsed_ns << '\n'
               << "subgraph_stream_read_ns=" << subgraph_benchmark.stream_read_ns << '\n'

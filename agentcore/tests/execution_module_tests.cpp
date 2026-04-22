@@ -268,6 +268,29 @@ int main() {
 
     std::remove(persistence_path.c_str());
 
+    ExecutionEngine lean_engine(1);
+    const RunId lean_run_id = lean_engine.start(
+        graph,
+        InputEnvelope{4U},
+        RunCaptureOptions{false, false}
+    );
+    const RunResult lean_result = lean_engine.run_to_completion(lean_run_id);
+    assert(lean_result.status == ExecutionStatus::Completed);
+    assert(lean_result.last_checkpoint_id == 0U);
+    const WorkflowState& lean_state = lean_engine.state(lean_run_id);
+    assert(lean_state.size() > kResult);
+    assert(std::holds_alternative<BlobRef>(lean_state.load(kResult)));
+    assert(
+        lean_engine.state_store(lean_run_id).blobs().read_string(std::get<BlobRef>(lean_state.load(kResult))) ==
+        "execution-module-ok"
+    );
+    assert(lean_engine.checkpoints().size() == 0U);
+    assert(lean_engine.trace().events_for_run(lean_run_id).empty());
+    lean_engine.discard_run(lean_run_id);
+    const InterruptResult discarded_interrupt = lean_engine.interrupt(lean_run_id);
+    assert(!discarded_interrupt.interrupted);
+    assert(discarded_interrupt.message == "run not found");
+
     GraphDefinition memoization_loop_graph = make_memoization_loop_graph();
     error_message.clear();
     assert(memoization_loop_graph.validate(&error_message));

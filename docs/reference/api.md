@@ -13,6 +13,10 @@ Exports:
 - `START`
 - `END`
 - `Command`
+- `IntelligenceView`
+- `IntelligenceRule`
+- `IntelligenceRouter`
+- `IntelligenceSubscription`
 - `RuntimeContext`
 - `ToolRegistryView`
 - `ModelRegistryView`
@@ -31,7 +35,7 @@ StateGraph(state_schema=None, *, name=None, worker_count=1)
 
 Builder methods:
 
-- `add_node(name, action=None, *, kind="compute", stop_after=False, allow_fan_out=False, create_join_scope=False, join_incoming_branches=False, merge=None)`
+- `add_node(name, action=None, *, kind="compute", stop_after=False, allow_fan_out=False, create_join_scope=False, join_incoming_branches=False, deterministic=False, read_keys=None, cache_size=16, intelligence_subscriptions=None, merge=None)`
 - `add_fanout(name, action=None, *, kind="control", create_join_scope=True)`
 - `add_join(name, action=None, *, merge=None, kind="aggregate")`
 - `add_subgraph(name, graph, *, inputs=None, outputs=None, namespace=None, propagate_knowledge_graph=False, session_mode="ephemeral", session_id_from=None)`
@@ -82,6 +86,8 @@ Metadata and stream events include the usual run/node identifiers plus:
 - `session_id`
 - `session_revision`
 - `namespaces`
+
+`invoke_with_metadata(...)`, `invoke_until_pause_with_metadata(...)`, and `resume_with_metadata(...)` also include the committed intelligence snapshot under `details["intelligence"]`.
 
 Registry properties:
 
@@ -146,12 +152,77 @@ Use `Command` when a node wants to return state updates together with explicit r
 Current surface:
 
 - `runtime.available`
+- `runtime.intelligence`
+- `runtime.snapshot_intelligence()`
+- `runtime.upsert_task(key, *, title=None, owner=None, details=None, result=None, status=None, priority=None, confidence=None)`
+- `runtime.upsert_claim(key, *, subject=None, relation=None, object=None, statement=None, status=None, confidence=None)`
+- `runtime.add_evidence(key, *, kind=None, source=None, content=None, task_key=None, claim_key=None, confidence=None)`
+- `runtime.record_decision(key, *, task_key=None, claim_key=None, summary=None, status=None, confidence=None)`
+- `runtime.remember(key, *, layer=None, scope=None, content=None, task_key=None, claim_key=None, importance=None)`
 - `runtime.record_once(key, request, producer)`
 - `runtime.record_once_with_metadata(key, request, producer)`
 - `runtime.invoke_tool(name, request, decode="auto")`
 - `runtime.invoke_tool_with_metadata(name, request, decode="auto")`
 - `runtime.invoke_model(name, prompt, schema=None, max_tokens=0, decode="auto")`
 - `runtime.invoke_model_with_metadata(name, prompt, schema=None, max_tokens=0, decode="auto")`
+
+`runtime.intelligence` is the preferred grouped surface for intelligence operations. Current methods:
+
+- `runtime.intelligence.snapshot()`
+- `runtime.intelligence.summary()`
+- `runtime.intelligence.count(kind=None, key=None, key_prefix=None, task_key=None, claim_key=None, subject=None, relation=None, object=None, owner=None, source=None, scope=None, status=None, layer=None, min_confidence=None, min_importance=None)`
+- `runtime.intelligence.exists(**filters)`
+- `runtime.intelligence.query(kind=None, key=None, key_prefix=None, task_key=None, claim_key=None, subject=None, relation=None, object=None, owner=None, source=None, scope=None, status=None, layer=None, min_confidence=None, min_importance=None, limit=None)`
+- `runtime.intelligence.supporting_claims(key=None, key_prefix=None, task_key=None, claim_key=None, subject=None, relation=None, object=None, status=None, min_confidence=None, limit=None)`
+- `runtime.intelligence.action_candidates(task_key=None, claim_key=None, subject=None, relation=None, object=None, owner=None, task_status=None, source=None, scope=None, layer=None, min_confidence=None, min_importance=None, limit=None)`
+- `runtime.intelligence.related(task_key=None, claim_key=None, limit=None, hops=1)`
+- `runtime.intelligence.agenda(key=None, key_prefix=None, task_key=None, owner=None, status=None, min_confidence=None, limit=None)`
+- `runtime.intelligence.next_task(key=None, key_prefix=None, task_key=None, owner=None, status=None, min_confidence=None)`
+- `runtime.intelligence.recall(key=None, key_prefix=None, task_key=None, claim_key=None, scope=None, layer=None, min_importance=None, limit=None)`
+- `runtime.intelligence.focus(key=None, key_prefix=None, task_key=None, claim_key=None, subject=None, relation=None, object=None, owner=None, source=None, scope=None, layer=None, min_confidence=None, min_importance=None, limit=5)`
+- `runtime.intelligence.route(rules, *, default=None)`
+- `runtime.intelligence.upsert_task(...)`
+- `runtime.intelligence.upsert_claim(...)`
+- `runtime.intelligence.add_evidence(...)`
+- `runtime.intelligence.record_decision(...)`
+- `runtime.intelligence.remember(...)`
+
+Routing helpers:
+
+- `IntelligenceRule(goto, *, kind=None, key=None, key_prefix=None, task_key=None, claim_key=None, subject=None, relation=None, object=None, owner=None, source=None, scope=None, status=None, layer=None, min_confidence=None, min_importance=None, min_count=1, max_count=None)`
+- `IntelligenceRouter(rules, default=None)`
+- `IntelligenceSubscription(kind=None, key=None, key_prefix=None, task_key=None, claim_key=None, subject=None, relation=None, object=None, owner=None, source=None, scope=None, status=None, layer=None, min_confidence=None, min_importance=None)`
+
+`IntelligenceRouter` is a small callable wrapper intended for `StateGraph.add_conditional_edges(...)`. It evaluates the provided `IntelligenceRule` list against the runtime intelligence view and returns the selected route name.
+
+`IntelligenceSubscription` is used at graph-build time. Passing `intelligence_subscriptions=[...]` to `StateGraph.add_node(...)` marks that node as intelligence-reactive, and matching committed intelligence deltas will enqueue the node through the native reactive frontier scheduler.
+
+The direct `RuntimeContext` intelligence methods remain available as compatibility wrappers around the grouped view.
+
+`agenda(...)` returns a tasks-only snapshot ranked by task status class, descending priority, descending confidence, then stable id. `next_task(...)` is the convenience form that returns the first ranked task or `None`.
+
+`supporting_claims(...)` returns a claims-only snapshot ranked by deterministic support from linked evidence, decisions, and memories. When `task_key=` is present, task-aligned support is prioritized so workflows can ask for the best-supported claims for one task without reimplementing the reduction path in Python.
+
+`action_candidates(...)` is the task-selection primitive that sits between those two. It accepts task, claim, semantic-claim, evidence-source, and memory-scope anchors, expands only the bounded linked neighborhood around those anchors, and returns tasks ranked by direct anchor match, aligned support from linked evidence/decisions/memories, task status class, total support, priority, confidence, then stable id. The result shape stays tasks-only so Python nodes can ask "what should we do next?" without materializing a larger cross-kind focus set first.
+
+`recall(...)` returns a memories-only snapshot ranked by descending importance, then stable id.
+
+`focus(...)` returns a bounded cross-kind snapshot. It seeds from direct anchors and the current agenda/recall surface, expands one bounded related set through task/claim links, and returns ranked `tasks`, `claims`, `evidence`, `decisions`, and `memories` lists in one response. Direct anchors stay first, and decisive support such as selected decisions and strong evidence is ranked ahead of large numbers of weak links.
+
+`related(...)` returns the neighborhood around one task or claim. With the default `hops=1`, it behaves like a first-hop expansion. Larger hop counts keep expanding through linked task/claim records in bounded BFS order so workflows can cross a shared claim or task boundary without writing custom traversal logic in Python.
+
+For claim records, `count(...)`, `query(...)`, `focus(...)`, `IntelligenceRule`, and `IntelligenceSubscription` all support semantic filtering by `subject`, `relation`, and `object`. That allows claim-centric routing and reactive execution to stay on the same native query path used for direct lookups.
+
+The intelligence snapshot shape is:
+
+- `counts`
+- `tasks`
+- `claims`
+- `evidence`
+- `decisions`
+- `memories`
+
+Each list entry carries a stable numeric `id`, a string `key`, and the currently implemented typed fields for that record category. Payload-bearing fields such as task `details`, evidence `content`, decision `summary`, and memory `content` round-trip through the native blob store and return as ordinary Python objects.
 
 `record_once(...)` returns the produced value. `record_once_with_metadata(...)` returns a dictionary with:
 
@@ -228,6 +299,7 @@ The most important headers are:
 - [`../../agentcore/include/agentcore/core/types.h`](../../agentcore/include/agentcore/core/types.h): common IDs, `Value`, blob and string handle types
 - [`../../agentcore/include/agentcore/graph/graph_ir.h`](../../agentcore/include/agentcore/graph/graph_ir.h): `GraphDefinition`, node and edge definitions, graph compilation helpers
 - [`../../agentcore/include/agentcore/state/state_store.h`](../../agentcore/include/agentcore/state/state_store.h): `WorkflowState`, `StatePatch`, `BlobStore`, patch log
+- [`../../agentcore/include/agentcore/state/intelligence/model.h`](../../agentcore/include/agentcore/state/intelligence/model.h): intelligence records, patches, deltas, and snapshots
 - [`../../agentcore/include/agentcore/state/journal/task_journal.h`](../../agentcore/include/agentcore/state/journal/task_journal.h): persisted recorded-task journal
 - [`../../agentcore/include/agentcore/state/knowledge_graph.h`](../../agentcore/include/agentcore/state/knowledge_graph.h): knowledge-graph storage and matching
 - [`../../agentcore/include/agentcore/runtime/node_runtime.h`](../../agentcore/include/agentcore/runtime/node_runtime.h): `ExecutionContext`, `NodeResult`, node execution contract
@@ -246,9 +318,10 @@ The most important headers are:
 - `ExecutionEngine`: run lifecycle and state/tracing access
 - `InterruptResult`: result of intentionally pausing a live run
 - `StateEditResult`: result of applying a manual state patch to a paused run
-- `ExecutionContext`: per-step view of state, blobs, registries, trace sink, deadlines, and knowledge graph
+- `ExecutionContext`: per-step view of state, blobs, registries, trace sink, deadlines, knowledge graph, and intelligence state
+- `IntelligenceStore`: structured task/claim/evidence/decision/memory state owned by `StateStore`
 - `NodeResult`: status, patch, confidence, flags, optional next-node override
-- `StatePatch`: field updates, blobs, recorded task outcomes, and knowledge-graph writes
+- `StatePatch`: field updates, blobs, recorded task outcomes, intelligence writes, and knowledge-graph writes
 - `TaskJournal`: persisted once-only task/outcome records scoped to a run snapshot
 - `RecordedEffectResult`: return type for `ExecutionContext` recorded-effect helpers
 

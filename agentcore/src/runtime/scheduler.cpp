@@ -24,6 +24,24 @@ bool WorkQueue::delayed_task_later(const ScheduledTask& left, const ScheduledTas
     return task_ready_before(right, left);
 }
 
+void WorkQueue::compact_ready_segment(std::vector<ScheduledTask>& tasks, std::size_t& head) {
+    if (head == 0U) {
+        return;
+    }
+    if (head >= tasks.size()) {
+        tasks.clear();
+        head = 0U;
+        return;
+    }
+    if (head >= 64U && head * 2U >= tasks.size()) {
+        tasks.erase(
+            tasks.begin(),
+            tasks.begin() + static_cast<std::ptrdiff_t>(head)
+        );
+        head = 0U;
+    }
+}
+
 bool WorkQueue::ReadyRunFrontOrder::operator()(const ReadyRunFront& left, const ReadyRunFront& right) const noexcept {
     if (WorkQueue::task_ready_before(left.task, right.task)) {
         return true;
@@ -44,18 +62,17 @@ void WorkQueue::promote_ready_locked(uint64_t now_ns) {
     }
 }
 
-void WorkQueue::refresh_ready_front_locked(RunId run_id) {
+void WorkQueue::erase_ready_front_locked(RunId run_id) {
     const auto ready_front_iterator = ready_front_index_.find(run_id);
     if (ready_front_iterator != ready_front_index_.end()) {
         ready_fronts_.erase(ready_front_iterator->second);
         ready_front_index_.erase(ready_front_iterator);
     }
+}
 
+void WorkQueue::insert_ready_front_locked(RunId run_id) {
     auto run_iterator = ready_by_run_.find(run_id);
     if (run_iterator == ready_by_run_.end() || run_iterator->second.empty()) {
-        if (run_iterator != ready_by_run_.end() && run_iterator->second.empty()) {
-            ready_by_run_.erase(run_iterator);
-        }
         return;
     }
 
@@ -64,16 +81,116 @@ void WorkQueue::refresh_ready_front_locked(RunId run_id) {
     ready_front_index_[run_id] = inserted_iterator;
 }
 
+void WorkQueue::rebuild_ready_fronts_locked() {
+    ready_fronts_.clear();
+    ready_front_index_.clear();
+    for (const auto& [run_id, ready_tasks] : ready_by_run_) {
+        if (ready_tasks.empty()) {
+            continue;
+        }
+        insert_ready_front_locked(run_id);
+    }
+}
+
+void WorkQueue::rebuild_ready_tracking_locked() {
+    if (ready_by_run_.empty()) {
+        ready_fronts_.clear();
+        ready_front_index_.clear();
+        single_ready_run_id_ = 0U;
+        return;
+    }
+
+    if (ready_by_run_.size() == 1U) {
+        ready_fronts_.clear();
+        ready_front_index_.clear();
+        single_ready_run_id_ = ready_by_run_.begin()->first;
+        return;
+    }
+
+    single_ready_run_id_ = 0U;
+    rebuild_ready_fronts_locked();
+}
+
+void WorkQueue::refresh_ready_front_locked(RunId run_id) {
+    erase_ready_front_locked(run_id);
+    if (single_ready_run_id_ == run_id) {
+        single_ready_run_id_ = 0U;
+    }
+
+    auto run_iterator = ready_by_run_.find(run_id);
+    if (run_iterator != ready_by_run_.end()) {
+        compact_ready_segment(run_iterator->second.ordered_tasks, run_iterator->second.ordered_head);
+        compact_ready_segment(run_iterator->second.tail_tasks, run_iterator->second.tail_head);
+    }
+    if (run_iterator != ready_by_run_.end() && run_iterator->second.empty()) {
+        ready_by_run_.erase(run_iterator);
+        run_iterator = ready_by_run_.end();
+    }
+
+    if (ready_by_run_.size() <= 1U) {
+        rebuild_ready_tracking_locked();
+        return;
+    }
+
+    single_ready_run_id_ = 0U;
+    if (ready_front_index_.empty()) {
+        rebuild_ready_fronts_locked();
+        return;
+    }
+
+    if (run_iterator != ready_by_run_.end()) {
+        insert_ready_front_locked(run_id);
+    }
+}
+
 void WorkQueue::enqueue_ready_locked(const ScheduledTask& task) {
-    std::deque<ScheduledTask>& ready_tasks = ready_by_run_[task.run_id];
+    ReadyTaskBuffer& ready_tasks = ready_by_run_[task.run_id];
+    if (ready_tasks.empty()) {
+        if (task.ready_at_ns == 0U) {
+            ready_tasks.tail_tasks.push_back(task);
+        } else {
+            ready_tasks.ordered_tasks.push_back(task);
+        }
+        refresh_ready_front_locked(task.run_id);
+        return;
+    }
+
+    if (!ready_tasks.tail_empty() || task.ready_at_ns == 0U) {
+        ready_tasks.tail_tasks.push_back(task);
+        refresh_ready_front_locked(task.run_id);
+        return;
+    }
+
+    compact_ready_segment(ready_tasks.ordered_tasks, ready_tasks.ordered_head);
+    if (ready_tasks.ordered_empty()) {
+        ready_tasks.ordered_tasks.push_back(task);
+        refresh_ready_front_locked(task.run_id);
+        return;
+    }
+
+    if (!task_ready_before(task, ready_tasks.ordered_tasks.back())) {
+        ready_tasks.ordered_tasks.push_back(task);
+        refresh_ready_front_locked(task.run_id);
+        return;
+    }
+
+    if (task_ready_before(task, ready_tasks.ordered_tasks[ready_tasks.ordered_head])) {
+        ready_tasks.ordered_tasks.insert(
+            ready_tasks.ordered_tasks.begin() + static_cast<std::ptrdiff_t>(ready_tasks.ordered_head),
+            task
+        );
+        refresh_ready_front_locked(task.run_id);
+        return;
+    }
+
     const auto insert_position = std::find_if(
-        ready_tasks.begin(),
-        ready_tasks.end(),
+        ready_tasks.ordered_tasks.begin() + static_cast<std::ptrdiff_t>(ready_tasks.ordered_head + 1U),
+        ready_tasks.ordered_tasks.end(),
         [&task](const ScheduledTask& candidate) {
             return task_ready_before(task, candidate);
         }
     );
-    ready_tasks.insert(insert_position, task);
+    ready_tasks.ordered_tasks.insert(insert_position, task);
     refresh_ready_front_locked(task.run_id);
 }
 
@@ -96,8 +213,13 @@ std::optional<ScheduledTask> WorkQueue::pop_ready_locked(RunId run_id) {
         return std::nullopt;
     }
 
-    ScheduledTask task = run_iterator->second.front();
-    run_iterator->second.pop_front();
+    ReadyTaskBuffer& ready_tasks = const_cast<ReadyTaskBuffer&>(run_iterator->second);
+    ScheduledTask task;
+    if (!ready_tasks.ordered_empty()) {
+        task = ready_tasks.ordered_tasks[ready_tasks.ordered_head++];
+    } else {
+        task = ready_tasks.tail_tasks[ready_tasks.tail_head++];
+    }
     refresh_ready_front_locked(run_id);
 
     auto task_count_iterator = run_task_counts_.find(run_id);
@@ -114,8 +236,14 @@ std::optional<ScheduledTask> WorkQueue::pop_ready_locked(RunId run_id) {
 std::optional<ScheduledTask> WorkQueue::pop_ready(uint64_t now_ns) {
     std::lock_guard<std::mutex> lock(mutex_);
     promote_ready_locked(now_ns);
-    if (ready_fronts_.empty()) {
+    if (ready_by_run_.empty()) {
         return std::nullopt;
+    }
+    if (single_ready_run_id_ != 0U) {
+        return pop_ready_locked(single_ready_run_id_);
+    }
+    if (ready_fronts_.empty()) {
+        rebuild_ready_fronts_locked();
     }
     return pop_ready_locked(ready_fronts_.begin()->run_id);
 }
@@ -157,7 +285,7 @@ std::vector<ScheduledTask> WorkQueue::pop_ready_batch_for_run(
 bool WorkQueue::has_ready(uint64_t now_ns) {
     std::lock_guard<std::mutex> lock(mutex_);
     promote_ready_locked(now_ns);
-    return !ready_fronts_.empty();
+    return !ready_by_run_.empty();
 }
 
 bool WorkQueue::has_ready_for_run(RunId run_id, uint64_t now_ns) {
@@ -210,10 +338,9 @@ void WorkQueue::remove_run_locked(RunId run_id) {
         ? 0U
         : task_count_iterator->second;
 
-    const auto ready_front_iterator = ready_front_index_.find(run_id);
-    if (ready_front_iterator != ready_front_index_.end()) {
-        ready_fronts_.erase(ready_front_iterator->second);
-        ready_front_index_.erase(ready_front_iterator);
+    erase_ready_front_locked(run_id);
+    if (single_ready_run_id_ == run_id) {
+        single_ready_run_id_ = 0U;
     }
 
     ready_by_run_.erase(run_id);
@@ -234,6 +361,7 @@ void WorkQueue::remove_run_locked(RunId run_id) {
 
     run_task_counts_.erase(run_id);
     total_task_count_ -= removed_task_count;
+    rebuild_ready_tracking_locked();
 }
 
 void WorkQueue::remove_run(RunId run_id) {
@@ -247,6 +375,7 @@ void WorkQueue::clear() {
     delayed_heap_.clear();
     ready_fronts_.clear();
     ready_front_index_.clear();
+    single_ready_run_id_ = 0U;
     run_task_counts_.clear();
     total_task_count_ = 0U;
     last_observed_now_ns_ = 0U;
@@ -257,15 +386,27 @@ std::vector<ScheduledTask> WorkQueue::tasks_for_run(RunId run_id) const {
     std::vector<ScheduledTask> tasks;
     const auto ready_iterator = ready_by_run_.find(run_id);
     if (ready_iterator != ready_by_run_.end()) {
-        tasks.insert(tasks.end(), ready_iterator->second.begin(), ready_iterator->second.end());
+        const ReadyTaskBuffer& ready_tasks = ready_iterator->second;
+        tasks.insert(
+            tasks.end(),
+            ready_tasks.ordered_tasks.begin() + static_cast<std::ptrdiff_t>(ready_tasks.ordered_head),
+            ready_tasks.ordered_tasks.end()
+        );
+        tasks.insert(
+            tasks.end(),
+            ready_tasks.tail_tasks.begin() + static_cast<std::ptrdiff_t>(ready_tasks.tail_head),
+            ready_tasks.tail_tasks.end()
+        );
     }
+    std::vector<ScheduledTask> delayed_tasks;
     for (const ScheduledTask& task : delayed_heap_) {
         if (task.run_id == run_id) {
-            tasks.push_back(task);
+            delayed_tasks.push_back(task);
         }
     }
-    if (!tasks.empty()) {
-        std::sort(tasks.begin(), tasks.end(), task_ready_before);
+    if (!delayed_tasks.empty()) {
+        std::sort(delayed_tasks.begin(), delayed_tasks.end(), task_ready_before);
+        tasks.insert(tasks.end(), delayed_tasks.begin(), delayed_tasks.end());
     }
     return tasks;
 }
@@ -314,6 +455,11 @@ WorkerPool::~WorkerPool() {
 
 void WorkerPool::run_batch(const std::vector<std::function<void()>>& jobs) {
     if (jobs.empty()) {
+        return;
+    }
+
+    if (jobs.size() == 1U) {
+        jobs.front()();
         return;
     }
 

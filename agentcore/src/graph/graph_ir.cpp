@@ -266,10 +266,14 @@ void GraphDefinition::compile_runtime() {
     compiled_routes.clear();
     compiled_node_routing.clear();
     compiled_knowledge_subscriptions.clear();
+    compiled_intelligence_subscriptions.clear();
     compiled_entity_subscription_index.clear();
     compiled_subject_subscription_index.clear();
     compiled_relation_subscription_index.clear();
     compiled_object_subscription_index.clear();
+    for (auto& bucket : compiled_intelligence_subscription_index) {
+        bucket.clear();
+    }
     compiled_node_routing.resize(nodes.size());
 
     for (std::size_t node_index = 0; node_index < nodes.size(); ++node_index) {
@@ -311,6 +315,21 @@ void GraphDefinition::compile_runtime() {
                 compiled_object_subscription_index[subscription.object_label].push_back(compiled_index);
             }
         }
+
+        for (std::size_t subscription_index = 0;
+             subscription_index < node.intelligence_subscriptions.size();
+             ++subscription_index) {
+            const IntelligenceSubscription& subscription = node.intelligence_subscriptions[subscription_index];
+            const uint32_t compiled_index =
+                static_cast<uint32_t>(compiled_intelligence_subscriptions.size());
+            compiled_intelligence_subscriptions.push_back(CompiledIntelligenceSubscription{
+                static_cast<uint32_t>(node_index),
+                static_cast<uint32_t>(subscription_index),
+                subscription.kind
+            });
+            compiled_intelligence_subscription_index[static_cast<std::size_t>(subscription.kind)]
+                .push_back(compiled_index);
+        }
     }
 
     runtime_compiled = true;
@@ -325,10 +344,14 @@ void GraphDefinition::invalidate_runtime() noexcept {
     compiled_routes.clear();
     compiled_node_routing.clear();
     compiled_knowledge_subscriptions.clear();
+    compiled_intelligence_subscriptions.clear();
     compiled_entity_subscription_index.clear();
     compiled_subject_subscription_index.clear();
     compiled_relation_subscription_index.clear();
     compiled_object_subscription_index.clear();
+    for (auto& bucket : compiled_intelligence_subscription_index) {
+        bucket.clear();
+    }
 }
 
 const NodeDefinition* GraphDefinition::find_node(NodeId node_id) const {
@@ -422,6 +445,15 @@ const CompiledKnowledgeSubscription* GraphDefinition::knowledge_subscription(uin
     return &compiled_knowledge_subscriptions[compiled_index];
 }
 
+const CompiledIntelligenceSubscription* GraphDefinition::intelligence_subscription(
+    uint32_t compiled_index
+) const {
+    if (!runtime_compiled || compiled_index >= compiled_intelligence_subscriptions.size()) {
+        return nullptr;
+    }
+    return &compiled_intelligence_subscriptions[compiled_index];
+}
+
 ArrayView<uint32_t> GraphDefinition::candidate_entity_subscriptions(std::string_view entity_label) const {
     if (!runtime_compiled) {
         return {};
@@ -462,6 +494,17 @@ ArrayView<uint32_t> GraphDefinition::candidate_triple_subscriptions(
     }
 
     return {};
+}
+
+ArrayView<uint32_t> GraphDefinition::candidate_intelligence_subscriptions(
+    IntelligenceSubscriptionKind kind
+) const {
+    if (!runtime_compiled) {
+        return {};
+    }
+    const std::vector<uint32_t>& bucket =
+        compiled_intelligence_subscription_index[static_cast<std::size_t>(kind)];
+    return ArrayView<uint32_t>(bucket.data(), bucket.size());
 }
 
 bool GraphDefinition::is_runtime_compiled() const noexcept {
@@ -518,6 +561,20 @@ bool GraphDefinition::validate(std::string* error_message) const {
                 "knowledge subscriptions require ReactToKnowledgeGraph policy: " + node.name
             );
         }
+        if (has_node_policy(node.policy_flags, NodePolicyFlag::ReactToIntelligence) &&
+            node.intelligence_subscriptions.empty()) {
+            return fail_validation(
+                error_message,
+                "intelligence-reactive node is missing subscriptions: " + node.name
+            );
+        }
+        if (!has_node_policy(node.policy_flags, NodePolicyFlag::ReactToIntelligence) &&
+            !node.intelligence_subscriptions.empty()) {
+            return fail_validation(
+                error_message,
+                "intelligence subscriptions require ReactToIntelligence policy: " + node.name
+            );
+        }
         if (node.memoization.enabled()) {
             if (node.kind != NodeKind::Compute &&
                 node.kind != NodeKind::Control &&
@@ -528,10 +585,11 @@ bool GraphDefinition::validate(std::string* error_message) const {
                         node.name
                 );
             }
-            if (has_node_policy(node.policy_flags, NodePolicyFlag::ReactToKnowledgeGraph)) {
+            if (has_node_policy(node.policy_flags, NodePolicyFlag::ReactToKnowledgeGraph) ||
+                has_node_policy(node.policy_flags, NodePolicyFlag::ReactToIntelligence)) {
                 return fail_validation(
                     error_message,
-                    "knowledge-reactive nodes cannot enable deterministic memoization yet: " + node.name
+                    "reactive nodes cannot enable deterministic memoization yet: " + node.name
                 );
             }
             std::unordered_set<StateKey> memoization_keys;
@@ -591,6 +649,79 @@ bool GraphDefinition::validate(std::string* error_message) const {
                         "triple knowledge subscription cannot declare entity label on node " + node.name
                     );
                 }
+            }
+        }
+        for (const IntelligenceSubscription& subscription : node.intelligence_subscriptions) {
+            const bool has_filter =
+                !subscription.key.empty() ||
+                !subscription.key_prefix.empty() ||
+                !subscription.task_key.empty() ||
+                !subscription.claim_key.empty() ||
+                !subscription.subject_label.empty() ||
+                !subscription.relation.empty() ||
+                !subscription.object_label.empty() ||
+                !subscription.owner.empty() ||
+                !subscription.source.empty() ||
+                !subscription.scope.empty() ||
+                subscription.min_confidence > 0.0F ||
+                subscription.min_importance > 0.0F ||
+                subscription.task_status.has_value() ||
+                subscription.claim_status.has_value() ||
+                subscription.decision_status.has_value() ||
+                subscription.memory_layer.has_value();
+            if (subscription.kind == IntelligenceSubscriptionKind::All && !has_filter) {
+                return fail_validation(
+                    error_message,
+                    "intelligence subscription must constrain kind or fields on node " + node.name
+                );
+            }
+            if ((subscription.task_status.has_value() ||
+                 !subscription.owner.empty()) &&
+                subscription.kind != IntelligenceSubscriptionKind::Tasks) {
+                return fail_validation(
+                    error_message,
+                    "task intelligence filters require kind=tasks on node " + node.name
+                );
+            }
+            if (subscription.claim_status.has_value() &&
+                subscription.kind != IntelligenceSubscriptionKind::Claims) {
+                return fail_validation(
+                    error_message,
+                    "claim intelligence filters require kind=claims on node " + node.name
+                );
+            }
+            if ((!subscription.subject_label.empty() ||
+                 !subscription.relation.empty() ||
+                 !subscription.object_label.empty()) &&
+                subscription.kind != IntelligenceSubscriptionKind::All &&
+                subscription.kind != IntelligenceSubscriptionKind::Claims) {
+                return fail_validation(
+                    error_message,
+                    "claim graph intelligence filters require kind=claims or kind=all on node " + node.name
+                );
+            }
+            if (!subscription.source.empty() &&
+                subscription.kind != IntelligenceSubscriptionKind::Evidence) {
+                return fail_validation(
+                    error_message,
+                    "evidence intelligence filters require kind=evidence on node " + node.name
+                );
+            }
+            if (subscription.decision_status.has_value() &&
+                subscription.kind != IntelligenceSubscriptionKind::Decisions) {
+                return fail_validation(
+                    error_message,
+                    "decision intelligence filters require kind=decisions on node " + node.name
+                );
+            }
+            if ((subscription.memory_layer.has_value() ||
+                 !subscription.scope.empty() ||
+                 subscription.min_importance > 0.0F) &&
+                subscription.kind != IntelligenceSubscriptionKind::Memories) {
+                return fail_validation(
+                    error_message,
+                    "memory intelligence filters require kind=memories on node " + node.name
+                );
             }
         }
         if (node.outgoing_range.offset + node.outgoing_range.count > edge_index_table.size()) {

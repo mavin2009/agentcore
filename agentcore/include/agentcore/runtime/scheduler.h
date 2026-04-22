@@ -80,24 +80,57 @@ private:
         ScheduledTask task;
     };
 
+    struct ReadyTaskBuffer {
+        std::vector<ScheduledTask> ordered_tasks;
+        std::size_t ordered_head{0};
+        std::vector<ScheduledTask> tail_tasks;
+        std::size_t tail_head{0};
+
+        [[nodiscard]] bool ordered_empty() const noexcept {
+            return ordered_head >= ordered_tasks.size();
+        }
+
+        [[nodiscard]] bool tail_empty() const noexcept {
+            return tail_head >= tail_tasks.size();
+        }
+
+        [[nodiscard]] bool empty() const noexcept {
+            return ordered_empty() && tail_empty();
+        }
+
+        [[nodiscard]] std::size_t size() const noexcept {
+            return (ordered_tasks.size() - ordered_head) + (tail_tasks.size() - tail_head);
+        }
+
+        [[nodiscard]] const ScheduledTask& front() const noexcept {
+            return ordered_empty() ? tail_tasks[tail_head] : ordered_tasks[ordered_head];
+        }
+    };
+
     struct ReadyRunFrontOrder {
         [[nodiscard]] bool operator()(const ReadyRunFront& left, const ReadyRunFront& right) const noexcept;
     };
 
     [[nodiscard]] static bool task_ready_before(const ScheduledTask& left, const ScheduledTask& right) noexcept;
     [[nodiscard]] static bool delayed_task_later(const ScheduledTask& left, const ScheduledTask& right) noexcept;
+    static void compact_ready_segment(std::vector<ScheduledTask>& tasks, std::size_t& head);
     void promote_ready_locked(uint64_t now_ns);
     void enqueue_ready_locked(const ScheduledTask& task);
+    void erase_ready_front_locked(RunId run_id);
+    void insert_ready_front_locked(RunId run_id);
+    void rebuild_ready_fronts_locked();
+    void rebuild_ready_tracking_locked();
     void refresh_ready_front_locked(RunId run_id);
     [[nodiscard]] std::optional<ScheduledTask> pop_ready_locked(RunId run_id);
     [[nodiscard]] std::optional<uint64_t> next_task_ready_time_for_run_locked(RunId run_id) const;
     void remove_run_locked(RunId run_id);
 
     mutable std::mutex mutex_;
-    std::unordered_map<RunId, std::deque<ScheduledTask>> ready_by_run_;
+    std::unordered_map<RunId, ReadyTaskBuffer> ready_by_run_;
     std::vector<ScheduledTask> delayed_heap_;
     std::set<ReadyRunFront, ReadyRunFrontOrder> ready_fronts_;
     std::unordered_map<RunId, std::set<ReadyRunFront, ReadyRunFrontOrder>::iterator> ready_front_index_;
+    RunId single_ready_run_id_{0};
     std::unordered_map<RunId, std::size_t> run_task_counts_;
     std::size_t total_task_count_{0};
     uint64_t last_observed_now_ns_{0};

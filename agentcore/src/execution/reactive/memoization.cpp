@@ -42,7 +42,8 @@ bool node_supports_deterministic_memoization(const NodeDefinition& node) noexcep
         case NodeKind::Compute:
         case NodeKind::Control:
         case NodeKind::Aggregate:
-            return !has_node_policy(node.policy_flags, NodePolicyFlag::ReactToKnowledgeGraph);
+            return !has_node_policy(node.policy_flags, NodePolicyFlag::ReactToKnowledgeGraph) &&
+                !has_node_policy(node.policy_flags, NodePolicyFlag::ReactToIntelligence);
         case NodeKind::Tool:
         case NodeKind::Model:
         case NodeKind::Human:

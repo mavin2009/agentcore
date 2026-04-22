@@ -2,7 +2,9 @@
 #define AGENTCORE_GRAPH_IR_H
 
 #include "agentcore/core/types.h"
+#include "agentcore/state/intelligence/model.h"
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -19,7 +21,8 @@ enum class NodePolicyFlag : uint32_t {
     StopAfterNode = 1U << 1,
     JoinIncomingBranches = 1U << 2,
     CreateJoinScope = 1U << 3,
-    ReactToKnowledgeGraph = 1U << 4
+    ReactToKnowledgeGraph = 1U << 4,
+    ReactToIntelligence = 1U << 5
 };
 
 constexpr uint32_t node_policy_mask(NodePolicyFlag flag) {
@@ -95,6 +98,35 @@ struct KnowledgeSubscription {
     std::string object_label;
 };
 
+enum class IntelligenceSubscriptionKind : uint8_t {
+    All = 0,
+    Tasks = 1,
+    Claims = 2,
+    Evidence = 3,
+    Decisions = 4,
+    Memories = 5
+};
+
+struct IntelligenceSubscription {
+    IntelligenceSubscriptionKind kind{IntelligenceSubscriptionKind::All};
+    std::string key;
+    std::string key_prefix;
+    std::string task_key;
+    std::string claim_key;
+    std::string subject_label;
+    std::string relation;
+    std::string object_label;
+    std::string owner;
+    std::string source;
+    std::string scope;
+    float min_confidence{0.0F};
+    float min_importance{0.0F};
+    std::optional<IntelligenceTaskStatus> task_status;
+    std::optional<IntelligenceClaimStatus> claim_status;
+    std::optional<IntelligenceDecisionStatus> decision_status;
+    std::optional<IntelligenceMemoryLayer> memory_layer;
+};
+
 struct SubgraphStateBinding {
     StateKey parent_key{0};
     StateKey child_key{0};
@@ -149,6 +181,7 @@ struct NodeDefinition {
     std::vector<KnowledgeSubscription> knowledge_subscriptions;
     std::optional<SubgraphBinding> subgraph;
     NodeMemoizationPolicy memoization{};
+    std::vector<IntelligenceSubscription> intelligence_subscriptions;
 };
 
 enum class EdgeKind : uint8_t {
@@ -190,6 +223,12 @@ struct CompiledKnowledgeSubscription {
     KnowledgeSubscriptionKind kind{KnowledgeSubscriptionKind::TriplePattern};
 };
 
+struct CompiledIntelligenceSubscription {
+    uint32_t node_index{0};
+    uint32_t subscription_index{0};
+    IntelligenceSubscriptionKind kind{IntelligenceSubscriptionKind::All};
+};
+
 struct GraphDefinition {
     GraphId id{0};
     std::string name;
@@ -204,10 +243,12 @@ struct GraphDefinition {
     std::vector<CompiledEdgeRoute> compiled_routes;
     std::vector<CompiledNodeRouting> compiled_node_routing;
     std::vector<CompiledKnowledgeSubscription> compiled_knowledge_subscriptions;
+    std::vector<CompiledIntelligenceSubscription> compiled_intelligence_subscriptions;
     std::unordered_map<std::string, std::vector<uint32_t>> compiled_entity_subscription_index;
     std::unordered_map<std::string, std::vector<uint32_t>> compiled_subject_subscription_index;
     std::unordered_map<std::string, std::vector<uint32_t>> compiled_relation_subscription_index;
     std::unordered_map<std::string, std::vector<uint32_t>> compiled_object_subscription_index;
+    std::array<std::vector<uint32_t>, 6U> compiled_intelligence_subscription_index{};
     bool runtime_compiled{false};
 
     void bind_outgoing_edges(NodeId node_id, const std::vector<EdgeId>& edge_ids);
@@ -222,11 +263,15 @@ struct GraphDefinition {
     [[nodiscard]] ArrayView<CompiledEdgeRoute> compiled_routes_view(const NodeDefinition& node) const;
     [[nodiscard]] const CompiledNodeRouting* routing(const NodeDefinition& node) const;
     [[nodiscard]] const CompiledKnowledgeSubscription* knowledge_subscription(uint32_t compiled_index) const;
+    [[nodiscard]] const CompiledIntelligenceSubscription* intelligence_subscription(uint32_t compiled_index) const;
     [[nodiscard]] ArrayView<uint32_t> candidate_entity_subscriptions(std::string_view entity_label) const;
     [[nodiscard]] ArrayView<uint32_t> candidate_triple_subscriptions(
         std::string_view subject_label,
         std::string_view relation,
         std::string_view object_label
+    ) const;
+    [[nodiscard]] ArrayView<uint32_t> candidate_intelligence_subscriptions(
+        IntelligenceSubscriptionKind kind
     ) const;
     [[nodiscard]] bool is_runtime_compiled() const noexcept;
     [[nodiscard]] bool validate(std::string* error_message = nullptr) const;

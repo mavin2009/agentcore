@@ -78,6 +78,37 @@ void hash_graph(Fnv1a64& hasher, const GraphDefinition& graph) {
             hasher.update_string(subscription.relation);
             hasher.update_string(subscription.object_label);
         }
+        const uint64_t intelligence_subscription_count =
+            static_cast<uint64_t>(node.intelligence_subscriptions.size());
+        hasher.update_pod(intelligence_subscription_count);
+        for (const IntelligenceSubscription& subscription : node.intelligence_subscriptions) {
+            hasher.update_pod(static_cast<uint8_t>(subscription.kind));
+            hasher.update_string(subscription.key);
+            hasher.update_string(subscription.key_prefix);
+            hasher.update_string(subscription.task_key);
+            hasher.update_string(subscription.claim_key);
+            hasher.update_string(subscription.owner);
+            hasher.update_string(subscription.source);
+            hasher.update_string(subscription.scope);
+            hasher.update_pod(subscription.min_confidence);
+            hasher.update_pod(subscription.min_importance);
+            hasher.update_pod(subscription.task_status.has_value());
+            if (subscription.task_status.has_value()) {
+                hasher.update_pod(static_cast<uint8_t>(*subscription.task_status));
+            }
+            hasher.update_pod(subscription.claim_status.has_value());
+            if (subscription.claim_status.has_value()) {
+                hasher.update_pod(static_cast<uint8_t>(*subscription.claim_status));
+            }
+            hasher.update_pod(subscription.decision_status.has_value());
+            if (subscription.decision_status.has_value()) {
+                hasher.update_pod(static_cast<uint8_t>(*subscription.decision_status));
+            }
+            hasher.update_pod(subscription.memory_layer.has_value());
+            if (subscription.memory_layer.has_value()) {
+                hasher.update_pod(static_cast<uint8_t>(*subscription.memory_layer));
+            }
+        }
         hasher.update_pod(node.memoization.deterministic);
         const uint64_t memoization_key_count = static_cast<uint64_t>(node.memoization.read_keys.size());
         hasher.update_pod(memoization_key_count);

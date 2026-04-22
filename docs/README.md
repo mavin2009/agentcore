@@ -4,9 +4,9 @@ AgentCore uses a small set of focused guides instead of one oversized manual.
 
 ## Start Here
 
-- [`./quickstarts/python.md`](./quickstarts/python.md): local build, first graph, metadata, streaming, recorded once-only work, persistent subgraph sessions, and pause/resume
+- [`./quickstarts/python.md`](./quickstarts/python.md): local build, first graph, metadata, streaming, recorded once-only work, intelligence state, persistent subgraph sessions, and pause/resume
 - [`./quickstarts/cpp.md`](./quickstarts/cpp.md): native build, `ExecutionEngine`, state patches, and example executables
-- [`./concepts/runtime-model.md`](./concepts/runtime-model.md): how runs, state, routing, concurrency, persistent subgraph sessions, and knowledge-graph state fit together
+- [`./concepts/runtime-model.md`](./concepts/runtime-model.md): how runs, state, routing, concurrency, persistent subgraph sessions, intelligence state, and knowledge-graph state fit together
 - [`./reference/api.md`](./reference/api.md): Python API summary and the key C++ entry points
 - [`./comparisons/langgraph-head-to-head.md`](./comparisons/langgraph-head-to-head.md): measured comparison against upstream LangGraph with reproduction commands
 - [`./migration/langgraph-to-agentcore.md`](./migration/langgraph-to-agentcore.md): shortest-path guide for moving a LangGraph-style `StateGraph` to AgentCore

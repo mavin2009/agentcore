@@ -178,6 +178,7 @@ For native numbers, do not compare unspecified build types against `Release`. Th
 The current benchmark surfaces include:
 
 - native scheduler, routing, checkpoint, subgraph, and knowledge-frontier benchmarks
+- native intelligence-query/index regression counters for task lookup, claim-semantic lookup, ranked supporting-claims retrieval, ranked action-candidate retrieval, ranked task agenda, ranked memory recall, bounded focus-set retrieval, first-hop and multi-hop related-record expansion, route selection, and top-match invariants for focused task/claim/memory ranking
 - native persistent-session fan-out and resume determinism benchmarks
 - native deterministic-node memoization hit/invalidation benchmark with executor-invocation counters
 - native recorded-effect hit/miss cost for the task-journal seam

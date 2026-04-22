@@ -155,7 +155,8 @@ bool node_inline_single_branch_eligible(
     if (has_node_policy(node.policy_flags, NodePolicyFlag::AllowFanOut) ||
         has_node_policy(node.policy_flags, NodePolicyFlag::JoinIncomingBranches) ||
         has_node_policy(node.policy_flags, NodePolicyFlag::CreateJoinScope) ||
-        has_node_policy(node.policy_flags, NodePolicyFlag::ReactToKnowledgeGraph)) {
+        has_node_policy(node.policy_flags, NodePolicyFlag::ReactToKnowledgeGraph) ||
+        has_node_policy(node.policy_flags, NodePolicyFlag::ReactToIntelligence)) {
         return false;
     }
     if (node.memoization.enabled()) {
@@ -203,7 +204,8 @@ InlineSingleBranchSubgraphResult run_inline_single_branch_subgraph(
     StateStore initial_state,
     const std::vector<std::byte>& runtime_config_payload,
     ToolRegistry& tools,
-    ModelRegistry& models
+    ModelRegistry& models,
+    bool capture_trace
 ) {
     TraceSink trace_sink;
     ScratchArena scratch;
@@ -252,6 +254,7 @@ InlineSingleBranchSubgraphResult run_inline_single_branch_subgraph(
                 state_store.blobs(),
                 state_store.strings(),
                 state_store.knowledge_graph(),
+                state_store.intelligence(),
                 state_store.task_journal(),
                 tools,
                 models,
@@ -295,23 +298,25 @@ InlineSingleBranchSubgraphResult run_inline_single_branch_subgraph(
         frame.checkpoint_id = static_cast<CheckpointId>(frame.checkpoint_id + 1U);
         confidence = node_result.confidence;
 
-        trace_sink.emit(TraceEvent{
-            0U,
-            started_at_ns,
-            ended_at_ns,
-            kInlineSubgraphRunId,
-            graph.id,
-            node->id,
-            0U,
-            frame.checkpoint_id,
-            node_result.status,
-            confidence,
-            static_cast<uint32_t>(node_result.patch.updates.size()),
-            node_result.flags,
-            {},
-            0U,
-            {}
-        });
+        if (capture_trace) {
+            trace_sink.emit(TraceEvent{
+                0U,
+                started_at_ns,
+                ended_at_ns,
+                kInlineSubgraphRunId,
+                graph.id,
+                node->id,
+                0U,
+                frame.checkpoint_id,
+                node_result.status,
+                confidence,
+                static_cast<uint32_t>(node_result.patch.updates.size()),
+                node_result.flags,
+                {},
+                0U,
+                {}
+            });
+        }
 
         if (node_result.status == NodeResult::Waiting) {
             frame.status = ExecutionStatus::Paused;

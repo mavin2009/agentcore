@@ -2,6 +2,7 @@
 #define AGENTCORE_STATE_STORE_H
 
 #include "agentcore/core/types.h"
+#include "agentcore/state/intelligence/model.h"
 #include "agentcore/state/journal/task_journal.h"
 #include "agentcore/state/knowledge_graph.h"
 #include <atomic>
@@ -65,10 +66,15 @@ struct StatePatch {
     std::vector<BlobRef> new_blobs;
     std::vector<TaskRecord> task_records;
     KnowledgeGraphPatch knowledge_graph;
+    IntelligencePatch intelligence;
     uint32_t flags{0};
 
     [[nodiscard]] bool empty() const {
-        return updates.empty() && new_blobs.empty() && task_records.empty() && knowledge_graph.empty();
+        return updates.empty() &&
+            new_blobs.empty() &&
+            task_records.empty() &&
+            knowledge_graph.empty() &&
+            intelligence.empty();
     }
 };
 
@@ -77,6 +83,7 @@ struct StateApplyResult {
     bool state_changed{false};
     std::vector<StateKey> changed_keys;
     KnowledgeGraphDeltaSummary knowledge_graph_delta;
+    IntelligenceDeltaSummary intelligence_delta;
 };
 
 class StringInterner {
@@ -170,12 +177,15 @@ public:
     [[nodiscard]] const StringInterner& strings() const noexcept;
     [[nodiscard]] KnowledgeGraphStore& knowledge_graph() noexcept;
     [[nodiscard]] const KnowledgeGraphStore& knowledge_graph() const noexcept;
+    [[nodiscard]] IntelligenceStore& intelligence() noexcept;
+    [[nodiscard]] const IntelligenceStore& intelligence() const noexcept;
     [[nodiscard]] TaskJournal& task_journal() noexcept;
     [[nodiscard]] const TaskJournal& task_journal() const noexcept;
     struct SharedBacking {
         bool blobs{false};
         bool strings{false};
         bool knowledge_graph{false};
+        bool intelligence{false};
     };
     [[nodiscard]] SharedBacking shared_backing_with(const StateStore& other) const noexcept;
     void serialize(std::ostream& output) const;
@@ -192,6 +202,7 @@ private:
     PatchLog patch_log_;
     StringInterner string_interner_;
     KnowledgeGraphStore knowledge_graph_;
+    IntelligenceStore intelligence_;
     TaskJournal task_journal_;
 };
 

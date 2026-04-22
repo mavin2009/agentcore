@@ -78,6 +78,41 @@ GraphDefinition make_valid_graph() {
                     "artifact"
                 }
             }
+        },
+        NodeDefinition{
+            7,
+            NodeKind::Aggregate,
+            "intelligence_reactive",
+            node_policy_mask(NodePolicyFlag::ReactToIntelligence),
+            0U,
+            0U,
+            success_node,
+            {},
+            {},
+            {},
+            std::nullopt,
+            {},
+            std::vector<IntelligenceSubscription>{
+                IntelligenceSubscription{
+                    IntelligenceSubscriptionKind::Claims,
+                    {},
+                    {},
+                    {},
+                    "claim:important",
+                    {},
+                    {},
+                    {},
+                    {},
+                    {},
+                    {},
+                    0.0F,
+                    0.0F,
+                    std::nullopt,
+                    IntelligenceClaimStatus::Supported,
+                    std::nullopt,
+                    std::nullopt
+                }
+            }
         }
     };
     graph.edges = {
@@ -86,13 +121,15 @@ GraphDefinition make_valid_graph() {
         EdgeDefinition{3, 2, 4, EdgeKind::OnSuccess, nullptr, 100U},
         EdgeDefinition{4, 3, 4, EdgeKind::OnSuccess, nullptr, 100U},
         EdgeDefinition{5, 4, 5, EdgeKind::OnSuccess, nullptr, 100U},
-        EdgeDefinition{6, 6, 5, EdgeKind::OnSuccess, nullptr, 100U}
+        EdgeDefinition{6, 6, 5, EdgeKind::OnSuccess, nullptr, 100U},
+        EdgeDefinition{7, 7, 5, EdgeKind::OnSuccess, nullptr, 100U}
     };
     graph.bind_outgoing_edges(1, std::vector<EdgeId>{1, 2});
     graph.bind_outgoing_edges(2, std::vector<EdgeId>{3});
     graph.bind_outgoing_edges(3, std::vector<EdgeId>{4});
     graph.bind_outgoing_edges(4, std::vector<EdgeId>{5});
     graph.bind_outgoing_edges(6, std::vector<EdgeId>{6});
+    graph.bind_outgoing_edges(7, std::vector<EdgeId>{7});
     graph.sort_edges_by_priority();
     return graph;
 }
@@ -120,6 +157,13 @@ int main() {
     const CompiledKnowledgeSubscription* kg_subscription = graph.knowledge_subscription(kg_candidates[0]);
     assert(kg_subscription != nullptr);
     assert(graph.nodes[kg_subscription->node_index].id == 6U);
+    const auto intelligence_candidates =
+        graph.candidate_intelligence_subscriptions(IntelligenceSubscriptionKind::Claims);
+    assert(intelligence_candidates.size() == 1U);
+    const CompiledIntelligenceSubscription* intelligence_subscription =
+        graph.intelligence_subscription(intelligence_candidates[0]);
+    assert(intelligence_subscription != nullptr);
+    assert(graph.nodes[intelligence_subscription->node_index].id == 7U);
 
     GraphDefinition duplicate_rule_graph = graph;
     duplicate_rule_graph.nodes[3].field_merge_rules.push_back(
@@ -143,6 +187,12 @@ int main() {
     assert(!missing_kg_policy_graph.validate(&error_message));
     assert(contains(error_message, "ReactToKnowledgeGraph"));
 
+    GraphDefinition missing_intelligence_policy_graph = graph;
+    missing_intelligence_policy_graph.nodes[6].policy_flags = 0U;
+    error_message.clear();
+    assert(!missing_intelligence_policy_graph.validate(&error_message));
+    assert(contains(error_message, "ReactToIntelligence"));
+
     GraphDefinition wildcard_kg_graph = graph;
     wildcard_kg_graph.nodes[5].knowledge_subscriptions = std::vector<KnowledgeSubscription>{
         KnowledgeSubscription{KnowledgeSubscriptionKind::TriplePattern, {}, {}, {}, {}}
@@ -150,6 +200,40 @@ int main() {
     error_message.clear();
     assert(!wildcard_kg_graph.validate(&error_message));
     assert(contains(error_message, "must constrain"));
+
+    GraphDefinition invalid_intelligence_graph = graph;
+    invalid_intelligence_graph.nodes[6].intelligence_subscriptions = std::vector<IntelligenceSubscription>{
+        IntelligenceSubscription{}
+    };
+    error_message.clear();
+    assert(!invalid_intelligence_graph.validate(&error_message));
+    assert(contains(error_message, "must constrain"));
+
+    GraphDefinition claim_graph_intelligence_graph = graph;
+    claim_graph_intelligence_graph.nodes[6].intelligence_subscriptions =
+        std::vector<IntelligenceSubscription>{
+            IntelligenceSubscription{
+                IntelligenceSubscriptionKind::All,
+                {},
+                {},
+                {},
+                {},
+                "agentcore",
+                "supports",
+                "reactive_intelligence",
+                {},
+                {},
+                {},
+                0.0F,
+                0.0F,
+                std::nullopt,
+                std::nullopt,
+                std::nullopt,
+                std::nullopt
+            }
+        };
+    error_message.clear();
+    assert(claim_graph_intelligence_graph.validate(&error_message));
 
     GraphDefinition invalid_subgraph_graph = graph;
     invalid_subgraph_graph.nodes[1].kind = NodeKind::Subgraph;

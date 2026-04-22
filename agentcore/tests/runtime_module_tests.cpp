@@ -96,6 +96,26 @@ int main() {
     assert(delayed_ready->node_id == 32U);
     scheduler.remove_run(11U);
 
+    scheduler.enqueue_task(ScheduledTask{13U, 41U, 5U, 0U});
+    scheduler.enqueue_task(ScheduledTask{13U, 42U, 1U, 0U});
+    const auto immediate_first = scheduler.dequeue_ready_for_run(13U, 0U);
+    assert(immediate_first.has_value());
+    assert(immediate_first->node_id == 41U);
+    const auto immediate_second = scheduler.dequeue_ready_for_run(13U, 0U);
+    assert(immediate_second.has_value());
+    assert(immediate_second->node_id == 42U);
+
+    scheduler.enqueue_task(ScheduledTask{14U, 51U, 1U, 0U});
+    scheduler.enqueue_task(ScheduledTask{15U, 61U, 1U, 0U});
+    const auto cross_run_first = scheduler.dequeue_ready(0U);
+    assert(cross_run_first.has_value());
+    assert(cross_run_first->run_id == 14U);
+    assert(cross_run_first->node_id == 51U);
+    const auto cross_run_second = scheduler.dequeue_ready(0U);
+    assert(cross_run_second.has_value());
+    assert(cross_run_second->run_id == 15U);
+    assert(cross_run_second->node_id == 61U);
+
     const AsyncWaitKey tool_wait_key{AsyncWaitKind::Tool, 41U};
     scheduler.register_async_waiter(tool_wait_key, ScheduledTask{7, 11, 2, 0U});
     assert(scheduler.has_async_waiters());

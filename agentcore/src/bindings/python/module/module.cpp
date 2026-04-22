@@ -98,6 +98,244 @@ bool parse_node_kind(PyObject* object, NodeKind* kind, std::string* error_messag
     return false;
 }
 
+bool get_mapping_item(
+    PyObject* mapping,
+    const char* key,
+    PyObject** value,
+    std::string* error_message
+);
+
+bool parse_string_from_mapping(
+    PyObject* mapping,
+    const char* key,
+    std::string* value,
+    std::string* error_message
+);
+
+bool parse_float_from_mapping(
+    PyObject* mapping,
+    const char* key,
+    float default_value,
+    float* value,
+    std::string* error_message
+) {
+    *value = default_value;
+    PyObject* item = nullptr;
+    if (!get_mapping_item(mapping, key, &item, error_message)) {
+        return false;
+    }
+    if (item == nullptr || item == Py_None) {
+        Py_XDECREF(item);
+        return true;
+    }
+    const double parsed = PyFloat_AsDouble(item);
+    Py_DECREF(item);
+    if (PyErr_Occurred() != nullptr) {
+        *error_message = GraphHandle::fetch_python_error();
+        PyErr_Clear();
+        return false;
+    }
+    *value = static_cast<float>(parsed);
+    return true;
+}
+
+bool parse_intelligence_subscription_kind(
+    PyObject* object,
+    IntelligenceSubscriptionKind* kind,
+    std::string* error_message
+) {
+    if (object == nullptr || object == Py_None) {
+        *kind = IntelligenceSubscriptionKind::All;
+        return true;
+    }
+
+    std::string text;
+    if (!parse_python_string(object, &text, error_message)) {
+        *error_message = "intelligence subscription kind must be a string";
+        return false;
+    }
+
+    if (text == "all") {
+        *kind = IntelligenceSubscriptionKind::All;
+        return true;
+    }
+    if (text == "task" || text == "tasks") {
+        *kind = IntelligenceSubscriptionKind::Tasks;
+        return true;
+    }
+    if (text == "claim" || text == "claims") {
+        *kind = IntelligenceSubscriptionKind::Claims;
+        return true;
+    }
+    if (text == "evidence") {
+        *kind = IntelligenceSubscriptionKind::Evidence;
+        return true;
+    }
+    if (text == "decision" || text == "decisions") {
+        *kind = IntelligenceSubscriptionKind::Decisions;
+        return true;
+    }
+    if (text == "memory" || text == "memories") {
+        *kind = IntelligenceSubscriptionKind::Memories;
+        return true;
+    }
+
+    *error_message = "unsupported intelligence subscription kind: " + text;
+    return false;
+}
+
+bool parse_intelligence_subscription(
+    PyObject* object,
+    IntelligenceSubscription* subscription,
+    std::string* error_message
+) {
+    if (object == nullptr || object == Py_None || !PyMapping_Check(object)) {
+        *error_message = "intelligence subscriptions must be mappings";
+        return false;
+    }
+
+    PyObject* kind_object = nullptr;
+    if (!get_mapping_item(object, "kind", &kind_object, error_message)) {
+        return false;
+    }
+    const bool kind_ok =
+        parse_intelligence_subscription_kind(kind_object, &subscription->kind, error_message);
+    Py_XDECREF(kind_object);
+    if (!kind_ok) {
+        return false;
+    }
+
+    if (!parse_string_from_mapping(object, "key", &subscription->key, error_message) ||
+        !parse_string_from_mapping(object, "key_prefix", &subscription->key_prefix, error_message) ||
+        !parse_string_from_mapping(object, "task_key", &subscription->task_key, error_message) ||
+        !parse_string_from_mapping(object, "claim_key", &subscription->claim_key, error_message) ||
+        !parse_string_from_mapping(object, "subject", &subscription->subject_label, error_message) ||
+        !parse_string_from_mapping(object, "relation", &subscription->relation, error_message) ||
+        !parse_string_from_mapping(object, "object", &subscription->object_label, error_message) ||
+        !parse_string_from_mapping(object, "owner", &subscription->owner, error_message) ||
+        !parse_string_from_mapping(object, "source", &subscription->source, error_message) ||
+        !parse_string_from_mapping(object, "scope", &subscription->scope, error_message) ||
+        !parse_float_from_mapping(
+            object,
+            "min_confidence",
+            subscription->min_confidence,
+            &subscription->min_confidence,
+            error_message
+        ) ||
+        !parse_float_from_mapping(
+            object,
+            "min_importance",
+            subscription->min_importance,
+            &subscription->min_importance,
+            error_message
+        )) {
+        return false;
+    }
+
+    PyObject* status_object = nullptr;
+    if (!get_mapping_item(object, "status", &status_object, error_message)) {
+        return false;
+    }
+    if (status_object != nullptr && status_object != Py_None) {
+        std::string status_name;
+        if (!parse_python_string(status_object, &status_name, error_message)) {
+            Py_DECREF(status_object);
+            return false;
+        }
+        Py_DECREF(status_object);
+        switch (subscription->kind) {
+            case IntelligenceSubscriptionKind::Tasks:
+                subscription->task_status = parse_intelligence_task_status(status_name);
+                if (!subscription->task_status.has_value()) {
+                    *error_message = "unsupported task status: " + status_name;
+                    return false;
+                }
+                break;
+            case IntelligenceSubscriptionKind::Claims:
+                subscription->claim_status = parse_intelligence_claim_status(status_name);
+                if (!subscription->claim_status.has_value()) {
+                    *error_message = "unsupported claim status: " + status_name;
+                    return false;
+                }
+                break;
+            case IntelligenceSubscriptionKind::Decisions:
+                subscription->decision_status = parse_intelligence_decision_status(status_name);
+                if (!subscription->decision_status.has_value()) {
+                    *error_message = "unsupported decision status: " + status_name;
+                    return false;
+                }
+                break;
+            case IntelligenceSubscriptionKind::All:
+            case IntelligenceSubscriptionKind::Evidence:
+            case IntelligenceSubscriptionKind::Memories:
+                *error_message =
+                    "status intelligence filters require kind='tasks', 'claims', or 'decisions'";
+                return false;
+        }
+    } else {
+        Py_XDECREF(status_object);
+    }
+
+    PyObject* layer_object = nullptr;
+    if (!get_mapping_item(object, "layer", &layer_object, error_message)) {
+        return false;
+    }
+    if (layer_object != nullptr && layer_object != Py_None) {
+        if (subscription->kind != IntelligenceSubscriptionKind::Memories) {
+            Py_DECREF(layer_object);
+            *error_message = "layer intelligence filters require kind='memories'";
+            return false;
+        }
+        std::string layer_name;
+        if (!parse_python_string(layer_object, &layer_name, error_message)) {
+            Py_DECREF(layer_object);
+            return false;
+        }
+        Py_DECREF(layer_object);
+        subscription->memory_layer = parse_intelligence_memory_layer(layer_name);
+        if (!subscription->memory_layer.has_value()) {
+            *error_message = "unsupported memory layer: " + layer_name;
+            return false;
+        }
+    } else {
+        Py_XDECREF(layer_object);
+    }
+
+    return true;
+}
+
+bool parse_intelligence_subscriptions(
+    PyObject* object,
+    std::vector<IntelligenceSubscription>* subscriptions,
+    std::string* error_message
+) {
+    subscriptions->clear();
+    if (object == nullptr || object == Py_None) {
+        return true;
+    }
+
+    PyObject* sequence = PySequence_Fast(object, "intelligence subscriptions must be a sequence");
+    if (sequence == nullptr) {
+        *error_message = GraphHandle::fetch_python_error();
+        return false;
+    }
+
+    const Py_ssize_t item_count = PySequence_Fast_GET_SIZE(sequence);
+    PyObject** item_values = PySequence_Fast_ITEMS(sequence);
+    subscriptions->reserve(static_cast<std::size_t>(item_count));
+    for (Py_ssize_t index = 0; index < item_count; ++index) {
+        IntelligenceSubscription subscription;
+        if (!parse_intelligence_subscription(item_values[index], &subscription, error_message)) {
+            Py_DECREF(sequence);
+            return false;
+        }
+        subscriptions->push_back(std::move(subscription));
+    }
+
+    Py_DECREF(sequence);
+    return true;
+}
+
 bool parse_join_merge_strategy(
     const std::string& text,
     JoinMergeStrategy* strategy,
@@ -772,6 +1010,7 @@ PyObject* py_add_node(PyObject*, PyObject* args, PyObject* kwargs) {
     int deterministic = 0;
     PyObject* read_keys_object = Py_None;
     unsigned int cache_size = 16U;
+    PyObject* intelligence_subscriptions_object = Py_None;
     static const char* keywords[] = {
         "graph",
         "name",
@@ -785,12 +1024,13 @@ PyObject* py_add_node(PyObject*, PyObject* args, PyObject* kwargs) {
         "deterministic",
         "read_keys",
         "cache_size",
+        "intelligence_subscriptions",
         nullptr
     };
     if (!PyArg_ParseTupleAndKeywords(
             args,
             kwargs,
-            "OsO|OppppOpOI",
+            "OsO|OppppOpOIO",
             const_cast<char**>(keywords),
             &capsule,
             &name,
@@ -803,7 +1043,8 @@ PyObject* py_add_node(PyObject*, PyObject* args, PyObject* kwargs) {
             &merge_rules_object,
             &deterministic,
             &read_keys_object,
-            &cache_size
+            &cache_size,
+            &intelligence_subscriptions_object
         )) {
         return nullptr;
     }
@@ -828,6 +1069,14 @@ PyObject* py_add_node(PyObject*, PyObject* args, PyObject* kwargs) {
 
     std::vector<std::string> read_keys;
     if (!parse_string_sequence(read_keys_object, &read_keys, &error_message)) {
+        PyErr_SetString(PyExc_ValueError, error_message.c_str());
+        return nullptr;
+    }
+    std::vector<IntelligenceSubscription> intelligence_subscriptions;
+    if (!parse_intelligence_subscriptions(
+            intelligence_subscriptions_object,
+            &intelligence_subscriptions,
+            &error_message)) {
         PyErr_SetString(PyExc_ValueError, error_message.c_str());
         return nullptr;
     }
@@ -861,6 +1110,9 @@ PyObject* py_add_node(PyObject*, PyObject* args, PyObject* kwargs) {
     if (join_incoming_branches != 0) {
         policy_flags |= node_policy_mask(NodePolicyFlag::JoinIncomingBranches);
     }
+    if (!intelligence_subscriptions.empty()) {
+        policy_flags |= node_policy_mask(NodePolicyFlag::ReactToIntelligence);
+    }
 
 
     if (!handle->add_node(
@@ -869,6 +1121,7 @@ PyObject* py_add_node(PyObject*, PyObject* args, PyObject* kwargs) {
             kind,
             policy_flags,
             memoization,
+            intelligence_subscriptions,
             merge_rules,
             &error_message
         )) {
@@ -1235,7 +1488,14 @@ PyObject* py_stream(PyObject*, PyObject* args, PyObject* kwargs) {
 
     PyObject* output_events = nullptr;
     std::string error_message;
-    if (!handle->stream(input_state, config, include_subgraphs != 0, &output_events, &error_message)) {
+    if (!handle->stream(
+            input_state,
+            config,
+            include_subgraphs != 0,
+            capsule,
+            &output_events,
+            &error_message
+        )) {
         PyErr_SetString(PyExc_RuntimeError, error_message.c_str());
         return nullptr;
     }
@@ -1267,6 +1527,381 @@ PyObject* py_runtime_record_once(PyObject*, PyObject* args, PyObject* kwargs) {
         if (PyErr_Occurred() == nullptr) {
             PyErr_SetString(PyExc_RuntimeError, error_message.c_str());
         }
+        return nullptr;
+    }
+    return result;
+}
+
+PyObject* py_runtime_upsert_task(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* runtime = nullptr;
+    PyObject* spec = Py_None;
+    static const char* keywords[] = {"runtime", "spec", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "OO",
+            const_cast<char**>(keywords),
+            &runtime,
+            &spec
+        )) {
+        return nullptr;
+    }
+
+    std::string error_message;
+    if (!runtime_stage_task_write(runtime, spec, &error_message)) {
+        PyErr_SetString(PyExc_ValueError, error_message.c_str());
+        return nullptr;
+    }
+    Py_RETURN_NONE;
+}
+
+PyObject* py_runtime_upsert_claim(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* runtime = nullptr;
+    PyObject* spec = Py_None;
+    static const char* keywords[] = {"runtime", "spec", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "OO",
+            const_cast<char**>(keywords),
+            &runtime,
+            &spec
+        )) {
+        return nullptr;
+    }
+
+    std::string error_message;
+    if (!runtime_stage_claim_write(runtime, spec, &error_message)) {
+        PyErr_SetString(PyExc_ValueError, error_message.c_str());
+        return nullptr;
+    }
+    Py_RETURN_NONE;
+}
+
+PyObject* py_runtime_add_evidence(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* runtime = nullptr;
+    PyObject* spec = Py_None;
+    static const char* keywords[] = {"runtime", "spec", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "OO",
+            const_cast<char**>(keywords),
+            &runtime,
+            &spec
+        )) {
+        return nullptr;
+    }
+
+    std::string error_message;
+    if (!runtime_stage_evidence_write(runtime, spec, &error_message)) {
+        PyErr_SetString(PyExc_ValueError, error_message.c_str());
+        return nullptr;
+    }
+    Py_RETURN_NONE;
+}
+
+PyObject* py_runtime_record_decision(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* runtime = nullptr;
+    PyObject* spec = Py_None;
+    static const char* keywords[] = {"runtime", "spec", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "OO",
+            const_cast<char**>(keywords),
+            &runtime,
+            &spec
+        )) {
+        return nullptr;
+    }
+
+    std::string error_message;
+    if (!runtime_stage_decision_write(runtime, spec, &error_message)) {
+        PyErr_SetString(PyExc_ValueError, error_message.c_str());
+        return nullptr;
+    }
+    Py_RETURN_NONE;
+}
+
+PyObject* py_runtime_remember(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* runtime = nullptr;
+    PyObject* spec = Py_None;
+    static const char* keywords[] = {"runtime", "spec", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "OO",
+            const_cast<char**>(keywords),
+            &runtime,
+            &spec
+        )) {
+        return nullptr;
+    }
+
+    std::string error_message;
+    if (!runtime_stage_memory_write(runtime, spec, &error_message)) {
+        PyErr_SetString(PyExc_ValueError, error_message.c_str());
+        return nullptr;
+    }
+    Py_RETURN_NONE;
+}
+
+PyObject* py_runtime_snapshot_intelligence(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* runtime = nullptr;
+    static const char* keywords[] = {"runtime", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "O",
+            const_cast<char**>(keywords),
+            &runtime
+        )) {
+        return nullptr;
+    }
+
+    std::string error_message;
+    PyObject* result = runtime_snapshot_intelligence(runtime, &error_message);
+    if (result == nullptr) {
+        PyErr_SetString(PyExc_RuntimeError, error_message.c_str());
+        return nullptr;
+    }
+    return result;
+}
+
+PyObject* py_runtime_query_intelligence(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* runtime = nullptr;
+    PyObject* spec = Py_None;
+    static const char* keywords[] = {"runtime", "spec", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "OO",
+            const_cast<char**>(keywords),
+            &runtime,
+            &spec
+        )) {
+        return nullptr;
+    }
+
+    std::string error_message;
+    PyObject* result = runtime_query_intelligence(runtime, spec, &error_message);
+    if (result == nullptr) {
+        PyErr_SetString(PyExc_ValueError, error_message.c_str());
+        return nullptr;
+    }
+    return result;
+}
+
+PyObject* py_runtime_related_intelligence(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* runtime = nullptr;
+    PyObject* spec = Py_None;
+    static const char* keywords[] = {"runtime", "spec", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "OO",
+            const_cast<char**>(keywords),
+            &runtime,
+            &spec
+        )) {
+        return nullptr;
+    }
+
+    std::string error_message;
+    PyObject* result = runtime_related_intelligence(runtime, spec, &error_message);
+    if (result == nullptr) {
+        PyErr_SetString(PyExc_ValueError, error_message.c_str());
+        return nullptr;
+    }
+    return result;
+}
+
+PyObject* py_runtime_agenda_intelligence(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* runtime = nullptr;
+    PyObject* spec = Py_None;
+    static const char* keywords[] = {"runtime", "spec", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "OO",
+            const_cast<char**>(keywords),
+            &runtime,
+            &spec
+        )) {
+        return nullptr;
+    }
+
+    std::string error_message;
+    PyObject* result = runtime_agenda_intelligence(runtime, spec, &error_message);
+    if (result == nullptr) {
+        PyErr_SetString(PyExc_ValueError, error_message.c_str());
+        return nullptr;
+    }
+    return result;
+}
+
+PyObject* py_runtime_supporting_claims_intelligence(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* runtime = nullptr;
+    PyObject* spec = Py_None;
+    static const char* keywords[] = {"runtime", "spec", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "OO",
+            const_cast<char**>(keywords),
+            &runtime,
+            &spec
+        )) {
+        return nullptr;
+    }
+
+    std::string error_message;
+    PyObject* result = runtime_supporting_claims_intelligence(runtime, spec, &error_message);
+    if (result == nullptr) {
+        PyErr_SetString(PyExc_ValueError, error_message.c_str());
+        return nullptr;
+    }
+    return result;
+}
+
+PyObject* py_runtime_action_candidates_intelligence(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* runtime = nullptr;
+    PyObject* spec = Py_None;
+    static const char* keywords[] = {"runtime", "spec", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "OO",
+            const_cast<char**>(keywords),
+            &runtime,
+            &spec
+        )) {
+        return nullptr;
+    }
+
+    std::string error_message;
+    PyObject* result = runtime_action_candidates_intelligence(runtime, spec, &error_message);
+    if (result == nullptr) {
+        PyErr_SetString(PyExc_ValueError, error_message.c_str());
+        return nullptr;
+    }
+    return result;
+}
+
+PyObject* py_runtime_recall_intelligence(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* runtime = nullptr;
+    PyObject* spec = Py_None;
+    static const char* keywords[] = {"runtime", "spec", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "OO",
+            const_cast<char**>(keywords),
+            &runtime,
+            &spec
+        )) {
+        return nullptr;
+    }
+
+    std::string error_message;
+    PyObject* result = runtime_recall_intelligence(runtime, spec, &error_message);
+    if (result == nullptr) {
+        PyErr_SetString(PyExc_ValueError, error_message.c_str());
+        return nullptr;
+    }
+    return result;
+}
+
+PyObject* py_runtime_focus_intelligence(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* runtime = nullptr;
+    PyObject* spec = Py_None;
+    static const char* keywords[] = {"runtime", "spec", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "OO",
+            const_cast<char**>(keywords),
+            &runtime,
+            &spec
+        )) {
+        return nullptr;
+    }
+
+    std::string error_message;
+    PyObject* result = runtime_focus_intelligence(runtime, spec, &error_message);
+    if (result == nullptr) {
+        PyErr_SetString(PyExc_ValueError, error_message.c_str());
+        return nullptr;
+    }
+    return result;
+}
+
+PyObject* py_runtime_intelligence_summary(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* runtime = nullptr;
+    static const char* keywords[] = {"runtime", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "O",
+            const_cast<char**>(keywords),
+            &runtime
+        )) {
+        return nullptr;
+    }
+
+    std::string error_message;
+    PyObject* result = runtime_intelligence_summary(runtime, &error_message);
+    if (result == nullptr) {
+        PyErr_SetString(PyExc_RuntimeError, error_message.c_str());
+        return nullptr;
+    }
+    return result;
+}
+
+PyObject* py_runtime_count_intelligence(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* runtime = nullptr;
+    PyObject* spec = Py_None;
+    static const char* keywords[] = {"runtime", "spec", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "OO",
+            const_cast<char**>(keywords),
+            &runtime,
+            &spec
+        )) {
+        return nullptr;
+    }
+
+    std::string error_message;
+    PyObject* result = runtime_count_intelligence(runtime, spec, &error_message);
+    if (result == nullptr) {
+        PyErr_SetString(PyExc_ValueError, error_message.c_str());
+        return nullptr;
+    }
+    return result;
+}
+
+PyObject* py_runtime_route_intelligence(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* runtime = nullptr;
+    PyObject* spec = Py_None;
+    static const char* keywords[] = {"runtime", "spec", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "OO",
+            const_cast<char**>(keywords),
+            &runtime,
+            &spec
+        )) {
+        return nullptr;
+    }
+
+    std::string error_message;
+    PyObject* result = runtime_route_intelligence(runtime, spec, &error_message);
+    if (result == nullptr) {
+        PyErr_SetString(PyExc_ValueError, error_message.c_str());
         return nullptr;
     }
     return result;
@@ -2060,6 +2695,102 @@ PyMethodDef kModuleMethods[] = {
         reinterpret_cast<PyCFunction>(py_runtime_record_once),
         METH_VARARGS | METH_KEYWORDS,
         "Record a once-only synchronous effect for the active Python node callback."
+    },
+    {
+        "_runtime_upsert_task",
+        reinterpret_cast<PyCFunction>(py_runtime_upsert_task),
+        METH_VARARGS | METH_KEYWORDS,
+        "Stage an intelligence task write for the active Python node callback."
+    },
+    {
+        "_runtime_upsert_claim",
+        reinterpret_cast<PyCFunction>(py_runtime_upsert_claim),
+        METH_VARARGS | METH_KEYWORDS,
+        "Stage an intelligence claim write for the active Python node callback."
+    },
+    {
+        "_runtime_add_evidence",
+        reinterpret_cast<PyCFunction>(py_runtime_add_evidence),
+        METH_VARARGS | METH_KEYWORDS,
+        "Stage an intelligence evidence write for the active Python node callback."
+    },
+    {
+        "_runtime_record_decision",
+        reinterpret_cast<PyCFunction>(py_runtime_record_decision),
+        METH_VARARGS | METH_KEYWORDS,
+        "Stage an intelligence decision write for the active Python node callback."
+    },
+    {
+        "_runtime_remember",
+        reinterpret_cast<PyCFunction>(py_runtime_remember),
+        METH_VARARGS | METH_KEYWORDS,
+        "Stage an intelligence memory write for the active Python node callback."
+    },
+    {
+        "_runtime_snapshot_intelligence",
+        reinterpret_cast<PyCFunction>(py_runtime_snapshot_intelligence),
+        METH_VARARGS | METH_KEYWORDS,
+        "Return the current intelligence snapshot for the active Python node callback."
+    },
+    {
+        "_runtime_query_intelligence",
+        reinterpret_cast<PyCFunction>(py_runtime_query_intelligence),
+        METH_VARARGS | METH_KEYWORDS,
+        "Query the current intelligence snapshot for the active Python node callback."
+    },
+    {
+        "_runtime_related_intelligence",
+        reinterpret_cast<PyCFunction>(py_runtime_related_intelligence),
+        METH_VARARGS | METH_KEYWORDS,
+        "Return intelligence records related to a task or claim for the active Python node callback."
+    },
+    {
+        "_runtime_agenda_intelligence",
+        reinterpret_cast<PyCFunction>(py_runtime_agenda_intelligence),
+        METH_VARARGS | METH_KEYWORDS,
+        "Return ranked task agenda entries for the active Python node callback."
+    },
+    {
+        "_runtime_supporting_claims_intelligence",
+        reinterpret_cast<PyCFunction>(py_runtime_supporting_claims_intelligence),
+        METH_VARARGS | METH_KEYWORDS,
+        "Return ranked supporting claims for the active Python node callback."
+    },
+    {
+        "_runtime_action_candidates_intelligence",
+        reinterpret_cast<PyCFunction>(py_runtime_action_candidates_intelligence),
+        METH_VARARGS | METH_KEYWORDS,
+        "Return ranked action candidates for the active Python node callback."
+    },
+    {
+        "_runtime_recall_intelligence",
+        reinterpret_cast<PyCFunction>(py_runtime_recall_intelligence),
+        METH_VARARGS | METH_KEYWORDS,
+        "Return ranked memory recall entries for the active Python node callback."
+    },
+    {
+        "_runtime_focus_intelligence",
+        reinterpret_cast<PyCFunction>(py_runtime_focus_intelligence),
+        METH_VARARGS | METH_KEYWORDS,
+        "Return a bounded cross-kind intelligence focus set for the active Python node callback."
+    },
+    {
+        "_runtime_intelligence_summary",
+        reinterpret_cast<PyCFunction>(py_runtime_intelligence_summary),
+        METH_VARARGS | METH_KEYWORDS,
+        "Return operational intelligence summary counts for the active Python node callback."
+    },
+    {
+        "_runtime_count_intelligence",
+        reinterpret_cast<PyCFunction>(py_runtime_count_intelligence),
+        METH_VARARGS | METH_KEYWORDS,
+        "Return the count of intelligence records matching a native filter."
+    },
+    {
+        "_runtime_route_intelligence",
+        reinterpret_cast<PyCFunction>(py_runtime_route_intelligence),
+        METH_VARARGS | METH_KEYWORDS,
+        "Select a route target from ordered intelligence rules."
     },
     {
         "_list_tools",

@@ -85,6 +85,7 @@ enum RecordedEffectStateKey : StateKey {
 std::atomic<int> g_recorded_effect_invocations{0};
 
 int64_t read_int_field(const WorkflowState& state, StateKey key);
+bool read_bool_field(const WorkflowState& state, StateKey key);
 
 void configure_checkpoint_storage(ExecutionEngine& engine, const std::string& path, bool use_sqlite) {
 #if defined(AGENTCORE_HAVE_SQLITE3)
@@ -187,6 +188,11 @@ enum KnowledgeGraphTestStateKey : StateKey {
 enum ReactiveKnowledgeStateKey : StateKey {
     kReactivePrimarySeen = 0,
     kReactiveOtherSeen = 1
+};
+
+enum ReactiveIntelligenceStateKey : StateKey {
+    kReactiveSupportedClaimCount = 0,
+    kReactiveRejectedSeen = 1
 };
 
 enum AsyncStateKey : StateKey {
@@ -310,6 +316,75 @@ NodeResult reactive_primary_node(ExecutionContext&) {
 NodeResult reactive_other_node(ExecutionContext&) {
     StatePatch patch;
     patch.updates.push_back(FieldUpdate{kReactiveOtherSeen, true});
+    return NodeResult::success(std::move(patch), 0.95F);
+}
+
+NodeResult emit_supported_claim_node(
+    ExecutionContext& context,
+    std::string_view claim_key,
+    std::string_view statement
+) {
+    StatePatch patch;
+    patch.intelligence.claims.push_back(IntelligenceClaimWrite{
+        context.strings.intern(claim_key),
+        context.strings.intern("agentcore"),
+        context.strings.intern("supports"),
+        context.strings.intern("reactive_intelligence"),
+        context.blobs.append_string(std::string(statement)),
+        IntelligenceClaimStatus::Supported,
+        0.92F,
+        intelligence_fields::kClaimSubject |
+            intelligence_fields::kClaimRelation |
+            intelligence_fields::kClaimObject |
+            intelligence_fields::kClaimStatement |
+            intelligence_fields::kClaimStatus |
+            intelligence_fields::kClaimConfidence
+    });
+    return NodeResult::success(std::move(patch), 0.97F);
+}
+
+NodeResult emit_supported_claim_primary_node(ExecutionContext& context) {
+    return emit_supported_claim_node(context, "claim:primary", "primary-signal");
+}
+
+NodeResult emit_supported_claim_alpha_node(ExecutionContext& context) {
+    return emit_supported_claim_node(context, "claim:alpha", "alpha-signal");
+}
+
+NodeResult emit_supported_claim_beta_node(ExecutionContext& context) {
+    return emit_supported_claim_node(context, "claim:beta", "beta-signal");
+}
+
+NodeResult emit_rejected_claim_node(ExecutionContext& context) {
+    StatePatch patch;
+    patch.intelligence.claims.push_back(IntelligenceClaimWrite{
+        context.strings.intern("claim:rejected"),
+        context.strings.intern("agentcore"),
+        context.strings.intern("supports"),
+        context.strings.intern("reactive_intelligence"),
+        context.blobs.append_string("rejected-signal"),
+        IntelligenceClaimStatus::Rejected,
+        0.81F,
+        intelligence_fields::kClaimSubject |
+            intelligence_fields::kClaimRelation |
+            intelligence_fields::kClaimObject |
+            intelligence_fields::kClaimStatement |
+            intelligence_fields::kClaimStatus |
+            intelligence_fields::kClaimConfidence
+    });
+    return NodeResult::success(std::move(patch), 0.95F);
+}
+
+NodeResult reactive_supported_claim_node(ExecutionContext& context) {
+    const int64_t seen = read_int_field(context.state, kReactiveSupportedClaimCount);
+    StatePatch patch;
+    patch.updates.push_back(FieldUpdate{kReactiveSupportedClaimCount, seen + 1});
+    return NodeResult::success(std::move(patch), 0.95F);
+}
+
+NodeResult reactive_rejected_claim_node(ExecutionContext&) {
+    StatePatch patch;
+    patch.updates.push_back(FieldUpdate{kReactiveRejectedSeen, true});
     return NodeResult::success(std::move(patch), 0.95F);
 }
 
@@ -1593,6 +1668,310 @@ GraphDefinition make_knowledge_reactive_resume_graph() {
     return graph;
 }
 
+GraphDefinition make_intelligence_reactive_graph() {
+    GraphDefinition graph;
+    graph.id = 33;
+    graph.name = "intelligence_reactive_test";
+    graph.entry = 1;
+    graph.nodes = {
+        NodeDefinition{1, NodeKind::Compute, "emit_supported_claim", 0U, 0U, 0U, emit_supported_claim_primary_node, {}},
+        NodeDefinition{2, NodeKind::Control, "root_stop", node_policy_mask(NodePolicyFlag::StopAfterNode), 0U, 0U, stop_node, {}},
+        NodeDefinition{
+            3,
+            NodeKind::Aggregate,
+            "react_supported_claim",
+            node_policy_mask(NodePolicyFlag::ReactToIntelligence),
+            0U,
+            0U,
+            reactive_supported_claim_node,
+            {},
+            {},
+            {},
+            std::nullopt,
+            {},
+            std::vector<IntelligenceSubscription>{
+                IntelligenceSubscription{
+                    IntelligenceSubscriptionKind::Claims,
+                    {},
+                    {},
+                    {},
+                    {},
+                    {},
+                    {},
+                    {},
+                    {},
+                    {},
+                    {},
+                    0.0F,
+                    0.0F,
+                    std::nullopt,
+                    IntelligenceClaimStatus::Supported,
+                    std::nullopt,
+                    std::nullopt
+                }
+            }
+        },
+        NodeDefinition{
+            4,
+            NodeKind::Aggregate,
+            "react_rejected_claim",
+            node_policy_mask(NodePolicyFlag::ReactToIntelligence),
+            0U,
+            0U,
+            reactive_rejected_claim_node,
+            {},
+            {},
+            {},
+            std::nullopt,
+            {},
+            std::vector<IntelligenceSubscription>{
+                IntelligenceSubscription{
+                    IntelligenceSubscriptionKind::Claims,
+                    {},
+                    {},
+                    {},
+                    {},
+                    {},
+                    {},
+                    {},
+                    {},
+                    {},
+                    {},
+                    0.0F,
+                    0.0F,
+                    std::nullopt,
+                    IntelligenceClaimStatus::Rejected,
+                    std::nullopt,
+                    std::nullopt
+                }
+            }
+        },
+        NodeDefinition{5, NodeKind::Control, "reactive_stop", node_policy_mask(NodePolicyFlag::StopAfterNode), 0U, 0U, stop_node, {}}
+    };
+    graph.edges = {
+        EdgeDefinition{1, 1, 2, EdgeKind::OnSuccess, nullptr, 100U},
+        EdgeDefinition{2, 3, 5, EdgeKind::OnSuccess, nullptr, 100U},
+        EdgeDefinition{3, 4, 5, EdgeKind::OnSuccess, nullptr, 100U}
+    };
+    graph.bind_outgoing_edges(1, std::vector<EdgeId>{1});
+    graph.bind_outgoing_edges(3, std::vector<EdgeId>{2});
+    graph.bind_outgoing_edges(4, std::vector<EdgeId>{3});
+    graph.sort_edges_by_priority();
+    return graph;
+}
+
+GraphDefinition make_intelligence_duplicate_reactive_graph() {
+    GraphDefinition graph;
+    graph.id = 34;
+    graph.name = "intelligence_duplicate_reactive_test";
+    graph.entry = 1;
+    graph.nodes = {
+        NodeDefinition{1, NodeKind::Compute, "emit_supported_claim_once", 0U, 0U, 0U, emit_supported_claim_primary_node, {}},
+        NodeDefinition{2, NodeKind::Compute, "emit_supported_claim_duplicate", 0U, 0U, 0U, emit_supported_claim_primary_node, {}},
+        NodeDefinition{3, NodeKind::Compute, "emit_supported_claim_duplicate_again", 0U, 0U, 0U, emit_supported_claim_primary_node, {}},
+        NodeDefinition{
+            4,
+            NodeKind::Aggregate,
+            "react_supported_claim_once",
+            node_policy_mask(NodePolicyFlag::ReactToIntelligence) |
+                node_policy_mask(NodePolicyFlag::StopAfterNode),
+            0U,
+            0U,
+            reactive_supported_claim_node,
+            {},
+            {},
+            {},
+            std::nullopt,
+            {},
+            std::vector<IntelligenceSubscription>{
+                IntelligenceSubscription{
+                    IntelligenceSubscriptionKind::Claims,
+                    {},
+                    {},
+                    {},
+                    {},
+                    {},
+                    {},
+                    {},
+                    {},
+                    {},
+                    {},
+                    0.0F,
+                    0.0F,
+                    std::nullopt,
+                    IntelligenceClaimStatus::Supported,
+                    std::nullopt,
+                    std::nullopt
+                }
+            }
+        }
+    };
+    graph.edges = {
+        EdgeDefinition{1, 1, 2, EdgeKind::OnSuccess, nullptr, 100U},
+        EdgeDefinition{2, 2, 3, EdgeKind::OnSuccess, nullptr, 100U}
+    };
+    graph.bind_outgoing_edges(1, std::vector<EdgeId>{1});
+    graph.bind_outgoing_edges(2, std::vector<EdgeId>{2});
+    graph.sort_edges_by_priority();
+    return graph;
+}
+
+GraphDefinition make_intelligence_reactive_resume_graph() {
+    GraphDefinition graph;
+    graph.id = 35;
+    graph.name = "intelligence_reactive_resume_test";
+    graph.entry = 1;
+    graph.nodes = {
+        NodeDefinition{
+            1,
+            NodeKind::Control,
+            "fanout_resume_claims",
+            node_policy_mask(NodePolicyFlag::AllowFanOut),
+            0U,
+            0U,
+            fanout_node,
+            {}
+        },
+        NodeDefinition{2, NodeKind::Compute, "emit_supported_claim_alpha", 0U, 0U, 0U, emit_supported_claim_alpha_node, {}},
+        NodeDefinition{3, NodeKind::Compute, "emit_supported_claim_beta", 0U, 0U, 0U, emit_supported_claim_beta_node, {}},
+        NodeDefinition{
+            4,
+            NodeKind::Aggregate,
+            "react_supported_claim_resume",
+            node_policy_mask(NodePolicyFlag::ReactToIntelligence) |
+                node_policy_mask(NodePolicyFlag::StopAfterNode),
+            0U,
+            0U,
+            reactive_supported_claim_node,
+            {},
+            {},
+            {},
+            std::nullopt,
+            {},
+            std::vector<IntelligenceSubscription>{
+                IntelligenceSubscription{
+                    IntelligenceSubscriptionKind::Claims,
+                    {},
+                    {},
+                    {},
+                    {},
+                    {},
+                    {},
+                    {},
+                    {},
+                    {},
+                    {},
+                    0.0F,
+                    0.0F,
+                    std::nullopt,
+                    IntelligenceClaimStatus::Supported,
+                    std::nullopt,
+                    std::nullopt
+                }
+            }
+        }
+    };
+    graph.edges = {
+        EdgeDefinition{1, 1, 2, EdgeKind::OnSuccess, nullptr, 100U},
+        EdgeDefinition{2, 1, 3, EdgeKind::OnSuccess, nullptr, 90U}
+    };
+    graph.bind_outgoing_edges(1, std::vector<EdgeId>{1, 2});
+    graph.sort_edges_by_priority();
+    return graph;
+}
+
+GraphDefinition make_intelligence_claim_graph_reactive_graph() {
+    GraphDefinition graph;
+    graph.id = 36;
+    graph.name = "intelligence_claim_graph_reactive_test";
+    graph.entry = 1;
+    graph.nodes = {
+        NodeDefinition{1, NodeKind::Compute, "emit_supported_claim", 0U, 0U, 0U, emit_supported_claim_primary_node, {}},
+        NodeDefinition{2, NodeKind::Control, "root_stop", node_policy_mask(NodePolicyFlag::StopAfterNode), 0U, 0U, stop_node, {}},
+        NodeDefinition{
+            3,
+            NodeKind::Aggregate,
+            "react_claim_graph_match",
+            node_policy_mask(NodePolicyFlag::ReactToIntelligence),
+            0U,
+            0U,
+            reactive_supported_claim_node,
+            {},
+            {},
+            {},
+            std::nullopt,
+            {},
+            std::vector<IntelligenceSubscription>{
+                IntelligenceSubscription{
+                    IntelligenceSubscriptionKind::All,
+                    {},
+                    {},
+                    {},
+                    {},
+                    "agentcore",
+                    "supports",
+                    "reactive_intelligence",
+                    {},
+                    {},
+                    {},
+                    0.0F,
+                    0.0F,
+                    std::nullopt,
+                    std::nullopt,
+                    std::nullopt,
+                    std::nullopt
+                }
+            }
+        },
+        NodeDefinition{
+            4,
+            NodeKind::Aggregate,
+            "react_claim_graph_miss",
+            node_policy_mask(NodePolicyFlag::ReactToIntelligence),
+            0U,
+            0U,
+            reactive_supported_claim_node,
+            {},
+            {},
+            {},
+            std::nullopt,
+            {},
+            std::vector<IntelligenceSubscription>{
+                IntelligenceSubscription{
+                    IntelligenceSubscriptionKind::All,
+                    {},
+                    {},
+                    {},
+                    {},
+                    "other-runtime",
+                    "supports",
+                    "reactive_intelligence",
+                    {},
+                    {},
+                    {},
+                    0.0F,
+                    0.0F,
+                    std::nullopt,
+                    std::nullopt,
+                    std::nullopt,
+                    std::nullopt
+                }
+            }
+        },
+        NodeDefinition{5, NodeKind::Control, "reactive_stop", node_policy_mask(NodePolicyFlag::StopAfterNode), 0U, 0U, stop_node, {}}
+    };
+    graph.edges = {
+        EdgeDefinition{1, 1, 2, EdgeKind::OnSuccess, nullptr, 100U},
+        EdgeDefinition{2, 3, 5, EdgeKind::OnSuccess, nullptr, 100U},
+        EdgeDefinition{3, 4, 5, EdgeKind::OnSuccess, nullptr, 100U}
+    };
+    graph.bind_outgoing_edges(1, std::vector<EdgeId>{1});
+    graph.bind_outgoing_edges(3, std::vector<EdgeId>{2});
+    graph.bind_outgoing_edges(4, std::vector<EdgeId>{3});
+    graph.sort_edges_by_priority();
+    return graph;
+}
+
 GraphDefinition make_parallel_fanout_graph() {
     GraphDefinition graph;
     graph.id = 12;
@@ -2052,6 +2431,31 @@ void test_resume_flow() {
     assert(state.size() > kResumeDone);
     assert(std::holds_alternative<bool>(state.load(kResumeDone)));
     assert(std::get<bool>(state.load(kResumeDone)));
+}
+
+void test_fresh_run_snapshot_and_step_preserve_deferred_entry_task() {
+    ExecutionEngine engine(1);
+    InputEnvelope input;
+    input.initial_field_count = 2;
+
+    const RunId run_id = engine.start(make_resume_graph(), input);
+    const RunSnapshot snapshot = engine.inspect(run_id);
+    verbose_log_snapshot_summary("fresh_run_snapshot", snapshot);
+    assert(snapshot.status == ExecutionStatus::Running);
+    assert(snapshot.pending_tasks.size() == 1U);
+    assert(snapshot.pending_tasks.front().run_id == run_id);
+    assert(snapshot.pending_tasks.front().node_id == 1U);
+    assert(snapshot.pending_tasks.front().branch_id == 0U);
+    assert(snapshot.pending_tasks.front().ready_at_ns == 0U);
+
+    const StepResult first_step = engine.step(run_id);
+    assert(first_step.progressed);
+    assert(first_step.status == ExecutionStatus::Paused);
+    assert(first_step.node_status == NodeResult::Waiting);
+
+    const RunSnapshot paused_snapshot = engine.inspect(run_id);
+    verbose_log_snapshot_summary("paused_snapshot", paused_snapshot);
+    assert(paused_snapshot.pending_tasks.empty());
 }
 
 void test_knowledge_graph_integration() {
@@ -2619,6 +3023,147 @@ void test_knowledge_graph_reactive_checkpoint_resume_preserves_pending_frontier(
     std::remove(checkpoint_path.c_str());
 
     const GraphDefinition graph = make_knowledge_reactive_resume_graph();
+    CheckpointPolicy policy;
+    policy.snapshot_interval_steps = 1U;
+
+    InputEnvelope input;
+    input.initial_field_count = 2;
+
+    ExecutionEngine direct_engine(1);
+    direct_engine.set_checkpoint_policy(policy);
+    const RunId direct_run_id = direct_engine.start(graph, input);
+    const RunResult direct_result = direct_engine.run_to_completion(direct_run_id);
+    assert(direct_result.status == ExecutionStatus::Completed);
+    const std::vector<TraceEvent> direct_trace = direct_engine.trace().events_for_run(direct_run_id);
+    assert(count_node_events(direct_trace, 4U) == 2U);
+
+    RunId resumed_run_id = 0U;
+    CheckpointId frontier_checkpoint_id = 0U;
+    std::vector<TraceEvent> prefix_trace;
+    {
+        ExecutionEngine engine(1);
+        engine.set_checkpoint_policy(policy);
+        engine.enable_checkpoint_persistence(checkpoint_path);
+
+        resumed_run_id = engine.start(graph, input);
+        const StepResult first_step = engine.step(resumed_run_id);
+        assert(first_step.progressed);
+        const StepResult second_step = engine.step(resumed_run_id);
+        assert(second_step.progressed);
+        const StepResult third_step = engine.step(resumed_run_id);
+        assert(third_step.progressed);
+        frontier_checkpoint_id = third_step.checkpoint_id;
+        assert(frontier_checkpoint_id != 0U);
+
+        const auto checkpoint_record = engine.checkpoints().get(frontier_checkpoint_id);
+        assert(checkpoint_record.has_value());
+        assert(checkpoint_record->resumable());
+        assert(checkpoint_record->snapshot.has_value());
+        assert(checkpoint_record->snapshot->reactive_frontiers.size() == 1U);
+        assert(checkpoint_record->snapshot->reactive_frontiers.front().node_id == 4U);
+        assert(checkpoint_record->snapshot->reactive_frontiers.front().pending_rerun);
+        assert(checkpoint_record->snapshot->reactive_frontiers.front().pending_rerun_seed.has_value());
+
+        std::size_t reactive_branch_count = 0U;
+        for (const BranchSnapshot& branch : checkpoint_record->snapshot->branches) {
+            if (branch.reactive_root_node_id.has_value() && *branch.reactive_root_node_id == 4U) {
+                ++reactive_branch_count;
+            }
+        }
+        assert(reactive_branch_count == 1U);
+
+        prefix_trace = trace_events_through_checkpoint(
+            engine.trace().events_for_run(resumed_run_id),
+            frontier_checkpoint_id
+        );
+    }
+
+    ExecutionEngine restored_engine(1);
+    restored_engine.register_graph(graph);
+    restored_engine.set_checkpoint_policy(policy);
+    restored_engine.enable_checkpoint_persistence(checkpoint_path);
+    assert(restored_engine.load_persisted_checkpoints() >= 1U);
+
+    const ResumeResult resume_result = restored_engine.resume(frontier_checkpoint_id);
+    assert(resume_result.resumed);
+    assert(resume_result.run_id == resumed_run_id);
+
+    const RunResult resumed_result = restored_engine.run_to_completion(resumed_run_id);
+    assert(resumed_result.status == ExecutionStatus::Completed);
+    const auto resumed_record = restored_engine.checkpoints().get(resumed_result.last_checkpoint_id);
+    assert(resumed_record.has_value());
+    assert(resumed_record->resumable());
+
+    const std::vector<TraceEvent> resumed_trace = append_trace_events(
+        prefix_trace,
+        restored_engine.trace().events_for_run(resumed_run_id)
+    );
+    assert(count_node_events(resumed_trace, 4U) == 2U);
+
+    const RunProofDigest direct_digest = digest_for_result(
+        direct_engine,
+        direct_run_id,
+        direct_result.last_checkpoint_id
+    );
+    const RunProofDigest resumed_digest = compute_run_proof_digest(
+        *resumed_record,
+        resumed_trace
+    );
+    assert(direct_digest.snapshot_digest == resumed_digest.snapshot_digest);
+    assert(direct_digest.trace_digest == resumed_digest.trace_digest);
+    assert(direct_digest.combined_digest == resumed_digest.combined_digest);
+
+    std::remove(checkpoint_path.c_str());
+}
+
+void test_intelligence_reactive_frontier() {
+    ExecutionEngine engine(2);
+    InputEnvelope input;
+    input.initial_field_count = 2;
+
+    const RunId run_id = engine.start(make_intelligence_reactive_graph(), input);
+    const RunResult result = engine.run_to_completion(run_id);
+    assert(result.status == ExecutionStatus::Completed);
+
+    const std::vector<TraceEvent> trace_events = engine.trace().events_for_run(run_id);
+    assert(count_node_events(trace_events, 3U) == 1U);
+    assert(count_node_events(trace_events, 4U) == 0U);
+    assert(count_node_events(trace_events, 5U) == 1U);
+}
+
+void test_intelligence_duplicate_writes_do_not_retrigger_frontier() {
+    ExecutionEngine engine(1);
+    InputEnvelope input;
+    input.initial_field_count = 2;
+
+    const RunId run_id = engine.start(make_intelligence_duplicate_reactive_graph(), input);
+    const RunResult result = engine.run_to_completion(run_id);
+    assert(result.status == ExecutionStatus::Completed);
+
+    const std::vector<TraceEvent> trace_events = engine.trace().events_for_run(run_id);
+    assert(count_node_events(trace_events, 4U) == 1U);
+}
+
+void test_intelligence_claim_graph_reactive_frontier() {
+    ExecutionEngine engine(2);
+    InputEnvelope input;
+    input.initial_field_count = 2;
+
+    const RunId run_id = engine.start(make_intelligence_claim_graph_reactive_graph(), input);
+    const RunResult result = engine.run_to_completion(run_id);
+    assert(result.status == ExecutionStatus::Completed);
+
+    const std::vector<TraceEvent> trace_events = engine.trace().events_for_run(run_id);
+    assert(count_node_events(trace_events, 3U) == 1U);
+    assert(count_node_events(trace_events, 4U) == 0U);
+    assert(count_node_events(trace_events, 5U) == 1U);
+}
+
+void test_intelligence_reactive_checkpoint_resume_preserves_pending_frontier() {
+    const std::string checkpoint_path = "/tmp/agentcore_intelligence_reactive_frontier.bin";
+    std::remove(checkpoint_path.c_str());
+
+    const GraphDefinition graph = make_intelligence_reactive_resume_graph();
     CheckpointPolicy policy;
     policy.snapshot_interval_steps = 1U;
 
@@ -3523,6 +4068,9 @@ int main() {
 
     const std::vector<NamedTest> tests = {
         {"test_resume_flow", [] { agentcore::test_resume_flow(); }},
+        {"test_fresh_run_snapshot_and_step_preserve_deferred_entry_task", [] {
+             agentcore::test_fresh_run_snapshot_and_step_preserve_deferred_entry_task();
+         }},
         {"test_knowledge_graph_integration", [] { agentcore::test_knowledge_graph_integration(); }},
         {"test_subgraph_composition_and_public_streaming", [] {
              agentcore::test_subgraph_composition_and_public_streaming();
@@ -3547,6 +4095,18 @@ int main() {
          }},
         {"test_knowledge_graph_reactive_checkpoint_resume_preserves_pending_frontier", [] {
              agentcore::test_knowledge_graph_reactive_checkpoint_resume_preserves_pending_frontier();
+         }},
+        {"test_intelligence_reactive_frontier", [] {
+             agentcore::test_intelligence_reactive_frontier();
+         }},
+        {"test_intelligence_duplicate_writes_do_not_retrigger_frontier", [] {
+             agentcore::test_intelligence_duplicate_writes_do_not_retrigger_frontier();
+         }},
+        {"test_intelligence_claim_graph_reactive_frontier", [] {
+             agentcore::test_intelligence_claim_graph_reactive_frontier();
+         }},
+        {"test_intelligence_reactive_checkpoint_resume_preserves_pending_frontier", [] {
+             agentcore::test_intelligence_reactive_checkpoint_resume_preserves_pending_frontier();
          }},
         {"test_parallel_scheduler_fanout", [] { agentcore::test_parallel_scheduler_fanout(); }},
         {"test_join_scope_merges_branch_state_and_knowledge_graph", [] {

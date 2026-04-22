@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
@@ -85,6 +86,11 @@ struct CheckpointPolicy {
     bool snapshot_on_join_events{true};
 };
 
+struct RunCaptureOptions {
+    bool capture_checkpoints{true};
+    bool capture_trace{true};
+};
+
 struct ExecutionEngineOptions {
     std::size_t worker_count{0U};
     bool inline_scheduler{false};
@@ -105,12 +111,14 @@ public:
     void enable_sqlite_checkpoint_persistence(std::string path);
     [[nodiscard]] std::size_t load_persisted_checkpoints();
     RunId start(const GraphDefinition&, const InputEnvelope&);
+    RunId start(const GraphDefinition&, const InputEnvelope&, const RunCaptureOptions&);
     StepResult step(RunId);
     RunResult run_to_completion(RunId);
     ResumeResult resume(CheckpointId);
     ResumeResult resume_run(RunId);
     InterruptResult interrupt(RunId);
     StateEditResult apply_state_patch(RunId run_id, const StatePatch& patch, uint32_t branch_id = 0U);
+    void discard_run(RunId run_id);
     [[nodiscard]] RunSnapshot inspect(RunId run_id) const;
 
     [[nodiscard]] const WorkflowState& state(RunId run_id, uint32_t branch_id = 0) const;
@@ -191,6 +199,8 @@ private:
         std::shared_ptr<std::mutex> subgraph_session_mutex{std::make_shared<std::mutex>()};
         uint32_t next_split_id{1};
         uint32_t in_flight_tasks{0};
+        RunCaptureOptions capture_options{};
+        std::optional<ScheduledTask> deferred_ready_task;
 
         RunRuntime();
         RunRuntime(const RunRuntime&) = delete;
@@ -220,7 +230,14 @@ private:
         const BranchPtr& branch,
         std::vector<TraceEvent>* deferred_trace_events
     );
-    StepResult commit_task_execution(RunId run_id, RunRuntime& run, TaskExecutionRecord record);
+    StepResult commit_task_execution(
+        RunId run_id,
+        RunRuntime& run,
+        TaskExecutionRecord record,
+        std::optional<ScheduledTask>* inline_followup_task = nullptr
+    );
+    [[nodiscard]] bool has_deferred_ready_task_locked(const RunRuntime& run) const noexcept;
+    [[nodiscard]] std::optional<ScheduledTask> take_deferred_ready_task_locked(RunRuntime& run);
     [[nodiscard]] RunSnapshot snapshot_run(RunId run_id, const RunRuntime& run) const;
     [[nodiscard]] RunSnapshot snapshot_run_locked(RunId run_id, const RunRuntime& run) const;
     [[nodiscard]] bool should_capture_checkpoint_snapshot(
@@ -263,8 +280,7 @@ private:
         NodeId reactive_node_id,
         const StateStore& state_seed,
         const ExecutionFrame& frame_seed,
-        std::size_t& enqueued_tasks,
-        uint32_t& trace_flags
+        std::size_t& enqueued_tasks
     );
     void mark_reactive_trigger(
         RunId run_id,
@@ -272,8 +288,7 @@ private:
         NodeId reactive_node_id,
         const StateStore& state_seed,
         const ExecutionFrame& frame_seed,
-        std::size_t& enqueued_tasks,
-        uint32_t& trace_flags
+        std::size_t& enqueued_tasks
     );
     void finalize_reactive_frontier_for_branch(
         RunId run_id,

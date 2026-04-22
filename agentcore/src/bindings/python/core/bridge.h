@@ -19,6 +19,7 @@
 namespace agentcore::python_binding {
 
 class GraphHandle;
+struct StreamIterator;
 
 constexpr const char* kGraphCapsuleName = "agentcore._native.GraphHandle";
 constexpr const char* kRuntimeCapsuleName = "agentcore._native.RuntimeContext";
@@ -34,6 +35,7 @@ struct NodeBinding {
     uint32_t policy_flags{0U};
     std::vector<FieldMergeRule> merge_rules;
     NodeMemoizationPolicy memoization;
+    std::vector<IntelligenceSubscription> intelligence_subscriptions;
     std::optional<SubgraphBinding> subgraph;
     GraphHandle* subgraph_handle{nullptr};
     PyObject* patch_key_lookup{nullptr};
@@ -42,6 +44,7 @@ struct NodeBinding {
 struct RunArtifacts {
     PyObject* state{nullptr};
     PyObject* trace{nullptr};
+    PyObject* intelligence{nullptr};
     RunResult result{};
     RunProofDigest proof{};
     RunId run_id{0};
@@ -63,6 +66,7 @@ public:
         NodeKind kind,
         uint32_t policy_flags,
         const NodeMemoizationPolicy& memoization,
+        const std::vector<IntelligenceSubscription>& intelligence_subscriptions,
         const std::vector<std::pair<std::string, JoinMergeStrategy>>& merge_rules,
         std::string* error_message
     );
@@ -82,7 +86,14 @@ public:
     bool finalize(std::string* error_message);
 
     bool invoke(PyObject* input_state, PyObject* config, PyObject** result, std::string* error_message);
-    bool stream(PyObject* input_state, PyObject* config, bool include_subgraphs, PyObject** result, std::string* error_message);
+    bool stream(
+        PyObject* input_state,
+        PyObject* config,
+        bool include_subgraphs,
+        PyObject* owner_ref,
+        PyObject** result,
+        std::string* error_message
+    );
 
     bool invoke_with_details(PyObject* input_state, PyObject* config, bool include_subgraphs, PyObject** result, std::string* error_message);
     bool invoke_until_pause_with_details(PyObject* input_state, PyObject* config, bool include_subgraphs, PyObject** result, std::string* error_message);
@@ -123,11 +134,27 @@ public:
 
     StateKey ensure_state_key(std::string_view state_name);
 
+    bool build_trace_event_dict(
+        const TraceEvent& event,
+        bool include_subgraphs,
+        PyObject** result,
+        std::string* error_message
+    ) const;
+
 private:
     friend NodeResult python_bootstrap_executor(ExecutionContext& context);
     friend NodeResult python_node_executor(ExecutionContext& context);
 
     bool finalize_locked(std::string* error_message);
+    bool execute_run_core(
+        PyObject* input_state,
+        PyObject* config,
+        bool until_pause,
+        const RunCaptureOptions& capture_options,
+        RunId* run_id,
+        RunResult* result,
+        std::string* error_message
+    );
     bool execute_run(PyObject* input_state, PyObject* config, bool include_subgraphs, bool until_pause, RunArtifacts* artifacts, std::string* error_message);
     bool populate_run_artifacts(RunId run_id, const RunResult& run_result, bool include_subgraphs, RunArtifacts* artifacts, std::string* error_message);
     PyObject* build_trace_list(RunId run_id, bool include_subgraphs, std::string* error_message) const;
@@ -190,6 +217,22 @@ PyObject* invoke_model_registry(ModelRegistry& registry, std::string_view name, 
 PyObject* runtime_invoke_model(PyObject* capsule, std::string_view name, const std::vector<std::byte>& prompt, const std::vector<std::byte>& schema, uint32_t max_tokens, std::string* error_message);
 
 PyObject* runtime_record_once(PyObject* capsule, std::string_view key, PyObject* request, PyObject* producer, std::string* error_message);
+bool runtime_stage_task_write(PyObject* capsule, PyObject* spec, std::string* error_message);
+bool runtime_stage_claim_write(PyObject* capsule, PyObject* spec, std::string* error_message);
+bool runtime_stage_evidence_write(PyObject* capsule, PyObject* spec, std::string* error_message);
+bool runtime_stage_decision_write(PyObject* capsule, PyObject* spec, std::string* error_message);
+bool runtime_stage_memory_write(PyObject* capsule, PyObject* spec, std::string* error_message);
+PyObject* runtime_snapshot_intelligence(PyObject* capsule, std::string* error_message);
+PyObject* runtime_query_intelligence(PyObject* capsule, PyObject* spec, std::string* error_message);
+PyObject* runtime_related_intelligence(PyObject* capsule, PyObject* spec, std::string* error_message);
+PyObject* runtime_agenda_intelligence(PyObject* capsule, PyObject* spec, std::string* error_message);
+PyObject* runtime_supporting_claims_intelligence(PyObject* capsule, PyObject* spec, std::string* error_message);
+PyObject* runtime_action_candidates_intelligence(PyObject* capsule, PyObject* spec, std::string* error_message);
+PyObject* runtime_recall_intelligence(PyObject* capsule, PyObject* spec, std::string* error_message);
+PyObject* runtime_focus_intelligence(PyObject* capsule, PyObject* spec, std::string* error_message);
+PyObject* runtime_intelligence_summary(PyObject* capsule, std::string* error_message);
+PyObject* runtime_count_intelligence(PyObject* capsule, PyObject* spec, std::string* error_message);
+PyObject* runtime_route_intelligence(PyObject* capsule, PyObject* spec, std::string* error_message);
 
 } // namespace agentcore::python_binding
 

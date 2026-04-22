@@ -386,6 +386,35 @@ void write_graph(std::ostream& output, const GraphDefinition& graph) {
             write_string(output, subscription.relation);
             write_string(output, subscription.object_label);
         }
+        write_pod<uint64_t>(output, static_cast<uint64_t>(node.intelligence_subscriptions.size()));
+        for (const IntelligenceSubscription& subscription : node.intelligence_subscriptions) {
+            write_pod(output, static_cast<uint8_t>(subscription.kind));
+            write_string(output, subscription.key);
+            write_string(output, subscription.key_prefix);
+            write_string(output, subscription.task_key);
+            write_string(output, subscription.claim_key);
+            write_string(output, subscription.owner);
+            write_string(output, subscription.source);
+            write_string(output, subscription.scope);
+            write_pod(output, subscription.min_confidence);
+            write_pod(output, subscription.min_importance);
+            write_pod(output, subscription.task_status.has_value());
+            if (subscription.task_status.has_value()) {
+                write_pod(output, static_cast<uint8_t>(*subscription.task_status));
+            }
+            write_pod(output, subscription.claim_status.has_value());
+            if (subscription.claim_status.has_value()) {
+                write_pod(output, static_cast<uint8_t>(*subscription.claim_status));
+            }
+            write_pod(output, subscription.decision_status.has_value());
+            if (subscription.decision_status.has_value()) {
+                write_pod(output, static_cast<uint8_t>(*subscription.decision_status));
+            }
+            write_pod(output, subscription.memory_layer.has_value());
+            if (subscription.memory_layer.has_value()) {
+                write_pod(output, static_cast<uint8_t>(*subscription.memory_layer));
+            }
+        }
         write_pod(output, node.memoization.deterministic);
         write_pod<uint64_t>(output, static_cast<uint64_t>(node.memoization.read_keys.size()));
         for (StateKey read_key : node.memoization.read_keys) {
@@ -472,6 +501,42 @@ GraphDefinition read_graph(std::istream& input) {
                 read_string(input),
                 read_string(input)
             });
+        }
+        const uint64_t intelligence_subscription_count = read_pod<uint64_t>(input);
+        graph.nodes.back().intelligence_subscriptions.reserve(
+            static_cast<std::size_t>(intelligence_subscription_count)
+        );
+        for (uint64_t subscription_index = 0;
+             subscription_index < intelligence_subscription_count;
+             ++subscription_index) {
+            IntelligenceSubscription subscription;
+            subscription.kind = static_cast<IntelligenceSubscriptionKind>(read_pod<uint8_t>(input));
+            subscription.key = read_string(input);
+            subscription.key_prefix = read_string(input);
+            subscription.task_key = read_string(input);
+            subscription.claim_key = read_string(input);
+            subscription.owner = read_string(input);
+            subscription.source = read_string(input);
+            subscription.scope = read_string(input);
+            subscription.min_confidence = read_pod<float>(input);
+            subscription.min_importance = read_pod<float>(input);
+            if (read_pod<bool>(input)) {
+                subscription.task_status =
+                    static_cast<IntelligenceTaskStatus>(read_pod<uint8_t>(input));
+            }
+            if (read_pod<bool>(input)) {
+                subscription.claim_status =
+                    static_cast<IntelligenceClaimStatus>(read_pod<uint8_t>(input));
+            }
+            if (read_pod<bool>(input)) {
+                subscription.decision_status =
+                    static_cast<IntelligenceDecisionStatus>(read_pod<uint8_t>(input));
+            }
+            if (read_pod<bool>(input)) {
+                subscription.memory_layer =
+                    static_cast<IntelligenceMemoryLayer>(read_pod<uint8_t>(input));
+            }
+            graph.nodes.back().intelligence_subscriptions.push_back(std::move(subscription));
         }
         graph.nodes.back().memoization.deterministic = read_pod<bool>(input);
         const uint64_t memoization_key_count = read_pod<uint64_t>(input);

@@ -1,4 +1,5 @@
 #include "bridge.h"
+#include "agentcore/state/intelligence/ops.h"
 #include "agentcore/runtime/model_api.h"
 #include "agentcore/runtime/tool_api.h"
 #include "agentcore/state/state_store.h"
@@ -11,6 +12,8 @@
 #include <utility>
 
 namespace agentcore::python_binding {
+
+BlobRef python_object_to_blob_payload(PyObject* value, BlobStore& blobs, std::string* error_message);
 
 namespace {
 
@@ -248,6 +251,8 @@ struct RuntimeViewProxy {
     const WorkflowState* state{nullptr};
     const BlobStore* blobs{nullptr};
     const StringInterner* strings{nullptr};
+    const IntelligenceStore* intelligence{nullptr};
+    IntelligencePatch pending_intelligence_patch;
     std::atomic<bool> active;
 };
 
@@ -267,6 +272,7 @@ struct OwnedStateSnapshot {
 };
 
 void RuntimeViewProxy_dealloc(RuntimeViewProxy* self) {
+    self->pending_intelligence_patch.~IntelligencePatch();
     self->active.~atomic();
     Py_TYPE(self)->tp_free(reinterpret_cast<PyObject*>(self));
 }
@@ -323,6 +329,8 @@ PyObject* create_runtime_view_proxy(ExecutionContext& context) {
         self->state = &context.state;
         self->blobs = &context.blobs;
         self->strings = &context.strings;
+        self->intelligence = &context.intelligence;
+        new (&self->pending_intelligence_patch) IntelligencePatch();
         new (&self->active) std::atomic<bool>(true);
     }
     return reinterpret_cast<PyObject*>(self);
@@ -348,6 +356,257 @@ RuntimeViewProxy* runtime_view_from_object(PyObject* object, std::string* error_
 ExecutionContext* runtime_context_from_capsule(PyObject* capsule, std::string* error_message) {
     RuntimeViewProxy* view = runtime_view_from_object(capsule, error_message);
     return view == nullptr ? nullptr : view->runtime;
+}
+
+bool require_spec_dict(PyObject* spec, std::string* error_message) {
+    if (spec != nullptr && PyDict_Check(spec)) {
+        return true;
+    }
+    if (error_message != nullptr) {
+        *error_message = "intelligence specification must be a dict";
+    }
+    return false;
+}
+
+bool parse_required_spec_string_id(
+    PyObject* spec,
+    const char* field_name,
+    StringInterner& strings,
+    InternedStringId* output,
+    std::string* error_message
+) {
+    PyObject* value = PyDict_GetItemString(spec, field_name);
+    if (value == nullptr || value == Py_None) {
+        if (error_message != nullptr) {
+            *error_message = std::string(field_name) + " is required";
+        }
+        return false;
+    }
+    if (!PyUnicode_Check(value)) {
+        if (error_message != nullptr) {
+            *error_message = std::string(field_name) + " must be a string";
+        }
+        return false;
+    }
+    *output = strings.intern(PyUnicode_AsUTF8(value));
+    return true;
+}
+
+bool parse_optional_spec_string_id(
+    PyObject* spec,
+    const char* field_name,
+    StringInterner& strings,
+    InternedStringId* output,
+    uint32_t mask_value,
+    uint32_t* field_mask,
+    std::string* error_message
+) {
+    PyObject* value = PyDict_GetItemString(spec, field_name);
+    if (value == nullptr) {
+        return true;
+    }
+    if (value == Py_None) {
+        *output = 0U;
+    } else {
+        if (!PyUnicode_Check(value)) {
+            if (error_message != nullptr) {
+                *error_message = std::string(field_name) + " must be a string or None";
+            }
+            return false;
+        }
+        *output = strings.intern(PyUnicode_AsUTF8(value));
+    }
+    *field_mask |= mask_value;
+    return true;
+}
+
+bool parse_optional_spec_blob(
+    PyObject* spec,
+    const char* field_name,
+    BlobStore& blobs,
+    BlobRef* output,
+    uint32_t mask_value,
+    uint32_t* field_mask,
+    std::string* error_message
+) {
+    PyObject* value = PyDict_GetItemString(spec, field_name);
+    if (value == nullptr) {
+        return true;
+    }
+    *output = python_object_to_blob_payload(value, blobs, error_message);
+    if (value != Py_None && output->empty() && error_message != nullptr && !error_message->empty()) {
+        return false;
+    }
+    *field_mask |= mask_value;
+    return true;
+}
+
+bool parse_optional_spec_string(
+    PyObject* spec,
+    const char* field_name,
+    std::string* output,
+    std::string* error_message
+) {
+    PyObject* value = PyDict_GetItemString(spec, field_name);
+    if (value == nullptr || value == Py_None) {
+        return true;
+    }
+    if (!PyUnicode_Check(value)) {
+        if (error_message != nullptr) {
+            *error_message = std::string(field_name) + " must be a string";
+        }
+        return false;
+    }
+    *output = PyUnicode_AsUTF8(value);
+    return true;
+}
+
+bool parse_optional_spec_float(
+    PyObject* spec,
+    const char* field_name,
+    float* output,
+    uint32_t mask_value,
+    uint32_t* field_mask,
+    std::string* error_message
+) {
+    PyObject* value = PyDict_GetItemString(spec, field_name);
+    if (value == nullptr) {
+        return true;
+    }
+    if (value == Py_None) {
+        *output = 0.0F;
+    } else {
+        const double raw = PyFloat_AsDouble(value);
+        if (PyErr_Occurred() != nullptr) {
+            if (error_message != nullptr) {
+                *error_message = fetch_python_error();
+            }
+            PyErr_Clear();
+            return false;
+        }
+        *output = static_cast<float>(raw);
+    }
+    *field_mask |= mask_value;
+    return true;
+}
+
+bool parse_optional_spec_int32(
+    PyObject* spec,
+    const char* field_name,
+    int32_t* output,
+    uint32_t mask_value,
+    uint32_t* field_mask,
+    std::string* error_message
+) {
+    PyObject* value = PyDict_GetItemString(spec, field_name);
+    if (value == nullptr) {
+        return true;
+    }
+    if (value == Py_None) {
+        *output = 0;
+    } else {
+        const long raw = PyLong_AsLong(value);
+        if (PyErr_Occurred() != nullptr) {
+            if (error_message != nullptr) {
+                *error_message = fetch_python_error();
+            }
+            PyErr_Clear();
+            return false;
+        }
+        *output = static_cast<int32_t>(raw);
+    }
+    *field_mask |= mask_value;
+    return true;
+}
+
+bool parse_optional_query_limit(
+    PyObject* spec,
+    const char* field_name,
+    uint32_t* output,
+    std::string* error_message
+) {
+    PyObject* value = PyDict_GetItemString(spec, field_name);
+    if (value == nullptr || value == Py_None) {
+        return true;
+    }
+    const unsigned long raw = PyLong_AsUnsignedLong(value);
+    if (PyErr_Occurred() != nullptr) {
+        if (error_message != nullptr) {
+            *error_message = fetch_python_error();
+        }
+        PyErr_Clear();
+        return false;
+    }
+    *output = static_cast<uint32_t>(raw);
+    return true;
+}
+
+template <typename EnumT>
+bool parse_optional_named_enum(
+    PyObject* spec,
+    const char* field_name,
+    EnumT* output,
+    uint32_t mask_value,
+    uint32_t* field_mask,
+    std::optional<EnumT> (*parser)(std::string_view),
+    std::string* error_message
+) {
+    PyObject* value = PyDict_GetItemString(spec, field_name);
+    if (value == nullptr) {
+        return true;
+    }
+    if (!PyUnicode_Check(value)) {
+        if (error_message != nullptr) {
+            *error_message = std::string(field_name) + " must be a string";
+        }
+        return false;
+    }
+    const char* utf8 = PyUnicode_AsUTF8(value);
+    const auto parsed = parser(utf8 == nullptr ? std::string_view{} : std::string_view(utf8));
+    if (!parsed.has_value()) {
+        if (error_message != nullptr) {
+            *error_message = std::string("unsupported ") + field_name + " value";
+        }
+        return false;
+    }
+    *output = *parsed;
+    *field_mask |= mask_value;
+    return true;
+}
+
+bool parse_intelligence_record_kind(
+    std::string_view name,
+    IntelligenceRecordKind* kind,
+    std::string* error_message
+) {
+    if (name == "all") {
+        *kind = IntelligenceRecordKind::All;
+        return true;
+    }
+    if (name == "task" || name == "tasks") {
+        *kind = IntelligenceRecordKind::Tasks;
+        return true;
+    }
+    if (name == "claim" || name == "claims") {
+        *kind = IntelligenceRecordKind::Claims;
+        return true;
+    }
+    if (name == "evidence") {
+        *kind = IntelligenceRecordKind::Evidence;
+        return true;
+    }
+    if (name == "decision" || name == "decisions") {
+        *kind = IntelligenceRecordKind::Decisions;
+        return true;
+    }
+    if (name == "memory" || name == "memories") {
+        *kind = IntelligenceRecordKind::Memories;
+        return true;
+    }
+    if (error_message != nullptr) {
+        *error_message = "kind must be one of all, tasks, claims, evidence, decisions, memories";
+    }
+    return false;
 }
 
 struct StateProxy {
@@ -954,6 +1213,124 @@ static PyTypeObject ConfigProxyType = {
     0,                                /* tp_free */
 };
 
+struct StreamIterator {
+    PyObject_HEAD
+    PyObject* owner_ref{nullptr};
+    const GraphHandle* handle{nullptr};
+    std::vector<TraceEvent> events;
+    std::size_t index{0U};
+    bool include_subgraphs{true};
+};
+
+void StreamIterator_dealloc(StreamIterator* self) {
+    self->events.~vector<TraceEvent>();
+    Py_XDECREF(self->owner_ref);
+    Py_TYPE(self)->tp_free(reinterpret_cast<PyObject*>(self));
+}
+
+PyObject* StreamIterator_iter(PyObject* self) {
+    Py_INCREF(self);
+    return self;
+}
+
+PyObject* StreamIterator_iternext(StreamIterator* self) {
+    while (self->index < self->events.size()) {
+        PyObject* result = nullptr;
+        std::string error_message;
+        if (!self->handle->build_trace_event_dict(
+                self->events[self->index++],
+                self->include_subgraphs,
+                &result,
+                &error_message
+            )) {
+            PyErr_SetString(
+                PyExc_RuntimeError,
+                error_message.empty() ? "failed to build stream event" : error_message.c_str()
+            );
+            return nullptr;
+        }
+        if (result != nullptr) {
+            return result;
+        }
+    }
+
+    PyErr_SetNone(PyExc_StopIteration);
+    return nullptr;
+}
+
+static PyTypeObject StreamIteratorType = {
+    PyVarObject_HEAD_INIT(nullptr, 0)
+    "agentcore.StreamIterator",            /* tp_name */
+    sizeof(StreamIterator),                /* tp_basicsize */
+    0,                                     /* tp_itemsize */
+    (destructor)StreamIterator_dealloc,    /* tp_dealloc */
+    0,                                     /* tp_print */
+    0,                                     /* tp_getattr */
+    0,                                     /* tp_setattr */
+    0,                                     /* tp_reserved */
+    0,                                     /* tp_repr */
+    0,                                     /* tp_as_number */
+    0,                                     /* tp_as_sequence */
+    0,                                     /* tp_as_mapping */
+    0,                                     /* tp_hash */
+    0,                                     /* tp_call */
+    0,                                     /* tp_str */
+    0,                                     /* tp_getattro */
+    0,                                     /* tp_setattro */
+    0,                                     /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT,                    /* tp_flags */
+    "Stream Iterator",                     /* tp_doc */
+    0,                                     /* tp_traverse */
+    0,                                     /* tp_clear */
+    0,                                     /* tp_richcompare */
+    0,                                     /* tp_weaklistoffset */
+    StreamIterator_iter,                   /* tp_iter */
+    (iternextfunc)StreamIterator_iternext, /* tp_iternext */
+    0,                                     /* tp_methods */
+    0,                                     /* tp_members */
+    0,                                     /* tp_getset */
+    0,                                     /* tp_base */
+    0,                                     /* tp_dict */
+    0,                                     /* tp_descr_get */
+    0,                                     /* tp_descr_set */
+    0,                                     /* tp_dictoffset */
+    0,                                     /* tp_init */
+    0,                                     /* tp_alloc */
+    0,                                     /* tp_new */
+    0,                                     /* tp_free */
+};
+
+PyObject* create_stream_iterator(
+    PyObject* owner_ref,
+    const GraphHandle* handle,
+    std::vector<TraceEvent> events,
+    bool include_subgraphs,
+    std::string* error_message
+) {
+    if (PyType_Ready(&StreamIteratorType) < 0) {
+        if (error_message != nullptr) {
+            *error_message = fetch_python_error();
+        }
+        return nullptr;
+    }
+
+    StreamIterator* self = PyObject_New(StreamIterator, &StreamIteratorType);
+    if (self == nullptr) {
+        if (error_message != nullptr) {
+            *error_message = fetch_python_error();
+        }
+        return nullptr;
+    }
+
+    self->owner_ref = owner_ref;
+    Py_XINCREF(self->owner_ref);
+    self->handle = handle;
+    new (&self->events) std::vector<TraceEvent>(std::move(events));
+    self->index = 0U;
+    self->include_subgraphs = include_subgraphs;
+    return reinterpret_cast<PyObject*>(self);
+}
+
 PyObject* create_config_proxy(PyObject* base_config, PyObject* runtime_capsule) {
     if (PyType_Ready(&ConfigProxyType) < 0) {
         return nullptr;
@@ -1063,6 +1440,408 @@ PyObject* GraphHandle::state_to_python_dict(const WorkflowState& state, const Bl
         state_key_lookup = state_key_lookup_;
     }
     return create_state_proxy(this, state, blobs, strings, names, keys, state_key_lookup);
+}
+
+BlobRef python_object_to_blob_payload(
+    PyObject* value,
+    BlobStore& blobs,
+    std::string* error_message
+) {
+    if (value == nullptr || value == Py_None) {
+        return {};
+    }
+    if (PyBytes_Check(value)) {
+        char* buffer = nullptr;
+        Py_ssize_t size = 0;
+        if (PyBytes_AsStringAndSize(value, &buffer, &size) != 0) {
+            if (error_message != nullptr) {
+                *error_message = fetch_python_error();
+            }
+            return {};
+        }
+        return append_tagged_blob(
+            blobs,
+            kBytesBlobTag,
+            reinterpret_cast<const std::byte*>(buffer),
+            static_cast<std::size_t>(size)
+        );
+    }
+
+    std::vector<std::byte> pickle_bytes;
+    if (!dump_object_as_pickle_bytes(value, &pickle_bytes, error_message)) {
+        return {};
+    }
+    return append_tagged_blob(blobs, kPickleBlobTag, pickle_bytes.data(), pickle_bytes.size());
+}
+
+PyObject* intelligence_blob_to_python(
+    const GraphHandle& handle,
+    BlobRef ref,
+    const BlobStore& blobs,
+    const StringInterner& strings,
+    std::string* error_message
+) {
+    if (ref.empty()) {
+        Py_RETURN_NONE;
+    }
+    return handle.convert_value_to_python(Value{ref}, blobs, strings, error_message);
+}
+
+PyObject* intelligence_snapshot_to_python(
+    const GraphHandle& handle,
+    const IntelligenceSnapshot& snapshot,
+    const BlobStore& blobs,
+    const StringInterner& strings,
+    std::string* error_message
+) {
+    PyObject* dict = PyDict_New();
+    if (dict == nullptr) {
+        if (error_message != nullptr) {
+            *error_message = fetch_python_error();
+        }
+        return nullptr;
+    }
+
+    const auto append_common_key = [&](PyObject* target, const char* field_name, InternedStringId key) -> bool {
+        PyObject* value = nullptr;
+        if (key == 0U) {
+            Py_INCREF(Py_None);
+            value = Py_None;
+        } else {
+            value = unicode_from_utf8(strings.resolve(key));
+        }
+        return set_python_dict_item(target, field_name, value, error_message);
+    };
+
+    const auto build_tasks = [&]() -> PyObject* {
+        PyObject* list = PyList_New(0);
+        if (list == nullptr) {
+            return nullptr;
+        }
+        for (const IntelligenceTask& task : snapshot.tasks) {
+            PyObject* item = PyDict_New();
+            if (item == nullptr ||
+                !set_python_dict_item(item, "id", PyLong_FromUnsignedLong(task.id), error_message) ||
+                !append_common_key(item, "key", task.key) ||
+                !append_common_key(item, "title", task.title) ||
+                !append_common_key(item, "owner", task.owner) ||
+                !set_python_dict_item(
+                    item,
+                    "status",
+                    unicode_from_utf8(intelligence_task_status_name(task.status)),
+                    error_message
+                ) ||
+                !set_python_dict_item(item, "priority", PyLong_FromLong(task.priority), error_message) ||
+                !set_python_dict_item(item, "confidence", PyFloat_FromDouble(task.confidence), error_message) ||
+                !set_python_dict_item(
+                    item,
+                    "payload",
+                    intelligence_blob_to_python(handle, task.payload, blobs, strings, error_message),
+                    error_message
+                ) ||
+                !set_python_dict_item(
+                    item,
+                    "result",
+                    intelligence_blob_to_python(handle, task.result, blobs, strings, error_message),
+                    error_message
+                )) {
+                Py_XDECREF(item);
+                Py_DECREF(list);
+                return nullptr;
+            }
+            if (PyList_Append(list, item) != 0) {
+                Py_DECREF(item);
+                Py_DECREF(list);
+                if (error_message != nullptr) {
+                    *error_message = fetch_python_error();
+                }
+                return nullptr;
+            }
+            Py_DECREF(item);
+        }
+        return list;
+    };
+
+    const auto build_claims = [&]() -> PyObject* {
+        PyObject* list = PyList_New(0);
+        if (list == nullptr) {
+            return nullptr;
+        }
+        for (const IntelligenceClaim& claim : snapshot.claims) {
+            PyObject* item = PyDict_New();
+            if (item == nullptr ||
+                !set_python_dict_item(item, "id", PyLong_FromUnsignedLong(claim.id), error_message) ||
+                !append_common_key(item, "key", claim.key) ||
+                !append_common_key(item, "subject", claim.subject_label) ||
+                !append_common_key(item, "relation", claim.relation) ||
+                !append_common_key(item, "object", claim.object_label) ||
+                !set_python_dict_item(
+                    item,
+                    "status",
+                    unicode_from_utf8(intelligence_claim_status_name(claim.status)),
+                    error_message
+                ) ||
+                !set_python_dict_item(item, "confidence", PyFloat_FromDouble(claim.confidence), error_message) ||
+                !set_python_dict_item(
+                    item,
+                    "statement",
+                    intelligence_blob_to_python(handle, claim.statement, blobs, strings, error_message),
+                    error_message
+                )) {
+                Py_XDECREF(item);
+                Py_DECREF(list);
+                return nullptr;
+            }
+            if (PyList_Append(list, item) != 0) {
+                Py_DECREF(item);
+                Py_DECREF(list);
+                if (error_message != nullptr) {
+                    *error_message = fetch_python_error();
+                }
+                return nullptr;
+            }
+            Py_DECREF(item);
+        }
+        return list;
+    };
+
+    const auto build_evidence = [&]() -> PyObject* {
+        PyObject* list = PyList_New(0);
+        if (list == nullptr) {
+            return nullptr;
+        }
+        for (const IntelligenceEvidence& evidence : snapshot.evidence) {
+            PyObject* item = PyDict_New();
+            if (item == nullptr ||
+                !set_python_dict_item(item, "id", PyLong_FromUnsignedLong(evidence.id), error_message) ||
+                !append_common_key(item, "key", evidence.key) ||
+                !append_common_key(item, "kind", evidence.kind) ||
+                !append_common_key(item, "source", evidence.source) ||
+                !append_common_key(item, "task_key", evidence.task_key) ||
+                !append_common_key(item, "claim_key", evidence.claim_key) ||
+                !set_python_dict_item(item, "confidence", PyFloat_FromDouble(evidence.confidence), error_message) ||
+                !set_python_dict_item(
+                    item,
+                    "content",
+                    intelligence_blob_to_python(handle, evidence.content, blobs, strings, error_message),
+                    error_message
+                )) {
+                Py_XDECREF(item);
+                Py_DECREF(list);
+                return nullptr;
+            }
+            if (PyList_Append(list, item) != 0) {
+                Py_DECREF(item);
+                Py_DECREF(list);
+                if (error_message != nullptr) {
+                    *error_message = fetch_python_error();
+                }
+                return nullptr;
+            }
+            Py_DECREF(item);
+        }
+        return list;
+    };
+
+    const auto build_decisions = [&]() -> PyObject* {
+        PyObject* list = PyList_New(0);
+        if (list == nullptr) {
+            return nullptr;
+        }
+        for (const IntelligenceDecision& decision : snapshot.decisions) {
+            PyObject* item = PyDict_New();
+            if (item == nullptr ||
+                !set_python_dict_item(item, "id", PyLong_FromUnsignedLong(decision.id), error_message) ||
+                !append_common_key(item, "key", decision.key) ||
+                !append_common_key(item, "task_key", decision.task_key) ||
+                !append_common_key(item, "claim_key", decision.claim_key) ||
+                !set_python_dict_item(
+                    item,
+                    "status",
+                    unicode_from_utf8(intelligence_decision_status_name(decision.status)),
+                    error_message
+                ) ||
+                !set_python_dict_item(item, "confidence", PyFloat_FromDouble(decision.confidence), error_message) ||
+                !set_python_dict_item(
+                    item,
+                    "summary",
+                    intelligence_blob_to_python(handle, decision.summary, blobs, strings, error_message),
+                    error_message
+                )) {
+                Py_XDECREF(item);
+                Py_DECREF(list);
+                return nullptr;
+            }
+            if (PyList_Append(list, item) != 0) {
+                Py_DECREF(item);
+                Py_DECREF(list);
+                if (error_message != nullptr) {
+                    *error_message = fetch_python_error();
+                }
+                return nullptr;
+            }
+            Py_DECREF(item);
+        }
+        return list;
+    };
+
+    const auto build_memories = [&]() -> PyObject* {
+        PyObject* list = PyList_New(0);
+        if (list == nullptr) {
+            return nullptr;
+        }
+        for (const IntelligenceMemoryEntry& memory : snapshot.memories) {
+            PyObject* item = PyDict_New();
+            if (item == nullptr ||
+                !set_python_dict_item(item, "id", PyLong_FromUnsignedLong(memory.id), error_message) ||
+                !append_common_key(item, "key", memory.key) ||
+                !append_common_key(item, "scope", memory.scope) ||
+                !append_common_key(item, "task_key", memory.task_key) ||
+                !append_common_key(item, "claim_key", memory.claim_key) ||
+                !set_python_dict_item(
+                    item,
+                    "layer",
+                    unicode_from_utf8(intelligence_memory_layer_name(memory.layer)),
+                    error_message
+                ) ||
+                !set_python_dict_item(item, "importance", PyFloat_FromDouble(memory.importance), error_message) ||
+                !set_python_dict_item(
+                    item,
+                    "content",
+                    intelligence_blob_to_python(handle, memory.content, blobs, strings, error_message),
+                    error_message
+                )) {
+                Py_XDECREF(item);
+                Py_DECREF(list);
+                return nullptr;
+            }
+            if (PyList_Append(list, item) != 0) {
+                Py_DECREF(item);
+                Py_DECREF(list);
+                if (error_message != nullptr) {
+                    *error_message = fetch_python_error();
+                }
+                return nullptr;
+            }
+            Py_DECREF(item);
+        }
+        return list;
+    };
+
+    PyObject* counts = PyDict_New();
+    if (counts == nullptr ||
+        !set_python_dict_item(counts, "tasks", PyLong_FromUnsignedLong(snapshot.tasks.size()), error_message) ||
+        !set_python_dict_item(counts, "claims", PyLong_FromUnsignedLong(snapshot.claims.size()), error_message) ||
+        !set_python_dict_item(counts, "evidence", PyLong_FromUnsignedLong(snapshot.evidence.size()), error_message) ||
+        !set_python_dict_item(counts, "decisions", PyLong_FromUnsignedLong(snapshot.decisions.size()), error_message) ||
+        !set_python_dict_item(counts, "memories", PyLong_FromUnsignedLong(snapshot.memories.size()), error_message)) {
+        Py_XDECREF(counts);
+        Py_DECREF(dict);
+        return nullptr;
+    }
+    if (!set_python_dict_item(dict, "counts", counts, error_message) ||
+        !set_python_dict_item(dict, "tasks", build_tasks(), error_message) ||
+        !set_python_dict_item(dict, "claims", build_claims(), error_message) ||
+        !set_python_dict_item(dict, "evidence", build_evidence(), error_message) ||
+        !set_python_dict_item(dict, "decisions", build_decisions(), error_message) ||
+        !set_python_dict_item(dict, "memories", build_memories(), error_message)) {
+        Py_DECREF(dict);
+        return nullptr;
+    }
+
+    return dict;
+}
+
+PyObject* intelligence_summary_to_python(
+    const IntelligenceOperationalSummary& summary,
+    std::string* error_message
+) {
+    PyObject* dict = PyDict_New();
+    if (dict == nullptr) {
+        if (error_message != nullptr) {
+            *error_message = fetch_python_error();
+        }
+        return nullptr;
+    }
+
+    PyObject* counts = PyDict_New();
+    PyObject* task_status = PyDict_New();
+    PyObject* claim_status = PyDict_New();
+    PyObject* decision_status = PyDict_New();
+    PyObject* memory_layers = PyDict_New();
+    if (counts == nullptr ||
+        task_status == nullptr ||
+        claim_status == nullptr ||
+        decision_status == nullptr ||
+        memory_layers == nullptr ||
+        !set_python_dict_item(counts, "tasks", PyLong_FromUnsignedLong(summary.task_count), error_message) ||
+        !set_python_dict_item(counts, "claims", PyLong_FromUnsignedLong(summary.claim_count), error_message) ||
+        !set_python_dict_item(counts, "evidence", PyLong_FromUnsignedLong(summary.evidence_count), error_message) ||
+        !set_python_dict_item(counts, "decisions", PyLong_FromUnsignedLong(summary.decision_count), error_message) ||
+        !set_python_dict_item(counts, "memories", PyLong_FromUnsignedLong(summary.memory_count), error_message) ||
+        !set_python_dict_item(task_status, "open", PyLong_FromUnsignedLong(summary.open_task_count), error_message) ||
+        !set_python_dict_item(task_status, "in_progress", PyLong_FromUnsignedLong(summary.in_progress_task_count), error_message) ||
+        !set_python_dict_item(task_status, "blocked", PyLong_FromUnsignedLong(summary.blocked_task_count), error_message) ||
+        !set_python_dict_item(task_status, "completed", PyLong_FromUnsignedLong(summary.completed_task_count), error_message) ||
+        !set_python_dict_item(task_status, "cancelled", PyLong_FromUnsignedLong(summary.cancelled_task_count), error_message) ||
+        !set_python_dict_item(claim_status, "proposed", PyLong_FromUnsignedLong(summary.proposed_claim_count), error_message) ||
+        !set_python_dict_item(claim_status, "supported", PyLong_FromUnsignedLong(summary.supported_claim_count), error_message) ||
+        !set_python_dict_item(claim_status, "disputed", PyLong_FromUnsignedLong(summary.disputed_claim_count), error_message) ||
+        !set_python_dict_item(claim_status, "confirmed", PyLong_FromUnsignedLong(summary.confirmed_claim_count), error_message) ||
+        !set_python_dict_item(claim_status, "rejected", PyLong_FromUnsignedLong(summary.rejected_claim_count), error_message) ||
+        !set_python_dict_item(decision_status, "pending", PyLong_FromUnsignedLong(summary.pending_decision_count), error_message) ||
+        !set_python_dict_item(decision_status, "selected", PyLong_FromUnsignedLong(summary.selected_decision_count), error_message) ||
+        !set_python_dict_item(decision_status, "superseded", PyLong_FromUnsignedLong(summary.superseded_decision_count), error_message) ||
+        !set_python_dict_item(decision_status, "rejected", PyLong_FromUnsignedLong(summary.rejected_decision_count), error_message) ||
+        !set_python_dict_item(memory_layers, "working", PyLong_FromUnsignedLong(summary.working_memory_count), error_message) ||
+        !set_python_dict_item(memory_layers, "episodic", PyLong_FromUnsignedLong(summary.episodic_memory_count), error_message) ||
+        !set_python_dict_item(memory_layers, "semantic", PyLong_FromUnsignedLong(summary.semantic_memory_count), error_message) ||
+        !set_python_dict_item(memory_layers, "procedural", PyLong_FromUnsignedLong(summary.procedural_memory_count), error_message)) {
+        Py_XDECREF(counts);
+        Py_XDECREF(task_status);
+        Py_XDECREF(claim_status);
+        Py_XDECREF(decision_status);
+        Py_XDECREF(memory_layers);
+        Py_DECREF(dict);
+        return nullptr;
+    }
+    if (!set_python_dict_item(dict, "counts", counts, error_message)) {
+        Py_XDECREF(task_status);
+        Py_XDECREF(claim_status);
+        Py_XDECREF(decision_status);
+        Py_XDECREF(memory_layers);
+        Py_DECREF(dict);
+        return nullptr;
+    }
+    counts = nullptr;
+    if (!set_python_dict_item(dict, "task_status", task_status, error_message)) {
+        Py_XDECREF(claim_status);
+        Py_XDECREF(decision_status);
+        Py_XDECREF(memory_layers);
+        Py_DECREF(dict);
+        return nullptr;
+    }
+    task_status = nullptr;
+    if (!set_python_dict_item(dict, "claim_status", claim_status, error_message)) {
+        Py_XDECREF(decision_status);
+        Py_XDECREF(memory_layers);
+        Py_DECREF(dict);
+        return nullptr;
+    }
+    claim_status = nullptr;
+    if (!set_python_dict_item(dict, "decision_status", decision_status, error_message)) {
+        Py_XDECREF(memory_layers);
+        Py_DECREF(dict);
+        return nullptr;
+    }
+    decision_status = nullptr;
+    if (!set_python_dict_item(dict, "memory_layers", memory_layers, error_message)) {
+        Py_DECREF(dict);
+        return nullptr;
+    }
+    memory_layers = nullptr;
+
+    return dict;
 }
 
 PyObject* GraphHandle::convert_value_to_python(const Value& value, const BlobStore& blobs, const StringInterner& strings, std::string* error_message) const {
@@ -1179,7 +1958,16 @@ StateKey GraphHandle::ensure_state_key_locked(std::string_view state_name) {
     return key;
 }
 
-bool GraphHandle::add_node(std::string_view name, PyObject* callback, NodeKind kind, uint32_t policy_flags, const NodeMemoizationPolicy& memoization, const std::vector<std::pair<std::string, JoinMergeStrategy>>& merge_rules, std::string* error_message) {
+bool GraphHandle::add_node(
+    std::string_view name,
+    PyObject* callback,
+    NodeKind kind,
+    uint32_t policy_flags,
+    const NodeMemoizationPolicy& memoization,
+    const std::vector<IntelligenceSubscription>& intelligence_subscriptions,
+    const std::vector<std::pair<std::string, JoinMergeStrategy>>& merge_rules,
+    std::string* error_message
+) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (node_ids_by_name_.count(std::string(name))) {
         *error_message = "Node with name '" + std::string(name) + "' already exists";
@@ -1202,7 +1990,8 @@ bool GraphHandle::add_node(std::string_view name, PyObject* callback, NodeKind k
         kind,
         policy_flags,
         std::move(rules),
-        memoization
+        memoization,
+        intelligence_subscriptions
     });
     node_binding_indices_[node_id] = node_bindings_.size() - 1U;
 
@@ -1243,6 +2032,7 @@ bool GraphHandle::add_subgraph_node(std::string_view name, GraphHandle* subgraph
         nullptr,
         NodeKind::Subgraph,
         0U,
+        {},
         {},
         {},
         sb,
@@ -1318,7 +2108,8 @@ bool GraphHandle::finalize_locked(std::string* error_message) {
             binding.merge_rules,
             {},
             binding.subgraph,
-            binding.memoization
+            binding.memoization,
+            binding.intelligence_subscriptions
         });
     }
 
@@ -1369,31 +2160,47 @@ bool GraphHandle::register_graph_hierarchy(ExecutionEngine& target_engine, std::
     return true;
 }
 
-bool GraphHandle::execute_run(PyObject* input_state, PyObject* config, bool include_subgraphs, bool until_pause, RunArtifacts* artifacts, std::string* error_message) {
+bool GraphHandle::execute_run_core(
+    PyObject* input_state,
+    PyObject* config,
+    bool until_pause,
+    const RunCaptureOptions& capture_options,
+    RunId* run_id,
+    RunResult* result,
+    std::string* error_message
+) {
     if (!ensure_finalized(error_message)) return false;
     if (!register_graph_hierarchy(*engine_, error_message)) return false;
 
     InputEnvelope envelope;
     if (!build_initial_envelope(input_state, config, &envelope, error_message)) return false;
 
-    RunId run_id = engine_->start(graph_, envelope);
+    const RunId started_run_id = engine_->start(graph_, envelope, capture_options);
+    const auto cleanup_active_config = [&]() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = active_configs_.find(started_run_id);
+        if (it != active_configs_.end()) {
+            Py_XDECREF(it->second);
+            active_configs_.erase(it);
+        }
+    };
 
     if (config && config != Py_None) {
         std::lock_guard<std::mutex> lock(mutex_);
         Py_INCREF(config);
-        active_configs_[run_id] = config;
+        active_configs_[started_run_id] = config;
     }
 
-    RunResult result;
+    RunResult local_result;
     if (until_pause) {
         Py_BEGIN_ALLOW_THREADS
         while (true) {
-            const StepResult step_result = engine_->step(run_id);
-            result.run_id = run_id;
-            result.status = step_result.status;
-            result.last_checkpoint_id = step_result.checkpoint_id;
+            const StepResult step_result = engine_->step(started_run_id);
+            local_result.run_id = started_run_id;
+            local_result.status = step_result.status;
+            local_result.last_checkpoint_id = step_result.checkpoint_id;
             if (step_result.progressed) {
-                result.steps_executed += 1U;
+                local_result.steps_executed += 1U;
             }
 
             if (step_result.waiting ||
@@ -1408,38 +2215,94 @@ bool GraphHandle::execute_run(PyObject* input_state, PyObject* config, bool incl
         Py_END_ALLOW_THREADS
     } else {
         Py_BEGIN_ALLOW_THREADS
-        result = engine_->run_to_completion(run_id);
+        local_result = engine_->run_to_completion(started_run_id);
         Py_END_ALLOW_THREADS
     }
 
-    bool ok = populate_run_artifacts(run_id, result, include_subgraphs, artifacts, error_message);
+    cleanup_active_config();
+    *run_id = started_run_id;
+    *result = local_result;
+    return true;
+}
 
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = active_configs_.find(run_id);
-        if (it != active_configs_.end()) {
-            Py_XDECREF(it->second);
-            active_configs_.erase(it);
-        }
+bool GraphHandle::execute_run(PyObject* input_state, PyObject* config, bool include_subgraphs, bool until_pause, RunArtifacts* artifacts, std::string* error_message) {
+    RunId run_id = 0U;
+    RunResult result;
+    if (!execute_run_core(
+            input_state,
+            config,
+            until_pause,
+            RunCaptureOptions{},
+            &run_id,
+            &result,
+            error_message
+        )) {
+        return false;
     }
 
-    return ok;
+    return populate_run_artifacts(run_id, result, include_subgraphs, artifacts, error_message);
 }
 
 bool GraphHandle::invoke(PyObject* input_state, PyObject* config, PyObject** result, std::string* error_message) {
-    RunArtifacts artifacts;
-    if (!execute_run(input_state, config, true, false, &artifacts, error_message)) return false;
-    *result = artifacts.state;
-    Py_XDECREF(artifacts.trace);
-    return true;
+    RunId run_id = 0U;
+    RunResult run_result;
+    if (!execute_run_core(
+            input_state,
+            config,
+            false,
+            RunCaptureOptions{false, false},
+            &run_id,
+            &run_result,
+            error_message
+        )) {
+        return false;
+    }
+
+    static_cast<void>(run_result);
+    const auto& store = engine_->state_store(run_id);
+    *result = state_to_python_dict(
+        engine_->state(run_id),
+        store.blobs(),
+        store.strings(),
+        error_message
+    );
+    engine_->discard_run(run_id);
+    return *result != nullptr;
 }
 
-bool GraphHandle::stream(PyObject* input_state, PyObject* config, bool include_subgraphs, PyObject** result, std::string* error_message) {
-    RunArtifacts artifacts;
-    if (!execute_run(input_state, config, include_subgraphs, false, &artifacts, error_message)) return false;
-    *result = artifacts.trace;
-    Py_XDECREF(artifacts.state);
-    return true;
+bool GraphHandle::stream(
+    PyObject* input_state,
+    PyObject* config,
+    bool include_subgraphs,
+    PyObject* owner_ref,
+    PyObject** result,
+    std::string* error_message
+) {
+    RunId run_id = 0U;
+    RunResult run_result;
+    if (!execute_run_core(
+            input_state,
+            config,
+            false,
+            RunCaptureOptions{false, true},
+            &run_id,
+            &run_result,
+            error_message
+        )) {
+        return false;
+    }
+
+    static_cast<void>(run_result);
+    std::vector<TraceEvent> events = engine_->trace().take_events_for_run(run_id);
+    engine_->discard_run(run_id);
+    *result = create_stream_iterator(
+        owner_ref,
+        this,
+        std::move(events),
+        include_subgraphs,
+        error_message
+    );
+    return *result != nullptr;
 }
 
 bool GraphHandle::invoke_with_details(PyObject* input_state, PyObject* config, bool include_subgraphs, PyObject** result, std::string* error_message) {
@@ -1448,6 +2311,7 @@ bool GraphHandle::invoke_with_details(PyObject* input_state, PyObject* config, b
     *result = build_details_dict(artifacts, error_message);
     Py_XDECREF(artifacts.state);
     Py_XDECREF(artifacts.trace);
+    Py_XDECREF(artifacts.intelligence);
     return *result != nullptr;
 }
 
@@ -1457,6 +2321,7 @@ bool GraphHandle::invoke_until_pause_with_details(PyObject* input_state, PyObjec
     *result = build_details_dict(artifacts, error_message);
     Py_XDECREF(artifacts.state);
     Py_XDECREF(artifacts.trace);
+    Py_XDECREF(artifacts.intelligence);
     return *result != nullptr;
 }
 
@@ -1489,6 +2354,7 @@ bool GraphHandle::resume_with_details(CheckpointId checkpoint_id, bool include_s
     *result = build_details_dict(artifacts, error_message);
     Py_XDECREF(artifacts.state);
     Py_XDECREF(artifacts.trace);
+    Py_XDECREF(artifacts.intelligence);
     return *result != nullptr;
 }
 
@@ -1496,6 +2362,13 @@ bool GraphHandle::populate_run_artifacts(RunId run_id, const RunResult& run_resu
     const auto& store = engine_->state_store(run_id);
     artifacts->state = state_to_python_dict(engine_->state(run_id), store.blobs(), store.strings(), error_message);
     artifacts->trace = build_trace_list(run_id, include_subgraphs, error_message);
+    artifacts->intelligence = intelligence_snapshot_to_python(
+        *this,
+        store.intelligence().snapshot(),
+        store.blobs(),
+        store.strings(),
+        error_message
+    );
     artifacts->run_id = run_id;
     artifacts->result = run_result;
     // Compute proof digest if possible
@@ -1504,11 +2377,149 @@ bool GraphHandle::populate_run_artifacts(RunId run_id, const RunResult& run_resu
     } catch (...) {
         artifacts->proof = {};
     }
-    return artifacts->state && artifacts->trace;
+    return artifacts->state && artifacts->trace && artifacts->intelligence;
+}
+
+bool GraphHandle::build_trace_event_dict(
+    const TraceEvent& event,
+    bool include_subgraphs,
+    PyObject** result,
+    std::string* error_message
+) const {
+    *result = nullptr;
+    if (!include_subgraphs && !event.namespace_path.empty()) {
+        return true;
+    }
+
+    const auto resolve_graph_handle = [this](GraphId graph_id) -> const GraphHandle* {
+        if (graph_id == graph_.id) {
+            return this;
+        }
+        return GraphHandleRegistry::instance().find(graph_id);
+    };
+
+    const auto resolve_graph = [this, &resolve_graph_handle](GraphId graph_id) -> const GraphDefinition& {
+        const GraphHandle* handle = resolve_graph_handle(graph_id);
+        return handle == nullptr ? graph_ : handle->graph_;
+    };
+
+    const NodeDefinition* node = resolve_graph(event.graph_id).find_node(event.node_id);
+    if (node == nullptr) {
+        return true;
+    }
+
+    const std::string name = node->name;
+    if (name == kInternalBootstrapNodeName || name == kInternalEndNodeName) {
+        return true;
+    }
+
+    const std::string graph_name = resolve_graph(event.graph_id).name;
+
+    PyObject* dict = PyDict_New();
+    if (dict == nullptr) {
+        if (error_message != nullptr) {
+            *error_message = fetch_python_error();
+        }
+        return false;
+    }
+
+    PyObject* namespaces = PyList_New(static_cast<Py_ssize_t>(event.namespace_path.size()));
+    if (namespaces == nullptr) {
+        Py_DECREF(dict);
+        if (error_message != nullptr) {
+            *error_message = fetch_python_error();
+        }
+        return false;
+    }
+
+    Py_ssize_t namespace_index = 0;
+    for (const ExecutionNamespaceRef& frame : event.namespace_path) {
+        const GraphDefinition& namespace_graph = resolve_graph(frame.graph_id);
+        const NodeDefinition* namespace_node = namespace_graph.find_node(frame.node_id);
+        std::string namespace_node_name;
+        if (namespace_node != nullptr) {
+            if (namespace_node->kind == NodeKind::Subgraph &&
+                namespace_node->subgraph.has_value() &&
+                !namespace_node->subgraph->namespace_name.empty()) {
+                namespace_node_name = namespace_node->subgraph->namespace_name;
+            } else {
+                namespace_node_name = namespace_node->name;
+            }
+        }
+
+        PyObject* frame_dict = PyDict_New();
+        if (frame_dict == nullptr ||
+            !set_python_dict_item(
+                frame_dict,
+                "graph_name",
+                unicode_from_utf8(namespace_graph.name),
+                error_message
+            ) ||
+            !set_python_dict_item(
+                frame_dict,
+                "node_name",
+                unicode_from_utf8(namespace_node_name),
+                error_message
+            ) ||
+            !set_python_dict_item(
+                frame_dict,
+                "session_id",
+                unicode_from_utf8(frame.session_id),
+                error_message
+            ) ||
+            !set_python_dict_item(
+                frame_dict,
+                "session_revision",
+                PyLong_FromUnsignedLongLong(frame.session_revision),
+                error_message
+            )) {
+            Py_XDECREF(frame_dict);
+            Py_DECREF(namespaces);
+            Py_DECREF(dict);
+            return false;
+        }
+        PyList_SET_ITEM(namespaces, namespace_index++, frame_dict);
+    }
+
+    if (!set_python_dict_item(dict, "node_name", unicode_from_utf8(name), error_message) ||
+        !set_python_dict_item(dict, "graph_name", unicode_from_utf8(graph_name), error_message) ||
+        !set_python_dict_item(
+            dict,
+            "session_id",
+            unicode_from_utf8(event.session_id),
+            error_message
+        ) ||
+        !set_python_dict_item(
+            dict,
+            "session_revision",
+            PyLong_FromUnsignedLongLong(event.session_revision),
+            error_message
+        ) ||
+        !set_python_dict_item(dict, "namespaces", namespaces, error_message)) {
+        Py_DECREF(dict);
+        return false;
+    }
+
+    *result = dict;
+    return true;
 }
 
 PyObject* GraphHandle::build_trace_list(RunId run_id, bool include_subgraphs, std::string* error_message) const {
-    PyObject* list = PyList_New(0);
+    const std::vector<TraceEvent> events = engine_->trace().events_for_run_since_sequence(run_id, 1U);
+
+    std::size_t visible_event_count = 0U;
+    for (const TraceEvent& event : events) {
+        PyObject* event_dict = nullptr;
+        if (!build_trace_event_dict(event, include_subgraphs, &event_dict, error_message)) {
+            return nullptr;
+        }
+        if (event_dict != nullptr) {
+            ++visible_event_count;
+            Py_DECREF(event_dict);
+        }
+    }
+
+    PyObject* list = PyList_New(static_cast<Py_ssize_t>(visible_event_count));
     if (list == nullptr) {
         if (error_message != nullptr) {
             *error_message = fetch_python_error();
@@ -1516,119 +2527,17 @@ PyObject* GraphHandle::build_trace_list(RunId run_id, bool include_subgraphs, st
         return nullptr;
     }
 
-    StreamCursor cursor;
-    const std::vector<StreamEvent> events = engine_->stream_events(
-        run_id,
-        cursor,
-        StreamReadOptions{include_subgraphs}
-    );
-
-    for (const StreamEvent& event : events) {
-        const GraphHandle* event_handle = GraphHandleRegistry::instance().find(event.graph_id);
-        const std::string name = event_handle == nullptr
-            ? node_name(event.node_id)
-            : event_handle->node_name(event.node_id);
-        const std::string graph_name = event_handle == nullptr
-            ? graph_.name
-            : event_handle->graph_.name;
-        if (name == kInternalBootstrapNodeName || name == kInternalEndNodeName) {
+    Py_ssize_t event_index = 0;
+    for (const TraceEvent& event : events) {
+        PyObject* event_dict = nullptr;
+        if (!build_trace_event_dict(event, include_subgraphs, &event_dict, error_message)) {
+            Py_DECREF(list);
+            return nullptr;
+        }
+        if (event_dict == nullptr) {
             continue;
         }
-
-        PyObject* dict = PyDict_New();
-        if (dict == nullptr) {
-            Py_DECREF(list);
-            if (error_message != nullptr) {
-                *error_message = fetch_python_error();
-            }
-            return nullptr;
-        }
-
-        PyObject* namespaces = PyList_New(0);
-        if (namespaces == nullptr) {
-            Py_DECREF(dict);
-            Py_DECREF(list);
-            if (error_message != nullptr) {
-                *error_message = fetch_python_error();
-            }
-            return nullptr;
-        }
-
-        for (const StreamNamespaceFrame& frame : event.namespaces) {
-            PyObject* frame_dict = PyDict_New();
-            if (frame_dict == nullptr ||
-                !set_python_dict_item(
-                    frame_dict,
-                    "graph_name",
-                    unicode_from_utf8(frame.graph_name),
-                    error_message
-                ) ||
-                !set_python_dict_item(
-                    frame_dict,
-                    "node_name",
-                    unicode_from_utf8(frame.node_name),
-                    error_message
-                ) ||
-                !set_python_dict_item(
-                    frame_dict,
-                    "session_id",
-                    unicode_from_utf8(frame.session_id),
-                    error_message
-                ) ||
-                !set_python_dict_item(
-                    frame_dict,
-                    "session_revision",
-                    PyLong_FromUnsignedLongLong(frame.session_revision),
-                    error_message
-                )) {
-                Py_XDECREF(frame_dict);
-                Py_DECREF(namespaces);
-                Py_DECREF(dict);
-                Py_DECREF(list);
-                return nullptr;
-            }
-            if (PyList_Append(namespaces, frame_dict) != 0) {
-                Py_DECREF(frame_dict);
-                Py_DECREF(namespaces);
-                Py_DECREF(dict);
-                Py_DECREF(list);
-                if (error_message != nullptr) {
-                    *error_message = fetch_python_error();
-                }
-                return nullptr;
-            }
-            Py_DECREF(frame_dict);
-        }
-
-        if (!set_python_dict_item(dict, "node_name", unicode_from_utf8(name), error_message) ||
-            !set_python_dict_item(dict, "graph_name", unicode_from_utf8(graph_name), error_message) ||
-            !set_python_dict_item(
-                dict,
-                "session_id",
-                unicode_from_utf8(event.session_id),
-                error_message
-            ) ||
-            !set_python_dict_item(
-                dict,
-                "session_revision",
-                PyLong_FromUnsignedLongLong(event.session_revision),
-                error_message
-            ) ||
-            !set_python_dict_item(dict, "namespaces", namespaces, error_message)) {
-            Py_DECREF(dict);
-            Py_DECREF(list);
-            return nullptr;
-        }
-
-        if (PyList_Append(list, dict) != 0) {
-            Py_DECREF(dict);
-            Py_DECREF(list);
-            if (error_message != nullptr) {
-                *error_message = fetch_python_error();
-            }
-            return nullptr;
-        }
-        Py_DECREF(dict);
+        PyList_SET_ITEM(list, event_index++, event_dict);
     }
     return list;
 }
@@ -1637,6 +2546,7 @@ PyObject* GraphHandle::build_details_dict(const RunArtifacts& artifacts, std::st
     PyObject* dict = PyDict_New();
     PyDict_SetItemString(dict, "state", artifacts.state);
     PyDict_SetItemString(dict, "trace", artifacts.trace);
+    PyDict_SetItemString(dict, "intelligence", artifacts.intelligence);
 
     PyObject* summary = PyDict_New();
     const char* status_str = "unknown";
@@ -2318,6 +3228,7 @@ NodeResult python_node_executor(ExecutionContext& ctx) {
     }
     PyObject* result = PyObject_CallObject(binding->callback, args);
 
+    const IntelligencePatch pending_intelligence_patch = runtime_view->pending_intelligence_patch;
     runtime_view->active.store(false, std::memory_order_release);
 
     Py_DECREF(args);
@@ -2380,6 +3291,34 @@ NodeResult python_node_executor(ExecutionContext& ctx) {
             PyGILState_Release(gil);
             return NodeResult{NodeResult::HardFail};
         }
+    }
+
+    if (!pending_intelligence_patch.empty()) {
+        node_result.patch.intelligence.tasks.insert(
+            node_result.patch.intelligence.tasks.end(),
+            pending_intelligence_patch.tasks.begin(),
+            pending_intelligence_patch.tasks.end()
+        );
+        node_result.patch.intelligence.claims.insert(
+            node_result.patch.intelligence.claims.end(),
+            pending_intelligence_patch.claims.begin(),
+            pending_intelligence_patch.claims.end()
+        );
+        node_result.patch.intelligence.evidence.insert(
+            node_result.patch.intelligence.evidence.end(),
+            pending_intelligence_patch.evidence.begin(),
+            pending_intelligence_patch.evidence.end()
+        );
+        node_result.patch.intelligence.decisions.insert(
+            node_result.patch.intelligence.decisions.end(),
+            pending_intelligence_patch.decisions.begin(),
+            pending_intelligence_patch.decisions.end()
+        );
+        node_result.patch.intelligence.memories.insert(
+            node_result.patch.intelligence.memories.end(),
+            pending_intelligence_patch.memories.begin(),
+            pending_intelligence_patch.memories.end()
+        );
     }
 
     if (should_wait) {
@@ -2957,6 +3896,906 @@ PyObject* runtime_invoke_model(
         }
         return nullptr;
     }
+}
+
+bool runtime_stage_task_write(PyObject* capsule, PyObject* spec, std::string* error_message) {
+    RuntimeViewProxy* view = runtime_view_from_object(capsule, error_message);
+    if (view == nullptr || !require_spec_dict(spec, error_message)) {
+        return false;
+    }
+
+    IntelligenceTaskWrite write;
+    if (!parse_required_spec_string_id(spec, "key", view->runtime->strings, &write.key, error_message) ||
+        !parse_optional_spec_string_id(
+            spec,
+            "title",
+            view->runtime->strings,
+            &write.title,
+            intelligence_fields::kTaskTitle,
+            &write.field_mask,
+            error_message
+        ) ||
+        !parse_optional_spec_string_id(
+            spec,
+            "owner",
+            view->runtime->strings,
+            &write.owner,
+            intelligence_fields::kTaskOwner,
+            &write.field_mask,
+            error_message
+        ) ||
+        !parse_optional_spec_blob(
+            spec,
+            "details",
+            view->runtime->blobs,
+            &write.payload,
+            intelligence_fields::kTaskPayload,
+            &write.field_mask,
+            error_message
+        ) ||
+        !parse_optional_spec_blob(
+            spec,
+            "result",
+            view->runtime->blobs,
+            &write.result,
+            intelligence_fields::kTaskResult,
+            &write.field_mask,
+            error_message
+        ) ||
+        !parse_optional_named_enum(
+            spec,
+            "status",
+            &write.status,
+            intelligence_fields::kTaskStatus,
+            &write.field_mask,
+            parse_intelligence_task_status,
+            error_message
+        ) ||
+        !parse_optional_spec_int32(
+            spec,
+            "priority",
+            &write.priority,
+            intelligence_fields::kTaskPriority,
+            &write.field_mask,
+            error_message
+        ) ||
+        !parse_optional_spec_float(
+            spec,
+            "confidence",
+            &write.confidence,
+            intelligence_fields::kTaskConfidence,
+            &write.field_mask,
+            error_message
+        )) {
+        return false;
+    }
+
+    view->pending_intelligence_patch.tasks.push_back(write);
+    return true;
+}
+
+bool runtime_stage_claim_write(PyObject* capsule, PyObject* spec, std::string* error_message) {
+    RuntimeViewProxy* view = runtime_view_from_object(capsule, error_message);
+    if (view == nullptr || !require_spec_dict(spec, error_message)) {
+        return false;
+    }
+
+    IntelligenceClaimWrite write;
+    if (!parse_required_spec_string_id(spec, "key", view->runtime->strings, &write.key, error_message) ||
+        !parse_optional_spec_string_id(
+            spec,
+            "subject",
+            view->runtime->strings,
+            &write.subject_label,
+            intelligence_fields::kClaimSubject,
+            &write.field_mask,
+            error_message
+        ) ||
+        !parse_optional_spec_string_id(
+            spec,
+            "relation",
+            view->runtime->strings,
+            &write.relation,
+            intelligence_fields::kClaimRelation,
+            &write.field_mask,
+            error_message
+        ) ||
+        !parse_optional_spec_string_id(
+            spec,
+            "object",
+            view->runtime->strings,
+            &write.object_label,
+            intelligence_fields::kClaimObject,
+            &write.field_mask,
+            error_message
+        ) ||
+        !parse_optional_spec_blob(
+            spec,
+            "statement",
+            view->runtime->blobs,
+            &write.statement,
+            intelligence_fields::kClaimStatement,
+            &write.field_mask,
+            error_message
+        ) ||
+        !parse_optional_named_enum(
+            spec,
+            "status",
+            &write.status,
+            intelligence_fields::kClaimStatus,
+            &write.field_mask,
+            parse_intelligence_claim_status,
+            error_message
+        ) ||
+        !parse_optional_spec_float(
+            spec,
+            "confidence",
+            &write.confidence,
+            intelligence_fields::kClaimConfidence,
+            &write.field_mask,
+            error_message
+        )) {
+        return false;
+    }
+
+    view->pending_intelligence_patch.claims.push_back(write);
+    return true;
+}
+
+bool runtime_stage_evidence_write(PyObject* capsule, PyObject* spec, std::string* error_message) {
+    RuntimeViewProxy* view = runtime_view_from_object(capsule, error_message);
+    if (view == nullptr || !require_spec_dict(spec, error_message)) {
+        return false;
+    }
+
+    IntelligenceEvidenceWrite write;
+    if (!parse_required_spec_string_id(spec, "key", view->runtime->strings, &write.key, error_message) ||
+        !parse_optional_spec_string_id(
+            spec,
+            "kind",
+            view->runtime->strings,
+            &write.kind,
+            intelligence_fields::kEvidenceKind,
+            &write.field_mask,
+            error_message
+        ) ||
+        !parse_optional_spec_string_id(
+            spec,
+            "source",
+            view->runtime->strings,
+            &write.source,
+            intelligence_fields::kEvidenceSource,
+            &write.field_mask,
+            error_message
+        ) ||
+        !parse_optional_spec_blob(
+            spec,
+            "content",
+            view->runtime->blobs,
+            &write.content,
+            intelligence_fields::kEvidenceContent,
+            &write.field_mask,
+            error_message
+        ) ||
+        !parse_optional_spec_string_id(
+            spec,
+            "task_key",
+            view->runtime->strings,
+            &write.task_key,
+            intelligence_fields::kEvidenceTaskKey,
+            &write.field_mask,
+            error_message
+        ) ||
+        !parse_optional_spec_string_id(
+            spec,
+            "claim_key",
+            view->runtime->strings,
+            &write.claim_key,
+            intelligence_fields::kEvidenceClaimKey,
+            &write.field_mask,
+            error_message
+        ) ||
+        !parse_optional_spec_float(
+            spec,
+            "confidence",
+            &write.confidence,
+            intelligence_fields::kEvidenceConfidence,
+            &write.field_mask,
+            error_message
+        )) {
+        return false;
+    }
+
+    view->pending_intelligence_patch.evidence.push_back(write);
+    return true;
+}
+
+bool runtime_stage_decision_write(PyObject* capsule, PyObject* spec, std::string* error_message) {
+    RuntimeViewProxy* view = runtime_view_from_object(capsule, error_message);
+    if (view == nullptr || !require_spec_dict(spec, error_message)) {
+        return false;
+    }
+
+    IntelligenceDecisionWrite write;
+    if (!parse_required_spec_string_id(spec, "key", view->runtime->strings, &write.key, error_message) ||
+        !parse_optional_spec_string_id(
+            spec,
+            "task_key",
+            view->runtime->strings,
+            &write.task_key,
+            intelligence_fields::kDecisionTaskKey,
+            &write.field_mask,
+            error_message
+        ) ||
+        !parse_optional_spec_string_id(
+            spec,
+            "claim_key",
+            view->runtime->strings,
+            &write.claim_key,
+            intelligence_fields::kDecisionClaimKey,
+            &write.field_mask,
+            error_message
+        ) ||
+        !parse_optional_spec_blob(
+            spec,
+            "summary",
+            view->runtime->blobs,
+            &write.summary,
+            intelligence_fields::kDecisionSummary,
+            &write.field_mask,
+            error_message
+        ) ||
+        !parse_optional_named_enum(
+            spec,
+            "status",
+            &write.status,
+            intelligence_fields::kDecisionStatus,
+            &write.field_mask,
+            parse_intelligence_decision_status,
+            error_message
+        ) ||
+        !parse_optional_spec_float(
+            spec,
+            "confidence",
+            &write.confidence,
+            intelligence_fields::kDecisionConfidence,
+            &write.field_mask,
+            error_message
+        )) {
+        return false;
+    }
+
+    view->pending_intelligence_patch.decisions.push_back(write);
+    return true;
+}
+
+bool runtime_stage_memory_write(PyObject* capsule, PyObject* spec, std::string* error_message) {
+    RuntimeViewProxy* view = runtime_view_from_object(capsule, error_message);
+    if (view == nullptr || !require_spec_dict(spec, error_message)) {
+        return false;
+    }
+
+    IntelligenceMemoryWrite write;
+    if (!parse_required_spec_string_id(spec, "key", view->runtime->strings, &write.key, error_message) ||
+        !parse_optional_named_enum(
+            spec,
+            "layer",
+            &write.layer,
+            intelligence_fields::kMemoryLayer,
+            &write.field_mask,
+            parse_intelligence_memory_layer,
+            error_message
+        ) ||
+        !parse_optional_spec_string_id(
+            spec,
+            "scope",
+            view->runtime->strings,
+            &write.scope,
+            intelligence_fields::kMemoryScope,
+            &write.field_mask,
+            error_message
+        ) ||
+        !parse_optional_spec_blob(
+            spec,
+            "content",
+            view->runtime->blobs,
+            &write.content,
+            intelligence_fields::kMemoryContent,
+            &write.field_mask,
+            error_message
+        ) ||
+        !parse_optional_spec_string_id(
+            spec,
+            "task_key",
+            view->runtime->strings,
+            &write.task_key,
+            intelligence_fields::kMemoryTaskKey,
+            &write.field_mask,
+            error_message
+        ) ||
+        !parse_optional_spec_string_id(
+            spec,
+            "claim_key",
+            view->runtime->strings,
+            &write.claim_key,
+            intelligence_fields::kMemoryClaimKey,
+            &write.field_mask,
+            error_message
+        ) ||
+        !parse_optional_spec_float(
+            spec,
+            "importance",
+            &write.importance,
+            intelligence_fields::kMemoryImportance,
+            &write.field_mask,
+            error_message
+        )) {
+        return false;
+    }
+
+    view->pending_intelligence_patch.memories.push_back(write);
+    return true;
+}
+
+bool resolve_runtime_intelligence_store(
+    PyObject* capsule,
+    RuntimeViewProxy** out_view,
+    GraphHandle** out_handle,
+    IntelligenceStore* out_store,
+    std::string* error_message
+) {
+    RuntimeViewProxy* view = runtime_view_from_object(capsule, error_message);
+    if (view == nullptr) {
+        return false;
+    }
+
+    GraphHandle* handle = GraphHandleRegistry::instance().find(view->runtime->graph_id);
+    if (handle == nullptr) {
+        if (error_message != nullptr) {
+            *error_message = "Graph handle not found";
+        }
+        return false;
+    }
+
+    *out_view = view;
+    *out_handle = handle;
+    *out_store = *view->intelligence;
+    if (!view->pending_intelligence_patch.empty()) {
+        out_store->apply(view->pending_intelligence_patch);
+    }
+    return true;
+}
+
+bool build_intelligence_query(
+    PyObject* spec,
+    RuntimeViewProxy* view,
+    IntelligenceQuery* query,
+    std::string* error_message
+) {
+    if (!require_spec_dict(spec, error_message)) {
+        return false;
+    }
+
+    uint32_t ignored_mask = 0U;
+
+    PyObject* kind_value = PyDict_GetItemString(spec, "kind");
+    if (kind_value != nullptr && kind_value != Py_None) {
+        if (!PyUnicode_Check(kind_value)) {
+            if (error_message != nullptr) {
+                *error_message = "kind must be a string";
+            }
+            return false;
+        }
+        const char* utf8 = PyUnicode_AsUTF8(kind_value);
+        if (!parse_intelligence_record_kind(
+                utf8 == nullptr ? std::string_view{} : std::string_view(utf8),
+                &query->kind,
+                error_message
+            )) {
+            return false;
+        }
+    }
+
+    if (!parse_optional_spec_string_id(
+            spec,
+            "key",
+            view->runtime->strings,
+            &query->key,
+            0U,
+            &ignored_mask,
+            error_message
+        )) {
+        return false;
+    }
+    if (!parse_optional_spec_string(spec, "key_prefix", &query->key_prefix, error_message) ||
+        !parse_optional_spec_string_id(spec, "task_key", view->runtime->strings, &query->task_key, 0U, &ignored_mask, error_message) ||
+        !parse_optional_spec_string_id(spec, "claim_key", view->runtime->strings, &query->claim_key, 0U, &ignored_mask, error_message) ||
+        !parse_optional_spec_string_id(spec, "subject", view->runtime->strings, &query->subject_label, 0U, &ignored_mask, error_message) ||
+        !parse_optional_spec_string_id(spec, "relation", view->runtime->strings, &query->relation, 0U, &ignored_mask, error_message) ||
+        !parse_optional_spec_string_id(spec, "object", view->runtime->strings, &query->object_label, 0U, &ignored_mask, error_message) ||
+        !parse_optional_spec_string_id(spec, "owner", view->runtime->strings, &query->owner, 0U, &ignored_mask, error_message) ||
+        !parse_optional_spec_string_id(spec, "source", view->runtime->strings, &query->source, 0U, &ignored_mask, error_message) ||
+        !parse_optional_spec_string_id(spec, "scope", view->runtime->strings, &query->scope, 0U, &ignored_mask, error_message) ||
+        !parse_optional_spec_float(spec, "min_confidence", &query->min_confidence, 0U, &ignored_mask, error_message) ||
+        !parse_optional_spec_float(spec, "min_importance", &query->min_importance, 0U, &ignored_mask, error_message) ||
+        !parse_optional_query_limit(spec, "limit", &query->limit, error_message)) {
+        return false;
+    }
+
+    if (PyObject* status_value = PyDict_GetItemString(spec, "status");
+        status_value != nullptr && status_value != Py_None) {
+        if (!PyUnicode_Check(status_value)) {
+            if (error_message != nullptr) {
+                *error_message = "status must be a string";
+            }
+            return false;
+        }
+        const char* utf8 = PyUnicode_AsUTF8(status_value);
+        const std::string_view name = utf8 == nullptr ? std::string_view{} : std::string_view(utf8);
+        switch (query->kind) {
+            case IntelligenceRecordKind::Tasks: {
+                query->task_status = parse_intelligence_task_status(name);
+                if (!query->task_status.has_value()) {
+                    if (error_message != nullptr) {
+                        *error_message = "unsupported task status value";
+                    }
+                    return false;
+                }
+                break;
+            }
+            case IntelligenceRecordKind::Claims: {
+                query->claim_status = parse_intelligence_claim_status(name);
+                if (!query->claim_status.has_value()) {
+                    if (error_message != nullptr) {
+                        *error_message = "unsupported claim status value";
+                    }
+                    return false;
+                }
+                break;
+            }
+            case IntelligenceRecordKind::Decisions: {
+                query->decision_status = parse_intelligence_decision_status(name);
+                if (!query->decision_status.has_value()) {
+                    if (error_message != nullptr) {
+                        *error_message = "unsupported decision status value";
+                    }
+                    return false;
+                }
+                break;
+            }
+            default:
+                if (error_message != nullptr) {
+                    *error_message = "status filters require kind='tasks', 'claims', or 'decisions'";
+                }
+                return false;
+        }
+    }
+
+    if (PyObject* layer_value = PyDict_GetItemString(spec, "layer");
+        layer_value != nullptr && layer_value != Py_None) {
+        if (!PyUnicode_Check(layer_value)) {
+            if (error_message != nullptr) {
+                *error_message = "layer must be a string";
+            }
+            return false;
+        }
+        const char* utf8 = PyUnicode_AsUTF8(layer_value);
+        query->memory_layer = parse_intelligence_memory_layer(
+            utf8 == nullptr ? std::string_view{} : std::string_view(utf8)
+        );
+        if (!query->memory_layer.has_value()) {
+            if (error_message != nullptr) {
+                *error_message = "unsupported memory layer value";
+            }
+            return false;
+        }
+    }
+
+    if (PyObject* task_status_value = PyDict_GetItemString(spec, "task_status");
+        task_status_value != nullptr && task_status_value != Py_None) {
+        if (!PyUnicode_Check(task_status_value)) {
+            if (error_message != nullptr) {
+                *error_message = "task_status must be a string";
+            }
+            return false;
+        }
+        const char* utf8 = PyUnicode_AsUTF8(task_status_value);
+        query->task_status = parse_intelligence_task_status(
+            utf8 == nullptr ? std::string_view{} : std::string_view(utf8)
+        );
+        if (!query->task_status.has_value()) {
+            if (error_message != nullptr) {
+                *error_message = "unsupported task_status value";
+            }
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool build_intelligence_route_rule(
+    PyObject* spec,
+    RuntimeViewProxy* view,
+    IntelligenceRouteRule* rule,
+    std::string* error_message
+) {
+    if (!build_intelligence_query(spec, view, &rule->query, error_message)) {
+        return false;
+    }
+
+    PyObject* goto_value = PyDict_GetItemString(spec, "goto");
+    if (goto_value == nullptr || goto_value == Py_None) {
+        if (error_message != nullptr) {
+            *error_message = "intelligence route rule requires goto";
+        }
+        return false;
+    }
+    if (!PyUnicode_Check(goto_value)) {
+        if (error_message != nullptr) {
+            *error_message = "goto must be a string";
+        }
+        return false;
+    }
+    rule->target = PyUnicode_AsUTF8(goto_value);
+
+    if (PyObject* min_count_value = PyDict_GetItemString(spec, "min_count");
+        min_count_value != nullptr && min_count_value != Py_None) {
+        const unsigned long raw = PyLong_AsUnsignedLong(min_count_value);
+        if (PyErr_Occurred() != nullptr) {
+            if (error_message != nullptr) {
+                *error_message = fetch_python_error();
+            }
+            PyErr_Clear();
+            return false;
+        }
+        rule->min_count = static_cast<uint32_t>(raw);
+    }
+
+    if (PyObject* max_count_value = PyDict_GetItemString(spec, "max_count");
+        max_count_value != nullptr && max_count_value != Py_None) {
+        const unsigned long raw = PyLong_AsUnsignedLong(max_count_value);
+        if (PyErr_Occurred() != nullptr) {
+            if (error_message != nullptr) {
+                *error_message = fetch_python_error();
+            }
+            PyErr_Clear();
+            return false;
+        }
+        rule->max_count = static_cast<uint32_t>(raw);
+    }
+
+    return true;
+}
+
+PyObject* runtime_snapshot_intelligence(PyObject* capsule, std::string* error_message) {
+    RuntimeViewProxy* view = nullptr;
+    GraphHandle* handle = nullptr;
+    IntelligenceStore working_store;
+    if (!resolve_runtime_intelligence_store(capsule, &view, &handle, &working_store, error_message)) {
+        return nullptr;
+    }
+    return intelligence_snapshot_to_python(
+        *handle,
+        working_store.snapshot(),
+        *view->blobs,
+        *view->strings,
+        error_message
+    );
+}
+
+PyObject* runtime_query_intelligence(PyObject* capsule, PyObject* spec, std::string* error_message) {
+    RuntimeViewProxy* view = nullptr;
+    GraphHandle* handle = nullptr;
+    IntelligenceStore working_store;
+    if (!resolve_runtime_intelligence_store(capsule, &view, &handle, &working_store, error_message)) {
+        return nullptr;
+    }
+
+    IntelligenceQuery query;
+    if (!build_intelligence_query(spec, view, &query, error_message)) {
+        return nullptr;
+    }
+
+    const IntelligenceSnapshot filtered = query_intelligence_records(working_store, *view->strings, query);
+    return intelligence_snapshot_to_python(
+        *handle,
+        filtered,
+        *view->blobs,
+        *view->strings,
+        error_message
+    );
+}
+
+PyObject* runtime_related_intelligence(PyObject* capsule, PyObject* spec, std::string* error_message) {
+    RuntimeViewProxy* view = nullptr;
+    GraphHandle* handle = nullptr;
+    IntelligenceStore working_store;
+    if (!resolve_runtime_intelligence_store(capsule, &view, &handle, &working_store, error_message)) {
+        return nullptr;
+    }
+    if (!require_spec_dict(spec, error_message)) {
+        return nullptr;
+    }
+
+    InternedStringId task_key = 0U;
+    InternedStringId claim_key = 0U;
+    uint32_t limit = 0U;
+    uint32_t hops = 1U;
+    uint32_t ignored_mask = 0U;
+    if (!parse_optional_spec_string_id(spec, "task_key", view->runtime->strings, &task_key, 0U, &ignored_mask, error_message) ||
+        !parse_optional_spec_string_id(spec, "claim_key", view->runtime->strings, &claim_key, 0U, &ignored_mask, error_message) ||
+        !parse_optional_query_limit(spec, "limit", &limit, error_message) ||
+        !parse_optional_query_limit(spec, "hops", &hops, error_message)) {
+        return nullptr;
+    }
+    if (task_key == 0U && claim_key == 0U) {
+        if (error_message != nullptr) {
+            *error_message = "related intelligence lookup requires task_key or claim_key";
+        }
+        return nullptr;
+    }
+    if (hops == 0U) {
+        if (error_message != nullptr) {
+            *error_message = "related intelligence hops must be >= 1";
+        }
+        return nullptr;
+    }
+
+    const IntelligenceSnapshot related =
+        related_intelligence_records(working_store, task_key, claim_key, limit, hops);
+    return intelligence_snapshot_to_python(
+        *handle,
+        related,
+        *view->blobs,
+        *view->strings,
+        error_message
+    );
+}
+
+PyObject* runtime_agenda_intelligence(PyObject* capsule, PyObject* spec, std::string* error_message) {
+    RuntimeViewProxy* view = nullptr;
+    GraphHandle* handle = nullptr;
+    IntelligenceStore working_store;
+    if (!resolve_runtime_intelligence_store(capsule, &view, &handle, &working_store, error_message)) {
+        return nullptr;
+    }
+
+    IntelligenceQuery query;
+    if (!build_intelligence_query(spec, view, &query, error_message)) {
+        return nullptr;
+    }
+    if (query.kind != IntelligenceRecordKind::All && query.kind != IntelligenceRecordKind::Tasks) {
+        if (error_message != nullptr) {
+            *error_message = "intelligence agenda only supports task filters";
+        }
+        return nullptr;
+    }
+
+    const IntelligenceSnapshot agenda = agenda_intelligence_tasks(working_store, *view->strings, query);
+    return intelligence_snapshot_to_python(
+        *handle,
+        agenda,
+        *view->blobs,
+        *view->strings,
+        error_message
+    );
+}
+
+PyObject* runtime_supporting_claims_intelligence(
+    PyObject* capsule,
+    PyObject* spec,
+    std::string* error_message
+) {
+    RuntimeViewProxy* view = nullptr;
+    GraphHandle* handle = nullptr;
+    IntelligenceStore working_store;
+    if (!resolve_runtime_intelligence_store(capsule, &view, &handle, &working_store, error_message)) {
+        return nullptr;
+    }
+
+    IntelligenceQuery query;
+    if (!build_intelligence_query(spec, view, &query, error_message)) {
+        return nullptr;
+    }
+    if (query.kind != IntelligenceRecordKind::All && query.kind != IntelligenceRecordKind::Claims) {
+        if (error_message != nullptr) {
+            *error_message = "supporting claim retrieval only supports claim filters";
+        }
+        return nullptr;
+    }
+
+    const IntelligenceSnapshot ranked_claims =
+        supporting_intelligence_claims(working_store, *view->strings, query);
+    return intelligence_snapshot_to_python(
+        *handle,
+        ranked_claims,
+        *view->blobs,
+        *view->strings,
+        error_message
+    );
+}
+
+PyObject* runtime_action_candidates_intelligence(
+    PyObject* capsule,
+    PyObject* spec,
+    std::string* error_message
+) {
+    RuntimeViewProxy* view = nullptr;
+    GraphHandle* handle = nullptr;
+    IntelligenceStore working_store;
+    if (!resolve_runtime_intelligence_store(capsule, &view, &handle, &working_store, error_message)) {
+        return nullptr;
+    }
+
+    IntelligenceQuery query;
+    if (!build_intelligence_query(spec, view, &query, error_message)) {
+        return nullptr;
+    }
+
+    const IntelligenceSnapshot ranked_tasks =
+        action_intelligence_tasks(working_store, *view->strings, query);
+    return intelligence_snapshot_to_python(
+        *handle,
+        ranked_tasks,
+        *view->blobs,
+        *view->strings,
+        error_message
+    );
+}
+
+PyObject* runtime_recall_intelligence(PyObject* capsule, PyObject* spec, std::string* error_message) {
+    RuntimeViewProxy* view = nullptr;
+    GraphHandle* handle = nullptr;
+    IntelligenceStore working_store;
+    if (!resolve_runtime_intelligence_store(capsule, &view, &handle, &working_store, error_message)) {
+        return nullptr;
+    }
+
+    IntelligenceQuery query;
+    if (!build_intelligence_query(spec, view, &query, error_message)) {
+        return nullptr;
+    }
+    if (query.kind != IntelligenceRecordKind::All && query.kind != IntelligenceRecordKind::Memories) {
+        if (error_message != nullptr) {
+            *error_message = "intelligence recall only supports memory filters";
+        }
+        return nullptr;
+    }
+
+    const IntelligenceSnapshot recall = recall_intelligence_memories(working_store, *view->strings, query);
+    return intelligence_snapshot_to_python(
+        *handle,
+        recall,
+        *view->blobs,
+        *view->strings,
+        error_message
+    );
+}
+
+PyObject* runtime_focus_intelligence(PyObject* capsule, PyObject* spec, std::string* error_message) {
+    RuntimeViewProxy* view = nullptr;
+    GraphHandle* handle = nullptr;
+    IntelligenceStore working_store;
+    if (!resolve_runtime_intelligence_store(capsule, &view, &handle, &working_store, error_message)) {
+        return nullptr;
+    }
+
+    IntelligenceQuery query;
+    if (!build_intelligence_query(spec, view, &query, error_message)) {
+        return nullptr;
+    }
+    if (query.kind != IntelligenceRecordKind::All) {
+        if (error_message != nullptr) {
+            *error_message = "intelligence focus operates across record kinds; use query, agenda, or recall for single-kind reads";
+        }
+        return nullptr;
+    }
+
+    const IntelligenceSnapshot focus = focus_intelligence_records(working_store, *view->strings, query);
+    return intelligence_snapshot_to_python(
+        *handle,
+        focus,
+        *view->blobs,
+        *view->strings,
+        error_message
+    );
+}
+
+PyObject* runtime_intelligence_summary(PyObject* capsule, std::string* error_message) {
+    RuntimeViewProxy* view = nullptr;
+    GraphHandle* handle = nullptr;
+    IntelligenceStore working_store;
+    if (!resolve_runtime_intelligence_store(capsule, &view, &handle, &working_store, error_message)) {
+        return nullptr;
+    }
+    static_cast<void>(handle);
+    return intelligence_summary_to_python(summarize_intelligence(working_store), error_message);
+}
+
+PyObject* runtime_count_intelligence(PyObject* capsule, PyObject* spec, std::string* error_message) {
+    RuntimeViewProxy* view = nullptr;
+    GraphHandle* handle = nullptr;
+    IntelligenceStore working_store;
+    if (!resolve_runtime_intelligence_store(capsule, &view, &handle, &working_store, error_message)) {
+        return nullptr;
+    }
+    static_cast<void>(handle);
+
+    IntelligenceQuery query;
+    if (!build_intelligence_query(spec, view, &query, error_message)) {
+        return nullptr;
+    }
+
+    return PyLong_FromSize_t(count_intelligence_records(working_store, *view->strings, query));
+}
+
+PyObject* runtime_route_intelligence(PyObject* capsule, PyObject* spec, std::string* error_message) {
+    RuntimeViewProxy* view = nullptr;
+    GraphHandle* handle = nullptr;
+    IntelligenceStore working_store;
+    if (!resolve_runtime_intelligence_store(capsule, &view, &handle, &working_store, error_message)) {
+        return nullptr;
+    }
+    static_cast<void>(handle);
+
+    if (!require_spec_dict(spec, error_message)) {
+        return nullptr;
+    }
+
+    PyObject* rules_value = PyDict_GetItemString(spec, "rules");
+    if (rules_value == nullptr || rules_value == Py_None || !PySequence_Check(rules_value)) {
+        if (error_message != nullptr) {
+            *error_message = "intelligence route requires a rules sequence";
+        }
+        return nullptr;
+    }
+
+    std::vector<IntelligenceRouteRule> rules;
+    const Py_ssize_t rule_count = PySequence_Size(rules_value);
+    if (rule_count < 0) {
+        if (error_message != nullptr) {
+            *error_message = fetch_python_error();
+        }
+        return nullptr;
+    }
+    rules.reserve(static_cast<std::size_t>(rule_count));
+
+    for (Py_ssize_t index = 0; index < rule_count; ++index) {
+        PyObject* item = PySequence_GetItem(rules_value, index);
+        if (item == nullptr) {
+            if (error_message != nullptr) {
+                *error_message = fetch_python_error();
+            }
+            return nullptr;
+        }
+        IntelligenceRouteRule rule;
+        const bool ok = require_spec_dict(item, error_message) &&
+            build_intelligence_route_rule(item, view, &rule, error_message);
+        Py_DECREF(item);
+        if (!ok) {
+            return nullptr;
+        }
+        rules.push_back(std::move(rule));
+    }
+
+    const std::optional<std::string> selected =
+        select_intelligence_route(working_store, *view->strings, rules);
+    if (selected.has_value()) {
+        return unicode_from_utf8(*selected);
+    }
+
+    PyObject* default_value = PyDict_GetItemString(spec, "default");
+    if (default_value == nullptr || default_value == Py_None) {
+        Py_RETURN_NONE;
+    }
+    if (!PyUnicode_Check(default_value)) {
+        if (error_message != nullptr) {
+            *error_message = "intelligence route default must be a string or None";
+        }
+        return nullptr;
+    }
+    return unicode_from_utf8(PyUnicode_AsUTF8(default_value));
 }
 
 PyObject* runtime_record_once(PyObject* capsule, std::string_view key, PyObject* request, PyObject* producer, std::string* error_message) {

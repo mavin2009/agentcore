@@ -174,6 +174,8 @@ Each streamed event and trace event may also carry subgraph session metadata:
 - `session_revision`
 - `namespaces`
 
+Metadata returned by `invoke_with_metadata(...)` also includes `details["intelligence"]` when the run commits intelligence records.
+
 ## Node Return Forms
 
 Python node callbacks can return any of the following:
@@ -221,6 +223,168 @@ This seam is intentionally narrow:
 - the producer runs only on the first committed occurrence
 - later visits for the same key and request replay the prior output
 - the recorded outcome is committed through the same native state/checkpoint path as other updates
+
+## Use The Intelligence State Model
+
+If a workflow needs structured reasoning state instead of one large JSON field, Python nodes can use the grouped `runtime.intelligence` view.
+
+```python
+from agentcore.graph import END, START, RuntimeContext, StateGraph
+
+
+def analyze(state, config, runtime: RuntimeContext):
+    runtime.intelligence.upsert_task(
+        "triage",
+        title="Inspect inbound request",
+        owner="planner",
+        status="in_progress",
+        priority=4,
+        details={"request_id": state["request_id"]},
+    )
+    runtime.intelligence.upsert_claim(
+        "needs-escalation",
+        subject="request",
+        relation="requires",
+        object="escalation",
+        status="proposed",
+        confidence=0.74,
+        statement={"reason": "account mismatch"},
+    )
+    runtime.intelligence.add_evidence(
+        "ticket-snippet",
+        kind="ticket",
+        source="support",
+        claim_key="needs-escalation",
+        content={"excerpt": state["excerpt"]},
+        confidence=0.82,
+    )
+    runtime.intelligence.record_decision(
+        "send-to-review",
+        task_key="triage",
+        claim_key="needs-escalation",
+        status="selected",
+        summary={"queue": "human-review"},
+        confidence=0.91,
+    )
+    runtime.intelligence.remember(
+        "customer-tone",
+        layer="working",
+        scope="request",
+        content={"tone": "urgent"},
+        importance=0.6,
+    )
+
+    summary = runtime.intelligence.summary()
+    supporting_claims = runtime.intelligence.supporting_claims(task_key="triage", limit=3)
+    action_candidates = runtime.intelligence.action_candidates(
+        owner="planner",
+        subject="request",
+        relation="requires",
+        object="escalation",
+        limit=2,
+    )
+    semantic_claims = runtime.intelligence.query(
+        kind="claims",
+        subject="request",
+        relation="requires",
+        object="escalation",
+    )
+    related = runtime.intelligence.related(task_key="triage", hops=2)
+    next_task = runtime.intelligence.next_task(owner="planner")
+    recalled_memories = runtime.intelligence.recall(scope="request", limit=3)
+    focus = runtime.intelligence.focus(owner="planner", scope="request", limit=3)
+    return {
+        "decision_count": summary["counts"]["decisions"],
+        "supporting_claim_count": supporting_claims["counts"]["claims"],
+        "action_candidate_key": action_candidates["tasks"][0]["key"],
+        "semantic_claim_count": semantic_claims["counts"]["claims"],
+        "related_claim_count": related["counts"]["claims"],
+        "next_task_key": None if next_task is None else next_task["key"],
+        "working_memory_count": recalled_memories["counts"]["memories"],
+        "focus_claim_count": focus["counts"]["claims"],
+    }
+
+
+graph = StateGraph(dict, name="intelligence_demo")
+graph.add_node("analyze", analyze)
+graph.add_edge(START, "analyze")
+graph.add_edge("analyze", END)
+
+details = graph.compile().invoke_with_metadata(
+    {"request_id": "req-7", "excerpt": "Please fix this today"}
+)
+print(details["intelligence"]["counts"])
+print(details["intelligence"]["claims"][0]["key"])
+```
+
+The implemented snapshot structure is:
+
+- `counts`
+- `tasks`
+- `claims`
+- `evidence`
+- `decisions`
+- `memories`
+
+This is useful when you want the runtime to preserve active work items, asserted claims, supporting evidence, accepted or rejected decisions, and short-lived or session-local memory through the same checkpoint/replay path as ordinary state and persistent subgraph sessions.
+
+The grouped operational surface is intentionally small:
+
+- `runtime.intelligence.snapshot()` returns the current intelligence snapshot, including staged writes from the active callback.
+- `runtime.intelligence.summary()` returns counts plus task-status, claim-status, decision-status, and memory-layer tallies.
+- `runtime.intelligence.count(...)` and `runtime.intelligence.exists(...)` support fast presence and threshold checks without forcing Python code to materialize and scan snapshots.
+- `runtime.intelligence.query(...)` filters records natively without forcing application code to scan the whole snapshot every time. Claim queries can also match directly on `subject`, `relation`, and `object`.
+- `runtime.intelligence.supporting_claims(...)` ranks claims natively from linked evidence, decisions, and memories, which is useful when a workflow wants the best-supported claims for one task instead of a raw filtered list.
+- `runtime.intelligence.action_candidates(...)` returns tasks only and ranks them from the linked evidence/decision/memory support around task, claim, or semantic-claim anchors, which is useful when a workflow wants a small operational shortlist rather than a full focus set.
+- `runtime.intelligence.related(...)` expands the records connected to one task or claim, with `hops=1` by default and bounded multi-hop traversal when needed.
+- `runtime.intelligence.agenda(...)` returns tasks ranked natively by operational priority.
+- `runtime.intelligence.next_task(...)` returns the first ranked task or `None`.
+- `runtime.intelligence.recall(...)` returns memories ranked natively by importance.
+- `runtime.intelligence.focus(...)` returns a bounded, cross-kind focus set around the active task/memory/evidence frontier, favoring direct anchors and decisive support over weak-link volume. Claim-semantic filters participate in those anchors.
+- `runtime.intelligence.route(...)` selects the first matching route from an ordered rule list.
+
+For conditional edges, `IntelligenceRule` and `IntelligenceRouter` provide a compact declarative layer over that same native query path.
+
+Nodes can also subscribe to committed intelligence changes directly:
+
+```python
+from agentcore.graph import IntelligenceSubscription, START, StateGraph
+
+
+def write_claim(state, config, runtime):
+    runtime.intelligence.upsert_claim(
+        "claim:reactive",
+        subject="agentcore",
+        relation="supports",
+        object="reactive_runtime",
+        status="supported",
+    )
+    return {}
+
+
+def react_to_supported_claim(state, config):
+    return {"reactive_seen": True}
+
+
+graph = StateGraph(dict, name="intelligence_reactive")
+graph.add_node("write", write_claim)
+graph.add_node(
+    "react",
+    react_to_supported_claim,
+    kind="aggregate",
+    stop_after=True,
+    intelligence_subscriptions=[
+        IntelligenceSubscription(
+            subject="agentcore",
+            relation="supports",
+            object="reactive_runtime",
+        ),
+    ],
+)
+graph.add_edge(START, "write")
+```
+
+That subscription is compiled into native graph metadata. When a committed intelligence delta matches it, the runtime schedules the subscribed node through the same checkpointed reactive frontier mechanism used for other graph-native reactive execution. The same `subject` / `relation` / `object` fields are also available on `IntelligenceRule` for claim-centric routing.
 
 ## Register Native Adapters From Python
 

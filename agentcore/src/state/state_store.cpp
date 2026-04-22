@@ -87,6 +87,175 @@ bool values_equal(const Value& left, const Value& right) {
     return left == right;
 }
 
+bool intelligence_task_blob_changed(
+    const IntelligenceTask& task,
+    const IntelligenceTaskWrite& write,
+    uint32_t mask,
+    const BlobStore& blobs
+) {
+    if ((write.field_mask & mask) == 0U) {
+        return false;
+    }
+    if (mask == intelligence_fields::kTaskPayload) {
+        return !blob_refs_equal(blobs, task.payload, write.payload);
+    }
+    return !blob_refs_equal(blobs, task.result, write.result);
+}
+
+uint32_t intelligence_task_changed_fields(
+    const IntelligenceTask& task,
+    const IntelligenceTaskWrite& write,
+    const BlobStore& blobs
+) {
+    uint32_t changed = 0U;
+    if ((write.field_mask & intelligence_fields::kTaskTitle) != 0U && task.title != write.title) {
+        changed |= intelligence_fields::kTaskTitle;
+    }
+    if ((write.field_mask & intelligence_fields::kTaskOwner) != 0U && task.owner != write.owner) {
+        changed |= intelligence_fields::kTaskOwner;
+    }
+    if (intelligence_task_blob_changed(task, write, intelligence_fields::kTaskPayload, blobs)) {
+        changed |= intelligence_fields::kTaskPayload;
+    }
+    if (intelligence_task_blob_changed(task, write, intelligence_fields::kTaskResult, blobs)) {
+        changed |= intelligence_fields::kTaskResult;
+    }
+    if ((write.field_mask & intelligence_fields::kTaskStatus) != 0U && task.status != write.status) {
+        changed |= intelligence_fields::kTaskStatus;
+    }
+    if ((write.field_mask & intelligence_fields::kTaskPriority) != 0U && task.priority != write.priority) {
+        changed |= intelligence_fields::kTaskPriority;
+    }
+    if ((write.field_mask & intelligence_fields::kTaskConfidence) != 0U && task.confidence != write.confidence) {
+        changed |= intelligence_fields::kTaskConfidence;
+    }
+    return changed;
+}
+
+uint32_t intelligence_claim_changed_fields(
+    const IntelligenceClaim& claim,
+    const IntelligenceClaimWrite& write,
+    const BlobStore& blobs
+) {
+    uint32_t changed = 0U;
+    if ((write.field_mask & intelligence_fields::kClaimSubject) != 0U &&
+        claim.subject_label != write.subject_label) {
+        changed |= intelligence_fields::kClaimSubject;
+    }
+    if ((write.field_mask & intelligence_fields::kClaimRelation) != 0U &&
+        claim.relation != write.relation) {
+        changed |= intelligence_fields::kClaimRelation;
+    }
+    if ((write.field_mask & intelligence_fields::kClaimObject) != 0U &&
+        claim.object_label != write.object_label) {
+        changed |= intelligence_fields::kClaimObject;
+    }
+    if ((write.field_mask & intelligence_fields::kClaimStatement) != 0U &&
+        !blob_refs_equal(blobs, claim.statement, write.statement)) {
+        changed |= intelligence_fields::kClaimStatement;
+    }
+    if ((write.field_mask & intelligence_fields::kClaimStatus) != 0U && claim.status != write.status) {
+        changed |= intelligence_fields::kClaimStatus;
+    }
+    if ((write.field_mask & intelligence_fields::kClaimConfidence) != 0U &&
+        claim.confidence != write.confidence) {
+        changed |= intelligence_fields::kClaimConfidence;
+    }
+    return changed;
+}
+
+uint32_t intelligence_evidence_changed_fields(
+    const IntelligenceEvidence& evidence,
+    const IntelligenceEvidenceWrite& write,
+    const BlobStore& blobs
+) {
+    uint32_t changed = 0U;
+    if ((write.field_mask & intelligence_fields::kEvidenceKind) != 0U && evidence.kind != write.kind) {
+        changed |= intelligence_fields::kEvidenceKind;
+    }
+    if ((write.field_mask & intelligence_fields::kEvidenceSource) != 0U &&
+        evidence.source != write.source) {
+        changed |= intelligence_fields::kEvidenceSource;
+    }
+    if ((write.field_mask & intelligence_fields::kEvidenceContent) != 0U &&
+        !blob_refs_equal(blobs, evidence.content, write.content)) {
+        changed |= intelligence_fields::kEvidenceContent;
+    }
+    if ((write.field_mask & intelligence_fields::kEvidenceTaskKey) != 0U &&
+        evidence.task_key != write.task_key) {
+        changed |= intelligence_fields::kEvidenceTaskKey;
+    }
+    if ((write.field_mask & intelligence_fields::kEvidenceClaimKey) != 0U &&
+        evidence.claim_key != write.claim_key) {
+        changed |= intelligence_fields::kEvidenceClaimKey;
+    }
+    if ((write.field_mask & intelligence_fields::kEvidenceConfidence) != 0U &&
+        evidence.confidence != write.confidence) {
+        changed |= intelligence_fields::kEvidenceConfidence;
+    }
+    return changed;
+}
+
+uint32_t intelligence_decision_changed_fields(
+    const IntelligenceDecision& decision,
+    const IntelligenceDecisionWrite& write,
+    const BlobStore& blobs
+) {
+    uint32_t changed = 0U;
+    if ((write.field_mask & intelligence_fields::kDecisionTaskKey) != 0U &&
+        decision.task_key != write.task_key) {
+        changed |= intelligence_fields::kDecisionTaskKey;
+    }
+    if ((write.field_mask & intelligence_fields::kDecisionClaimKey) != 0U &&
+        decision.claim_key != write.claim_key) {
+        changed |= intelligence_fields::kDecisionClaimKey;
+    }
+    if ((write.field_mask & intelligence_fields::kDecisionSummary) != 0U &&
+        !blob_refs_equal(blobs, decision.summary, write.summary)) {
+        changed |= intelligence_fields::kDecisionSummary;
+    }
+    if ((write.field_mask & intelligence_fields::kDecisionStatus) != 0U &&
+        decision.status != write.status) {
+        changed |= intelligence_fields::kDecisionStatus;
+    }
+    if ((write.field_mask & intelligence_fields::kDecisionConfidence) != 0U &&
+        decision.confidence != write.confidence) {
+        changed |= intelligence_fields::kDecisionConfidence;
+    }
+    return changed;
+}
+
+uint32_t intelligence_memory_changed_fields(
+    const IntelligenceMemoryEntry& memory,
+    const IntelligenceMemoryWrite& write,
+    const BlobStore& blobs
+) {
+    uint32_t changed = 0U;
+    if ((write.field_mask & intelligence_fields::kMemoryLayer) != 0U && memory.layer != write.layer) {
+        changed |= intelligence_fields::kMemoryLayer;
+    }
+    if ((write.field_mask & intelligence_fields::kMemoryScope) != 0U && memory.scope != write.scope) {
+        changed |= intelligence_fields::kMemoryScope;
+    }
+    if ((write.field_mask & intelligence_fields::kMemoryContent) != 0U &&
+        !blob_refs_equal(blobs, memory.content, write.content)) {
+        changed |= intelligence_fields::kMemoryContent;
+    }
+    if ((write.field_mask & intelligence_fields::kMemoryTaskKey) != 0U &&
+        memory.task_key != write.task_key) {
+        changed |= intelligence_fields::kMemoryTaskKey;
+    }
+    if ((write.field_mask & intelligence_fields::kMemoryClaimKey) != 0U &&
+        memory.claim_key != write.claim_key) {
+        changed |= intelligence_fields::kMemoryClaimKey;
+    }
+    if ((write.field_mask & intelligence_fields::kMemoryImportance) != 0U &&
+        memory.importance != write.importance) {
+        changed |= intelligence_fields::kMemoryImportance;
+    }
+    return changed;
+}
+
 struct TripleDeltaKey {
     InternedStringId subject_label{0};
     InternedStringId relation{0};
@@ -196,6 +365,149 @@ KnowledgeGraphPatch read_knowledge_graph_patch(std::istream& input) {
     return patch;
 }
 
+void write_intelligence_patch(std::ostream& output, const IntelligencePatch& patch) {
+    write_pod<uint64_t>(output, static_cast<uint64_t>(patch.tasks.size()));
+    for (const IntelligenceTaskWrite& task : patch.tasks) {
+        write_pod(output, task.key);
+        write_pod(output, task.title);
+        write_pod(output, task.owner);
+        write_blob_ref(output, task.payload);
+        write_blob_ref(output, task.result);
+        write_pod(output, static_cast<uint8_t>(task.status));
+        write_pod(output, task.priority);
+        write_pod(output, task.confidence);
+        write_pod(output, task.field_mask);
+    }
+
+    write_pod<uint64_t>(output, static_cast<uint64_t>(patch.claims.size()));
+    for (const IntelligenceClaimWrite& claim : patch.claims) {
+        write_pod(output, claim.key);
+        write_pod(output, claim.subject_label);
+        write_pod(output, claim.relation);
+        write_pod(output, claim.object_label);
+        write_blob_ref(output, claim.statement);
+        write_pod(output, static_cast<uint8_t>(claim.status));
+        write_pod(output, claim.confidence);
+        write_pod(output, claim.field_mask);
+    }
+
+    write_pod<uint64_t>(output, static_cast<uint64_t>(patch.evidence.size()));
+    for (const IntelligenceEvidenceWrite& evidence : patch.evidence) {
+        write_pod(output, evidence.key);
+        write_pod(output, evidence.kind);
+        write_pod(output, evidence.source);
+        write_blob_ref(output, evidence.content);
+        write_pod(output, evidence.task_key);
+        write_pod(output, evidence.claim_key);
+        write_pod(output, evidence.confidence);
+        write_pod(output, evidence.field_mask);
+    }
+
+    write_pod<uint64_t>(output, static_cast<uint64_t>(patch.decisions.size()));
+    for (const IntelligenceDecisionWrite& decision : patch.decisions) {
+        write_pod(output, decision.key);
+        write_pod(output, decision.task_key);
+        write_pod(output, decision.claim_key);
+        write_blob_ref(output, decision.summary);
+        write_pod(output, static_cast<uint8_t>(decision.status));
+        write_pod(output, decision.confidence);
+        write_pod(output, decision.field_mask);
+    }
+
+    write_pod<uint64_t>(output, static_cast<uint64_t>(patch.memories.size()));
+    for (const IntelligenceMemoryWrite& memory : patch.memories) {
+        write_pod(output, memory.key);
+        write_pod(output, static_cast<uint8_t>(memory.layer));
+        write_pod(output, memory.scope);
+        write_blob_ref(output, memory.content);
+        write_pod(output, memory.task_key);
+        write_pod(output, memory.claim_key);
+        write_pod(output, memory.importance);
+        write_pod(output, memory.field_mask);
+    }
+}
+
+IntelligencePatch read_intelligence_patch(std::istream& input) {
+    IntelligencePatch patch;
+
+    const uint64_t task_count = read_pod<uint64_t>(input);
+    patch.tasks.reserve(static_cast<std::size_t>(task_count));
+    for (uint64_t index = 0; index < task_count; ++index) {
+        patch.tasks.push_back(IntelligenceTaskWrite{
+            read_pod<InternedStringId>(input),
+            read_pod<InternedStringId>(input),
+            read_pod<InternedStringId>(input),
+            read_blob_ref(input),
+            read_blob_ref(input),
+            static_cast<IntelligenceTaskStatus>(read_pod<uint8_t>(input)),
+            read_pod<int32_t>(input),
+            read_pod<float>(input),
+            read_pod<uint32_t>(input)
+        });
+    }
+
+    const uint64_t claim_count = read_pod<uint64_t>(input);
+    patch.claims.reserve(static_cast<std::size_t>(claim_count));
+    for (uint64_t index = 0; index < claim_count; ++index) {
+        patch.claims.push_back(IntelligenceClaimWrite{
+            read_pod<InternedStringId>(input),
+            read_pod<InternedStringId>(input),
+            read_pod<InternedStringId>(input),
+            read_pod<InternedStringId>(input),
+            read_blob_ref(input),
+            static_cast<IntelligenceClaimStatus>(read_pod<uint8_t>(input)),
+            read_pod<float>(input),
+            read_pod<uint32_t>(input)
+        });
+    }
+
+    const uint64_t evidence_count = read_pod<uint64_t>(input);
+    patch.evidence.reserve(static_cast<std::size_t>(evidence_count));
+    for (uint64_t index = 0; index < evidence_count; ++index) {
+        patch.evidence.push_back(IntelligenceEvidenceWrite{
+            read_pod<InternedStringId>(input),
+            read_pod<InternedStringId>(input),
+            read_pod<InternedStringId>(input),
+            read_blob_ref(input),
+            read_pod<InternedStringId>(input),
+            read_pod<InternedStringId>(input),
+            read_pod<float>(input),
+            read_pod<uint32_t>(input)
+        });
+    }
+
+    const uint64_t decision_count = read_pod<uint64_t>(input);
+    patch.decisions.reserve(static_cast<std::size_t>(decision_count));
+    for (uint64_t index = 0; index < decision_count; ++index) {
+        patch.decisions.push_back(IntelligenceDecisionWrite{
+            read_pod<InternedStringId>(input),
+            read_pod<InternedStringId>(input),
+            read_pod<InternedStringId>(input),
+            read_blob_ref(input),
+            static_cast<IntelligenceDecisionStatus>(read_pod<uint8_t>(input)),
+            read_pod<float>(input),
+            read_pod<uint32_t>(input)
+        });
+    }
+
+    const uint64_t memory_count = read_pod<uint64_t>(input);
+    patch.memories.reserve(static_cast<std::size_t>(memory_count));
+    for (uint64_t index = 0; index < memory_count; ++index) {
+        patch.memories.push_back(IntelligenceMemoryWrite{
+            read_pod<InternedStringId>(input),
+            static_cast<IntelligenceMemoryLayer>(read_pod<uint8_t>(input)),
+            read_pod<InternedStringId>(input),
+            read_blob_ref(input),
+            read_pod<InternedStringId>(input),
+            read_pod<InternedStringId>(input),
+            read_pod<float>(input),
+            read_pod<uint32_t>(input)
+        });
+    }
+
+    return patch;
+}
+
 void write_state_patch(std::ostream& output, const StatePatch& patch) {
     write_pod<uint64_t>(output, static_cast<uint64_t>(patch.updates.size()));
     for (const FieldUpdate& update : patch.updates) {
@@ -217,6 +529,7 @@ void write_state_patch(std::ostream& output, const StatePatch& patch) {
     }
 
     write_knowledge_graph_patch(output, patch.knowledge_graph);
+    write_intelligence_patch(output, patch.intelligence);
     write_pod(output, patch.flags);
 }
 
@@ -250,6 +563,7 @@ StatePatch read_state_patch(std::istream& input) {
     }
 
     patch.knowledge_graph = read_knowledge_graph_patch(input);
+    patch.intelligence = read_intelligence_patch(input);
     patch.flags = read_pod<uint32_t>(input);
     return patch;
 }
@@ -632,6 +946,7 @@ void StateStore::reset(std::size_t initial_field_count) {
     patch_log_ = PatchLog{};
     string_interner_ = StringInterner{};
     knowledge_graph_ = KnowledgeGraphStore{};
+    intelligence_.clear();
     task_journal_.clear();
 }
 
@@ -641,6 +956,7 @@ StateStore::StateStore(const StateStore& other)
       patch_log_(other.patch_log_),
       string_interner_(other.string_interner_),
       knowledge_graph_(other.knowledge_graph_),
+      intelligence_(other.intelligence_),
       task_journal_(other.task_journal_) {}
 
 StateStore& StateStore::operator=(const StateStore& other) {
@@ -652,6 +968,7 @@ StateStore& StateStore::operator=(const StateStore& other) {
     patch_log_ = other.patch_log_;
     string_interner_ = other.string_interner_;
     knowledge_graph_ = other.knowledge_graph_;
+    intelligence_ = other.intelligence_;
     task_journal_ = other.task_journal_;
     return *this;
 }
@@ -817,11 +1134,108 @@ StateApplyResult StateStore::apply_with_summary(const StatePatch& patch) {
         knowledge_graph_ = std::move(working_graph);
     }
 
+    if (!patch.intelligence.empty()) {
+        IntelligenceStore working_intelligence = intelligence_;
+
+        for (const IntelligenceTaskWrite& task : patch.intelligence.tasks) {
+            const IntelligenceTask* existing = working_intelligence.find_task_by_key(task.key);
+            const bool created = existing == nullptr;
+            const uint32_t changed_fields = created
+                ? task.field_mask
+                : intelligence_task_changed_fields(*existing, task, blob_store_);
+            if (!created && changed_fields == 0U) {
+                continue;
+            }
+            const IntelligenceTaskId id = working_intelligence.upsert_task(task);
+            result.intelligence_delta.tasks.push_back(IntelligenceDelta{
+                id,
+                task.key,
+                created,
+                changed_fields
+            });
+        }
+
+        for (const IntelligenceClaimWrite& claim : patch.intelligence.claims) {
+            const IntelligenceClaim* existing = working_intelligence.find_claim_by_key(claim.key);
+            const bool created = existing == nullptr;
+            const uint32_t changed_fields = created
+                ? claim.field_mask
+                : intelligence_claim_changed_fields(*existing, claim, blob_store_);
+            if (!created && changed_fields == 0U) {
+                continue;
+            }
+            const IntelligenceClaimId id = working_intelligence.upsert_claim(claim);
+            result.intelligence_delta.claims.push_back(IntelligenceDelta{
+                id,
+                claim.key,
+                created,
+                changed_fields
+            });
+        }
+
+        for (const IntelligenceEvidenceWrite& evidence : patch.intelligence.evidence) {
+            const IntelligenceEvidence* existing = working_intelligence.find_evidence_by_key(evidence.key);
+            const bool created = existing == nullptr;
+            const uint32_t changed_fields = created
+                ? evidence.field_mask
+                : intelligence_evidence_changed_fields(*existing, evidence, blob_store_);
+            if (!created && changed_fields == 0U) {
+                continue;
+            }
+            const IntelligenceEvidenceId id = working_intelligence.upsert_evidence(evidence);
+            result.intelligence_delta.evidence.push_back(IntelligenceDelta{
+                id,
+                evidence.key,
+                created,
+                changed_fields
+            });
+        }
+
+        for (const IntelligenceDecisionWrite& decision : patch.intelligence.decisions) {
+            const IntelligenceDecision* existing = working_intelligence.find_decision_by_key(decision.key);
+            const bool created = existing == nullptr;
+            const uint32_t changed_fields = created
+                ? decision.field_mask
+                : intelligence_decision_changed_fields(*existing, decision, blob_store_);
+            if (!created && changed_fields == 0U) {
+                continue;
+            }
+            const IntelligenceDecisionId id = working_intelligence.upsert_decision(decision);
+            result.intelligence_delta.decisions.push_back(IntelligenceDelta{
+                id,
+                decision.key,
+                created,
+                changed_fields
+            });
+        }
+
+        for (const IntelligenceMemoryWrite& memory : patch.intelligence.memories) {
+            const IntelligenceMemoryEntry* existing = working_intelligence.find_memory_by_key(memory.key);
+            const bool created = existing == nullptr;
+            const uint32_t changed_fields = created
+                ? memory.field_mask
+                : intelligence_memory_changed_fields(*existing, memory, blob_store_);
+            if (!created && changed_fields == 0U) {
+                continue;
+            }
+            const IntelligenceMemoryId id = working_intelligence.upsert_memory(memory);
+            result.intelligence_delta.memories.push_back(IntelligenceDelta{
+                id,
+                memory.key,
+                created,
+                changed_fields
+            });
+        }
+
+        intelligence_ = std::move(working_intelligence);
+    }
+
     const bool task_journal_changed = task_journal_.apply(patch.task_records);
     result.state_changed =
         !result.changed_keys.empty() ||
         !patch.new_blobs.empty() ||
         !result.knowledge_graph_delta.empty() ||
+        !result.intelligence_delta.empty() ||
         task_journal_changed;
     if (!result.state_changed) {
         return result;
@@ -881,6 +1295,14 @@ const KnowledgeGraphStore& StateStore::knowledge_graph() const noexcept {
     return knowledge_graph_;
 }
 
+IntelligenceStore& StateStore::intelligence() noexcept {
+    return intelligence_;
+}
+
+const IntelligenceStore& StateStore::intelligence() const noexcept {
+    return intelligence_;
+}
+
 TaskJournal& StateStore::task_journal() noexcept {
     return task_journal_;
 }
@@ -893,7 +1315,8 @@ StateStore::SharedBacking StateStore::shared_backing_with(const StateStore& othe
     return SharedBacking{
         blob_store_.shares_storage_with(other.blob_store_),
         string_interner_.shares_storage_with(other.string_interner_),
-        knowledge_graph_.shares_storage_with(other.knowledge_graph_)
+        knowledge_graph_.shares_storage_with(other.knowledge_graph_),
+        intelligence_.shares_storage_with(other.intelligence_)
     };
 }
 
@@ -903,6 +1326,7 @@ void StateStore::serialize(std::ostream& output) const {
     patch_log_.serialize(output);
     string_interner_.serialize(output);
     knowledge_graph_.serialize(output);
+    intelligence_.serialize(output);
     task_journal_.serialize(output);
 }
 
@@ -913,6 +1337,7 @@ StateStore StateStore::deserialize(std::istream& input) {
     store.patch_log_ = PatchLog::deserialize(input);
     store.string_interner_ = StringInterner::deserialize(input);
     store.knowledge_graph_ = KnowledgeGraphStore::deserialize(input);
+    store.intelligence_ = IntelligenceStore::deserialize(input);
     store.task_journal_ = TaskJournal::deserialize(input);
     return store;
 }

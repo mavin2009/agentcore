@@ -39,6 +39,18 @@ _VALID_MERGE_STRATEGIES = {
     "logical_or",
     "logical_and",
 }
+_VALID_INTELLIGENCE_KINDS = {
+    "all",
+    "task",
+    "tasks",
+    "claim",
+    "claims",
+    "evidence",
+    "decision",
+    "decisions",
+    "memory",
+    "memories",
+}
 
 _MISSING = object()
 
@@ -48,6 +60,56 @@ class Command:
     update: dict[str, Any] | None = None
     goto: str | None = None
     wait: bool = False
+
+
+@dataclass(frozen=True)
+class IntelligenceRule:
+    goto: str
+    kind: str | None = None
+    key: str | None = None
+    key_prefix: str | None = None
+    task_key: str | None = None
+    claim_key: str | None = None
+    subject: str | None = None
+    relation: str | None = None
+    object: str | None = None
+    owner: str | None = None
+    source: str | None = None
+    scope: str | None = None
+    status: str | None = None
+    layer: str | None = None
+    min_confidence: float | None = None
+    min_importance: float | None = None
+    min_count: int = 1
+    max_count: int | None = None
+
+
+@dataclass(frozen=True)
+class IntelligenceSubscription:
+    kind: str | None = None
+    key: str | None = None
+    key_prefix: str | None = None
+    task_key: str | None = None
+    claim_key: str | None = None
+    subject: str | None = None
+    relation: str | None = None
+    object: str | None = None
+    owner: str | None = None
+    source: str | None = None
+    scope: str | None = None
+    status: str | None = None
+    layer: str | None = None
+    min_confidence: float | None = None
+    min_importance: float | None = None
+
+
+@dataclass(frozen=True)
+class IntelligenceRouter:
+    rules: Sequence[IntelligenceRule | Mapping[str, Any]]
+    default: str | None = None
+
+    def __call__(self, state: Any, config: Any, runtime: "RuntimeContext") -> str | None:
+        return runtime.intelligence.route(self.rules, default=self.default)
 
 
 @dataclass
@@ -73,6 +135,7 @@ class _NodeSpec:
     read_keys: tuple[str, ...] = ()
     cache_size: int = 16
     merge: dict[str, str] = field(default_factory=dict)
+    intelligence_subscriptions: tuple[dict[str, Any], ...] = ()
     subgraph: _SubgraphSpec | None = None
 
 
@@ -164,17 +227,775 @@ def _resolve_maybe_awaitable(value: Any) -> Any:
     return value
 
 
+def _build_intelligence_filter_spec(
+    *,
+    kind: str | None,
+    key: str | None,
+    key_prefix: str | None,
+    task_key: str | None,
+    claim_key: str | None,
+    subject: str | None,
+    relation: str | None,
+    object: str | None,
+    owner: str | None,
+    source: str | None,
+    scope: str | None,
+    status: str | None,
+    layer: str | None,
+    min_confidence: float | None,
+    min_importance: float | None,
+    limit: int | None,
+) -> dict[str, Any]:
+    spec: dict[str, Any] = {}
+    normalized_kind: str | None = None
+    if kind is not None:
+        normalized_kind = str(kind).strip().lower()
+        if normalized_kind not in _VALID_INTELLIGENCE_KINDS:
+            raise ValueError(
+                "kind must be one of all, task, tasks, claim, claims, evidence, decision, decisions, memory, memories"
+            )
+        spec["kind"] = normalized_kind
+    if key is not None:
+        spec["key"] = str(key)
+    if key_prefix is not None:
+        spec["key_prefix"] = str(key_prefix)
+    if task_key is not None:
+        spec["task_key"] = str(task_key)
+    if claim_key is not None:
+        spec["claim_key"] = str(claim_key)
+    if subject is not None:
+        if normalized_kind not in {None, "all", "claim", "claims"}:
+            raise ValueError("subject filters require kind='claims' or a cross-kind surface")
+        spec["subject"] = str(subject)
+    if relation is not None:
+        if normalized_kind not in {None, "all", "claim", "claims"}:
+            raise ValueError("relation filters require kind='claims' or a cross-kind surface")
+        spec["relation"] = str(relation)
+    if object is not None:
+        if normalized_kind not in {None, "all", "claim", "claims"}:
+            raise ValueError("object filters require kind='claims' or a cross-kind surface")
+        spec["object"] = str(object)
+    if owner is not None:
+        spec["owner"] = str(owner)
+    if source is not None:
+        spec["source"] = str(source)
+    if scope is not None:
+        spec["scope"] = str(scope)
+    if status is not None:
+        if normalized_kind not in {"task", "tasks", "claim", "claims", "decision", "decisions"}:
+            raise ValueError("status filters require kind='tasks', 'claims', or 'decisions'")
+        spec["status"] = str(status)
+    if layer is not None:
+        if normalized_kind not in {"memory", "memories"}:
+            raise ValueError("layer filters require kind='memories'")
+        spec["layer"] = str(layer)
+    if min_confidence is not None:
+        spec["min_confidence"] = float(min_confidence)
+    if min_importance is not None:
+        if normalized_kind not in {"memory", "memories"}:
+            raise ValueError("min_importance filters require kind='memories'")
+        spec["min_importance"] = float(min_importance)
+    if limit is not None:
+        if int(limit) < 0:
+            raise ValueError("limit must be >= 0")
+        spec["limit"] = int(limit)
+    return spec
+
+
+def _normalize_intelligence_subscription(
+    subscription: IntelligenceSubscription | Mapping[str, Any]
+) -> dict[str, Any]:
+    if isinstance(subscription, IntelligenceSubscription):
+        raw = {
+            "kind": subscription.kind,
+            "key": subscription.key,
+            "key_prefix": subscription.key_prefix,
+            "task_key": subscription.task_key,
+            "claim_key": subscription.claim_key,
+            "subject": subscription.subject,
+            "relation": subscription.relation,
+            "object": subscription.object,
+            "owner": subscription.owner,
+            "source": subscription.source,
+            "scope": subscription.scope,
+            "status": subscription.status,
+            "layer": subscription.layer,
+            "min_confidence": subscription.min_confidence,
+            "min_importance": subscription.min_importance,
+        }
+    elif isinstance(subscription, Mapping):
+        raw = dict(subscription.items())
+    else:
+        raise TypeError(
+            "intelligence_subscriptions must contain IntelligenceSubscription instances or mappings"
+        )
+
+    spec = _build_intelligence_filter_spec(
+        kind=None if raw.get("kind") is None else str(raw.get("kind")),
+        key=None if raw.get("key") is None else str(raw.get("key")),
+        key_prefix=None if raw.get("key_prefix") is None else str(raw.get("key_prefix")),
+        task_key=None if raw.get("task_key") is None else str(raw.get("task_key")),
+        claim_key=None if raw.get("claim_key") is None else str(raw.get("claim_key")),
+        subject=None if raw.get("subject") is None else str(raw.get("subject")),
+        relation=None if raw.get("relation") is None else str(raw.get("relation")),
+        object=None if raw.get("object") is None else str(raw.get("object")),
+        owner=None if raw.get("owner") is None else str(raw.get("owner")),
+        source=None if raw.get("source") is None else str(raw.get("source")),
+        scope=None if raw.get("scope") is None else str(raw.get("scope")),
+        status=None if raw.get("status") is None else str(raw.get("status")),
+        layer=None if raw.get("layer") is None else str(raw.get("layer")),
+        min_confidence=None if raw.get("min_confidence") is None else float(raw.get("min_confidence")),
+        min_importance=None if raw.get("min_importance") is None else float(raw.get("min_importance")),
+        limit=None,
+    )
+    if not spec:
+        raise ValueError(
+            "intelligence subscriptions must constrain kind or at least one filter field"
+        )
+    return spec
+
+
+class IntelligenceView:
+    def __init__(self, runtime_context: "RuntimeContext"):
+        self._runtime_context = runtime_context
+
+    def _require_runtime(self) -> Any:
+        self._runtime_context._require_runtime()
+        return self._runtime_context._native_runtime
+
+    def snapshot(self) -> dict[str, Any]:
+        runtime = self._require_runtime()
+        snapshot = _native._runtime_snapshot_intelligence(runtime)
+        if not isinstance(snapshot, dict):
+            raise TypeError("native runtime returned an invalid intelligence snapshot")
+        return snapshot
+
+    def summary(self) -> dict[str, Any]:
+        runtime = self._require_runtime()
+        result = _native._runtime_intelligence_summary(runtime)
+        if not isinstance(result, dict):
+            raise TypeError("native runtime returned an invalid intelligence summary")
+        return result
+
+    def count(
+        self,
+        *,
+        kind: str | None = None,
+        key: str | None = None,
+        key_prefix: str | None = None,
+        task_key: str | None = None,
+        claim_key: str | None = None,
+        subject: str | None = None,
+        relation: str | None = None,
+        object: str | None = None,
+        owner: str | None = None,
+        source: str | None = None,
+        scope: str | None = None,
+        status: str | None = None,
+        layer: str | None = None,
+        min_confidence: float | None = None,
+        min_importance: float | None = None,
+    ) -> int:
+        runtime = self._require_runtime()
+        spec = self._build_query_spec(
+            kind=kind,
+            key=key,
+            key_prefix=key_prefix,
+            task_key=task_key,
+            claim_key=claim_key,
+            subject=subject,
+            relation=relation,
+            object=object,
+            owner=owner,
+            source=source,
+            scope=scope,
+            status=status,
+            layer=layer,
+            min_confidence=min_confidence,
+            min_importance=min_importance,
+            limit=None,
+        )
+        result = _native._runtime_count_intelligence(runtime, spec)
+        if not isinstance(result, int):
+            raise TypeError("native runtime returned an invalid intelligence count")
+        return result
+
+    def exists(self, **filters: Any) -> bool:
+        return self.count(**filters) > 0
+
+    def query(
+        self,
+        *,
+        kind: str | None = None,
+        key: str | None = None,
+        key_prefix: str | None = None,
+        task_key: str | None = None,
+        claim_key: str | None = None,
+        subject: str | None = None,
+        relation: str | None = None,
+        object: str | None = None,
+        owner: str | None = None,
+        source: str | None = None,
+        scope: str | None = None,
+        status: str | None = None,
+        layer: str | None = None,
+        min_confidence: float | None = None,
+        min_importance: float | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        runtime = self._require_runtime()
+        spec = self._build_query_spec(
+            kind=kind,
+            key=key,
+            key_prefix=key_prefix,
+            task_key=task_key,
+            claim_key=claim_key,
+            subject=subject,
+            relation=relation,
+            object=object,
+            owner=owner,
+            source=source,
+            scope=scope,
+            status=status,
+            layer=layer,
+            min_confidence=min_confidence,
+            min_importance=min_importance,
+            limit=limit,
+        )
+        result = _native._runtime_query_intelligence(runtime, spec)
+        if not isinstance(result, dict):
+            raise TypeError("native runtime returned an invalid intelligence query result")
+        return result
+
+    def related(
+        self,
+        *,
+        task_key: str | None = None,
+        claim_key: str | None = None,
+        limit: int | None = None,
+        hops: int = 1,
+    ) -> dict[str, Any]:
+        runtime = self._require_runtime()
+        spec: dict[str, Any] = {}
+        if task_key is not None:
+            spec["task_key"] = str(task_key)
+        if claim_key is not None:
+            spec["claim_key"] = str(claim_key)
+        if not spec:
+            raise ValueError("related intelligence lookup requires task_key or claim_key")
+        if limit is not None:
+            if int(limit) < 0:
+                raise ValueError("limit must be >= 0")
+            spec["limit"] = int(limit)
+        if int(hops) < 1:
+            raise ValueError("hops must be >= 1")
+        spec["hops"] = int(hops)
+        result = _native._runtime_related_intelligence(runtime, spec)
+        if not isinstance(result, dict):
+            raise TypeError("native runtime returned an invalid related intelligence result")
+        return result
+
+    def agenda(
+        self,
+        *,
+        key: str | None = None,
+        key_prefix: str | None = None,
+        task_key: str | None = None,
+        owner: str | None = None,
+        status: str | None = None,
+        min_confidence: float | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        runtime = self._require_runtime()
+        spec = self._build_query_spec(
+            kind="tasks",
+            key=key,
+            key_prefix=key_prefix,
+            task_key=task_key,
+            claim_key=None,
+            subject=None,
+            relation=None,
+            object=None,
+            owner=owner,
+            source=None,
+            scope=None,
+            status=status,
+            layer=None,
+            min_confidence=min_confidence,
+            min_importance=None,
+            limit=limit,
+        )
+        result = _native._runtime_agenda_intelligence(runtime, spec)
+        if not isinstance(result, dict):
+            raise TypeError("native runtime returned an invalid intelligence agenda result")
+        return result
+
+    def supporting_claims(
+        self,
+        *,
+        key: str | None = None,
+        key_prefix: str | None = None,
+        task_key: str | None = None,
+        claim_key: str | None = None,
+        subject: str | None = None,
+        relation: str | None = None,
+        object: str | None = None,
+        status: str | None = None,
+        min_confidence: float | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        runtime = self._require_runtime()
+        spec = self._build_query_spec(
+            kind="claims",
+            key=key,
+            key_prefix=key_prefix,
+            task_key=task_key,
+            claim_key=claim_key,
+            subject=subject,
+            relation=relation,
+            object=object,
+            owner=None,
+            source=None,
+            scope=None,
+            status=status,
+            layer=None,
+            min_confidence=min_confidence,
+            min_importance=None,
+            limit=limit,
+        )
+        result = _native._runtime_supporting_claims_intelligence(runtime, spec)
+        if not isinstance(result, dict):
+            raise TypeError("native runtime returned an invalid supporting-claims result")
+        return result
+
+    def action_candidates(
+        self,
+        *,
+        task_key: str | None = None,
+        claim_key: str | None = None,
+        subject: str | None = None,
+        relation: str | None = None,
+        object: str | None = None,
+        owner: str | None = None,
+        task_status: str | None = None,
+        source: str | None = None,
+        scope: str | None = None,
+        layer: str | None = None,
+        min_confidence: float | None = None,
+        min_importance: float | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        runtime = self._require_runtime()
+        spec: dict[str, Any] = {}
+        if task_key is not None:
+            spec["task_key"] = str(task_key)
+        if claim_key is not None:
+            spec["claim_key"] = str(claim_key)
+        if subject is not None:
+            spec["subject"] = str(subject)
+        if relation is not None:
+            spec["relation"] = str(relation)
+        if object is not None:
+            spec["object"] = str(object)
+        if owner is not None:
+            spec["owner"] = str(owner)
+        if task_status is not None:
+            spec["task_status"] = str(task_status)
+        if source is not None:
+            spec["source"] = str(source)
+        if scope is not None:
+            spec["scope"] = str(scope)
+        if layer is not None:
+            spec["layer"] = str(layer)
+        if min_confidence is not None:
+            spec["min_confidence"] = float(min_confidence)
+        if min_importance is not None:
+            spec["min_importance"] = float(min_importance)
+        if limit is not None:
+            if int(limit) < 0:
+                raise ValueError("limit must be >= 0")
+            spec["limit"] = int(limit)
+        result = _native._runtime_action_candidates_intelligence(runtime, spec)
+        if not isinstance(result, dict):
+            raise TypeError("native runtime returned an invalid action-candidates result")
+        return result
+
+    def next_task(
+        self,
+        *,
+        key: str | None = None,
+        key_prefix: str | None = None,
+        task_key: str | None = None,
+        owner: str | None = None,
+        status: str | None = None,
+        min_confidence: float | None = None,
+    ) -> dict[str, Any] | None:
+        agenda = self.agenda(
+            key=key,
+            key_prefix=key_prefix,
+            task_key=task_key,
+            owner=owner,
+            status=status,
+            min_confidence=min_confidence,
+            limit=1,
+        )
+        tasks = agenda.get("tasks")
+        if not isinstance(tasks, list) or not tasks:
+            return None
+        first = tasks[0]
+        if not isinstance(first, dict):
+            raise TypeError("native runtime returned an invalid next-task payload")
+        return first
+
+    def recall(
+        self,
+        *,
+        key: str | None = None,
+        key_prefix: str | None = None,
+        task_key: str | None = None,
+        claim_key: str | None = None,
+        scope: str | None = None,
+        layer: str | None = None,
+        min_importance: float | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        runtime = self._require_runtime()
+        spec = self._build_query_spec(
+            kind="memories",
+            key=key,
+            key_prefix=key_prefix,
+            task_key=task_key,
+            claim_key=claim_key,
+            subject=None,
+            relation=None,
+            object=None,
+            owner=None,
+            source=None,
+            scope=scope,
+            status=None,
+            layer=layer,
+            min_confidence=None,
+            min_importance=min_importance,
+            limit=limit,
+        )
+        result = _native._runtime_recall_intelligence(runtime, spec)
+        if not isinstance(result, dict):
+            raise TypeError("native runtime returned an invalid intelligence recall result")
+        return result
+
+    def focus(
+        self,
+        *,
+        key: str | None = None,
+        key_prefix: str | None = None,
+        task_key: str | None = None,
+        claim_key: str | None = None,
+        subject: str | None = None,
+        relation: str | None = None,
+        object: str | None = None,
+        owner: str | None = None,
+        source: str | None = None,
+        scope: str | None = None,
+        layer: str | None = None,
+        min_confidence: float | None = None,
+        min_importance: float | None = None,
+        limit: int | None = 5,
+    ) -> dict[str, Any]:
+        runtime = self._require_runtime()
+        spec = self._build_query_spec(
+            kind=None,
+            key=key,
+            key_prefix=key_prefix,
+            task_key=task_key,
+            claim_key=claim_key,
+            subject=subject,
+            relation=relation,
+            object=object,
+            owner=owner,
+            source=source,
+            scope=scope,
+            status=None,
+            layer=layer,
+            min_confidence=min_confidence,
+            min_importance=min_importance,
+            limit=limit,
+        )
+        result = _native._runtime_focus_intelligence(runtime, spec)
+        if not isinstance(result, dict):
+            raise TypeError("native runtime returned an invalid intelligence focus result")
+        return result
+
+    def route(
+        self,
+        rules: Sequence[IntelligenceRule | Mapping[str, Any]],
+        *,
+        default: str | None = None,
+    ) -> str | None:
+        runtime = self._require_runtime()
+        if not rules:
+            return default
+
+        native_rules: list[dict[str, Any]] = []
+        for rule in rules:
+            spec = self._normalize_route_rule(rule)
+            native_rules.append(spec)
+
+        result = _native._runtime_route_intelligence(
+            runtime,
+            {"rules": native_rules, "default": default},
+        )
+        if result is None:
+            return None
+        if not isinstance(result, str):
+            raise TypeError("native runtime returned an invalid intelligence route result")
+        return result
+
+    def upsert_task(
+        self,
+        key: str,
+        *,
+        title: str | None = None,
+        owner: str | None = None,
+        details: Any | None = None,
+        result: Any | None = None,
+        status: str | None = None,
+        priority: int | None = None,
+        confidence: float | None = None,
+    ) -> None:
+        runtime = self._require_runtime()
+        spec = {"key": str(key)}
+        if title is not None:
+            spec["title"] = str(title)
+        if owner is not None:
+            spec["owner"] = str(owner)
+        if details is not None:
+            spec["details"] = details
+        if result is not None:
+            spec["result"] = result
+        if status is not None:
+            spec["status"] = str(status)
+        if priority is not None:
+            spec["priority"] = int(priority)
+        if confidence is not None:
+            spec["confidence"] = float(confidence)
+        _native._runtime_upsert_task(runtime, spec)
+
+    def upsert_claim(
+        self,
+        key: str,
+        *,
+        subject: str | None = None,
+        relation: str | None = None,
+        object: str | None = None,
+        statement: Any | None = None,
+        status: str | None = None,
+        confidence: float | None = None,
+    ) -> None:
+        runtime = self._require_runtime()
+        spec = {"key": str(key)}
+        if subject is not None:
+            spec["subject"] = str(subject)
+        if relation is not None:
+            spec["relation"] = str(relation)
+        if object is not None:
+            spec["object"] = str(object)
+        if statement is not None:
+            spec["statement"] = statement
+        if status is not None:
+            spec["status"] = str(status)
+        if confidence is not None:
+            spec["confidence"] = float(confidence)
+        _native._runtime_upsert_claim(runtime, spec)
+
+    def add_evidence(
+        self,
+        key: str,
+        *,
+        kind: str | None = None,
+        source: str | None = None,
+        content: Any | None = None,
+        task_key: str | None = None,
+        claim_key: str | None = None,
+        confidence: float | None = None,
+    ) -> None:
+        runtime = self._require_runtime()
+        spec = {"key": str(key)}
+        if kind is not None:
+            spec["kind"] = str(kind)
+        if source is not None:
+            spec["source"] = str(source)
+        if content is not None:
+            spec["content"] = content
+        if task_key is not None:
+            spec["task_key"] = str(task_key)
+        if claim_key is not None:
+            spec["claim_key"] = str(claim_key)
+        if confidence is not None:
+            spec["confidence"] = float(confidence)
+        _native._runtime_add_evidence(runtime, spec)
+
+    def record_decision(
+        self,
+        key: str,
+        *,
+        task_key: str | None = None,
+        claim_key: str | None = None,
+        summary: Any | None = None,
+        status: str | None = None,
+        confidence: float | None = None,
+    ) -> None:
+        runtime = self._require_runtime()
+        spec = {"key": str(key)}
+        if task_key is not None:
+            spec["task_key"] = str(task_key)
+        if claim_key is not None:
+            spec["claim_key"] = str(claim_key)
+        if summary is not None:
+            spec["summary"] = summary
+        if status is not None:
+            spec["status"] = str(status)
+        if confidence is not None:
+            spec["confidence"] = float(confidence)
+        _native._runtime_record_decision(runtime, spec)
+
+    def remember(
+        self,
+        key: str,
+        *,
+        layer: str | None = None,
+        scope: str | None = None,
+        content: Any | None = None,
+        task_key: str | None = None,
+        claim_key: str | None = None,
+        importance: float | None = None,
+    ) -> None:
+        runtime = self._require_runtime()
+        spec = {"key": str(key)}
+        if layer is not None:
+            spec["layer"] = str(layer)
+        if scope is not None:
+            spec["scope"] = str(scope)
+        if content is not None:
+            spec["content"] = content
+        if task_key is not None:
+            spec["task_key"] = str(task_key)
+        if claim_key is not None:
+            spec["claim_key"] = str(claim_key)
+        if importance is not None:
+            spec["importance"] = float(importance)
+        _native._runtime_remember(runtime, spec)
+
+    def _build_query_spec(
+        self,
+        *,
+        kind: str | None,
+        key: str | None,
+        key_prefix: str | None,
+        task_key: str | None,
+        claim_key: str | None,
+        subject: str | None,
+        relation: str | None,
+        object: str | None,
+        owner: str | None,
+        source: str | None,
+        scope: str | None,
+        status: str | None,
+        layer: str | None,
+        min_confidence: float | None,
+        min_importance: float | None,
+        limit: int | None,
+    ) -> dict[str, Any]:
+        return _build_intelligence_filter_spec(
+            kind=kind,
+            key=key,
+            key_prefix=key_prefix,
+            task_key=task_key,
+            claim_key=claim_key,
+            subject=subject,
+            relation=relation,
+            object=object,
+            owner=owner,
+            source=source,
+            scope=scope,
+            status=status,
+            layer=layer,
+            min_confidence=min_confidence,
+            min_importance=min_importance,
+            limit=limit,
+        )
+
+    def _normalize_route_rule(self, rule: IntelligenceRule | Mapping[str, Any]) -> dict[str, Any]:
+        if isinstance(rule, IntelligenceRule):
+            raw = {
+                "goto": rule.goto,
+                "kind": rule.kind,
+                "key": rule.key,
+                "key_prefix": rule.key_prefix,
+                "task_key": rule.task_key,
+                "claim_key": rule.claim_key,
+                "subject": rule.subject,
+                "relation": rule.relation,
+                "object": rule.object,
+                "owner": rule.owner,
+                "source": rule.source,
+                "scope": rule.scope,
+                "status": rule.status,
+                "layer": rule.layer,
+                "min_confidence": rule.min_confidence,
+                "min_importance": rule.min_importance,
+                "min_count": rule.min_count,
+                "max_count": rule.max_count,
+            }
+        elif isinstance(rule, Mapping):
+            raw = dict(rule.items())
+        else:
+            raise TypeError("intelligence route rules must be IntelligenceRule instances or mappings")
+
+        goto = raw.get("goto")
+        if goto is None:
+            raise ValueError("intelligence route rules require goto")
+
+        spec = self._build_query_spec(
+            kind=None if raw.get("kind") is None else str(raw.get("kind")),
+            key=None if raw.get("key") is None else str(raw.get("key")),
+            key_prefix=None if raw.get("key_prefix") is None else str(raw.get("key_prefix")),
+            task_key=None if raw.get("task_key") is None else str(raw.get("task_key")),
+            claim_key=None if raw.get("claim_key") is None else str(raw.get("claim_key")),
+            subject=None if raw.get("subject") is None else str(raw.get("subject")),
+            relation=None if raw.get("relation") is None else str(raw.get("relation")),
+            object=None if raw.get("object") is None else str(raw.get("object")),
+            owner=None if raw.get("owner") is None else str(raw.get("owner")),
+            source=None if raw.get("source") is None else str(raw.get("source")),
+            scope=None if raw.get("scope") is None else str(raw.get("scope")),
+            status=None if raw.get("status") is None else str(raw.get("status")),
+            layer=None if raw.get("layer") is None else str(raw.get("layer")),
+            min_confidence=None if raw.get("min_confidence") is None else float(raw.get("min_confidence")),
+            min_importance=None if raw.get("min_importance") is None else float(raw.get("min_importance")),
+            limit=None,
+        )
+        min_count = raw.get("min_count", 1)
+        if int(min_count) < 0:
+            raise ValueError("min_count must be >= 0")
+        spec["min_count"] = int(min_count)
+        if raw.get("max_count") is not None:
+            if int(raw["max_count"]) < 0:
+                raise ValueError("max_count must be >= 0")
+            spec["max_count"] = int(raw["max_count"])
+        spec["goto"] = str(goto)
+        return spec
+
+
 class RuntimeContext:
     def __init__(self, native_runtime: Any | None):
         self._native_runtime = native_runtime
+        self._intelligence = IntelligenceView(self)
 
     @property
     def available(self) -> bool:
         return self._native_runtime is not None
 
     def record_once_with_metadata(self, key: str, request: Any, producer: Any) -> dict[str, Any]:
-        if not self.available:
-            raise RuntimeError("runtime context is not available for this callback")
+        self._require_runtime()
         if not isinstance(key, str) or not key:
             raise ValueError("recorded effect key must be a non-empty string")
         if not callable(producer):
@@ -192,6 +1013,122 @@ class RuntimeContext:
     def record_once(self, key: str, request: Any, producer: Any) -> Any:
         return self.record_once_with_metadata(key, request, producer)["value"]
 
+    def _require_runtime(self) -> None:
+        if not self.available:
+            raise RuntimeError("runtime context is not available for this callback")
+
+    @property
+    def intelligence(self) -> "IntelligenceView":
+        return self._intelligence
+
+    def snapshot_intelligence(self) -> dict[str, Any]:
+        return self.intelligence.snapshot()
+
+    def upsert_task(
+        self,
+        key: str,
+        *,
+        title: str | None = None,
+        owner: str | None = None,
+        details: Any | None = None,
+        result: Any | None = None,
+        status: str | None = None,
+        priority: int | None = None,
+        confidence: float | None = None,
+    ) -> None:
+        self.intelligence.upsert_task(
+            key,
+            title=title,
+            owner=owner,
+            details=details,
+            result=result,
+            status=status,
+            priority=priority,
+            confidence=confidence,
+        )
+
+    def upsert_claim(
+        self,
+        key: str,
+        *,
+        subject: str | None = None,
+        relation: str | None = None,
+        object: str | None = None,
+        statement: Any | None = None,
+        status: str | None = None,
+        confidence: float | None = None,
+    ) -> None:
+        self.intelligence.upsert_claim(
+            key,
+            subject=subject,
+            relation=relation,
+            object=object,
+            statement=statement,
+            status=status,
+            confidence=confidence,
+        )
+
+    def add_evidence(
+        self,
+        key: str,
+        *,
+        kind: str | None = None,
+        source: str | None = None,
+        content: Any | None = None,
+        task_key: str | None = None,
+        claim_key: str | None = None,
+        confidence: float | None = None,
+    ) -> None:
+        self.intelligence.add_evidence(
+            key,
+            kind=kind,
+            source=source,
+            content=content,
+            task_key=task_key,
+            claim_key=claim_key,
+            confidence=confidence,
+        )
+
+    def record_decision(
+        self,
+        key: str,
+        *,
+        task_key: str | None = None,
+        claim_key: str | None = None,
+        summary: Any | None = None,
+        status: str | None = None,
+        confidence: float | None = None,
+    ) -> None:
+        self.intelligence.record_decision(
+            key,
+            task_key=task_key,
+            claim_key=claim_key,
+            summary=summary,
+            status=status,
+            confidence=confidence,
+        )
+
+    def remember(
+        self,
+        key: str,
+        *,
+        layer: str | None = None,
+        scope: str | None = None,
+        content: Any | None = None,
+        task_key: str | None = None,
+        claim_key: str | None = None,
+        importance: float | None = None,
+    ) -> None:
+        self.intelligence.remember(
+            key,
+            layer=layer,
+            scope=scope,
+            content=content,
+            task_key=task_key,
+            claim_key=claim_key,
+            importance=importance,
+        )
+
     def invoke_tool_with_metadata(
         self,
         name: str,
@@ -199,8 +1136,7 @@ class RuntimeContext:
         *,
         decode: str = "auto",
     ) -> dict[str, Any]:
-        if not self.available:
-            raise RuntimeError("runtime context is not available for this callback")
+        self._require_runtime()
         details = _native._runtime_invoke_tool_with_details(
             self._native_runtime,
             str(name),
@@ -229,8 +1165,7 @@ class RuntimeContext:
         max_tokens: int = 0,
         decode: str = "auto",
     ) -> dict[str, Any]:
-        if not self.available:
-            raise RuntimeError("runtime context is not available for this callback")
+        self._require_runtime()
         details = _native._runtime_invoke_model_with_details(
             self._native_runtime,
             str(name),
@@ -419,6 +1354,7 @@ class StateGraph:
         deterministic: bool = False,
         read_keys: Sequence[str] | None = None,
         cache_size: int = 16,
+        intelligence_subscriptions: Sequence[IntelligenceSubscription | Mapping[str, Any]] | None = None,
         merge: dict[str, Any] | None = None,
     ) -> "StateGraph":
         if action is not None and not callable(action):
@@ -432,6 +1368,10 @@ class StateGraph:
         if not deterministic and normalized_read_keys:
             raise ValueError("read_keys require deterministic=True")
         normalized_cache_size = max(1, int(cache_size))
+        normalized_intelligence_subscriptions = tuple(
+            _normalize_intelligence_subscription(subscription)
+            for subscription in (intelligence_subscriptions or ())
+        )
 
         self._nodes[name] = _NodeSpec(
             action=action,
@@ -443,6 +1383,7 @@ class StateGraph:
             deterministic=bool(deterministic),
             read_keys=normalized_read_keys,
             cache_size=normalized_cache_size,
+            intelligence_subscriptions=normalized_intelligence_subscriptions,
             merge=_normalize_merge_rules(merge),
         )
         if self._entry_point is None:
@@ -615,6 +1556,7 @@ class StateGraph:
                     deterministic=node_spec.deterministic,
                     read_keys=node_spec.read_keys,
                     cache_size=node_spec.cache_size,
+                    intelligence_subscriptions=node_spec.intelligence_subscriptions,
                     merge_rules=node_spec.merge,
                 )
 

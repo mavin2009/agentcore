@@ -59,8 +59,8 @@ The runtime now includes a first incremental-execution seam for deterministic no
 
 This is intentionally conservative.
 
-- knowledge-reactive nodes do not currently participate in deterministic memoization
-- knowledge-graph writes clear the branch-local memo cache rather than trying to derive a partial graph dependency key
+- reactive nodes do not currently participate in deterministic memoization
+- knowledge-graph or intelligence writes clear the branch-local memo cache rather than trying to derive a partial graph dependency key
 - subgraph/tool/model nodes are excluded from this first memoization seam
 
 The reason for this design is straightforward: the runtime gets an explicit invalidation model without weakening replay or smuggling hidden Python-side caches into execution.
@@ -71,10 +71,95 @@ The state layer intentionally separates:
 
 - small indexed fields in `WorkflowState`
 - larger payloads in `BlobStore`
+- structured intelligence records in `IntelligenceStore`
 - knowledge-graph state in `KnowledgeGraphStore`
 - recorded synchronous outcomes in `TaskJournal`
 
 This keeps the hot execution path focused on compact control state while still allowing prompts, model outputs, tool payloads, and serialized artifacts to move through the runtime.
+
+## Intelligence State
+
+AgentCore now includes a first-class intelligence state model inside the native state subsystem rather than treating agent reasoning artifacts as a convention layered on top of generic fields.
+
+The implemented record types are:
+
+- tasks
+- claims
+- evidence
+- decisions
+- memories
+
+These records are stored in `IntelligenceStore`, carried through `StatePatch::intelligence`, summarized by `IntelligenceDeltaSummary`, serialized with checkpoints, and restored on replay/resume with the rest of state.
+
+This design is intentionally separate from the knowledge graph.
+
+- the intelligence model is optimized for execution-oriented records such as active work, asserted claims, supporting evidence, accepted or rejected decisions, and memory entries
+- the knowledge graph is optimized for entity/triple storage and reactive graph-aware matching
+
+The two can reference the same domain concepts, but they solve different runtime problems.
+
+### Commit And Read Semantics
+
+Intelligence writes follow the same commit rule as other state:
+
+1. the node stages a write into `StatePatch::intelligence`
+2. the engine commits that patch once for the step
+3. checkpoints, traces, proof digests, and replay all observe the same committed result
+
+On the Python surface, `runtime.intelligence.snapshot()` overlays any staged writes onto the current intelligence store before returning, so a callback can verify read-your-own-writes within the same node execution without introducing a second mutable state channel.
+
+The runtime now also exposes a small operational layer over that store:
+
+- `runtime.intelligence.summary()` for status and layer tallies
+- `runtime.intelligence.count(...)` and `runtime.intelligence.exists(...)` for threshold and presence checks
+- `runtime.intelligence.query(...)` for filtered record retrieval, including direct claim-semantic filters by `subject`, `relation`, and `object`
+- `runtime.intelligence.supporting_claims(...)` for ranked claim retrieval from supporting evidence, decisions, and memories
+- `runtime.intelligence.action_candidates(...)` for ranked task retrieval from task, claim, semantic-claim, source, and memory anchors
+- `runtime.intelligence.related(...)` for bounded neighborhood expansion around one task or claim
+- `runtime.intelligence.agenda(...)` and `runtime.intelligence.next_task(...)` for ranked task selection
+- `runtime.intelligence.recall(...)` for ranked memory retrieval
+- `runtime.intelligence.focus(...)` for bounded cross-kind retrieval around the current task/memory/evidence frontier, including claim-semantic anchors
+- `runtime.intelligence.route(...)` for ordered route selection against the live intelligence view
+
+That layer is intentionally narrow. It gives workflows a way to act on the intelligence records already in state without turning the engine itself into a hardcoded planner or belief system.
+
+The ranking rules are explicit and deterministic:
+
+- task agendas rank tasks by status class (`in_progress`, `open`, `blocked`, `completed`, `cancelled`), then by descending priority, then by descending confidence, then by ascending stable id
+- supporting-claim retrieval ranks claims by aligned support first, then total support, then claim status class, then confidence, then stable id
+- action-candidate retrieval ranks tasks by direct task anchor first, then direct support alignment from linked evidence/decisions/memories, then task status class, then total linked support, then descending priority, then descending confidence, then stable id
+- memory recall ranks memories by descending importance, then by ascending stable id
+- focus retrieval seeds from direct anchors plus the current task agenda, memory recall, and explicit source/owner filters, then expands one bounded related set through task/claim links before ranking each record type deterministically
+- inside that focus set, direct anchors stay first, and weighted support from selected decisions, stronger evidence, and higher-importance memories is preferred over sheer weak-link volume
+- `related(...)` uses the same indexed link structure and can expand for multiple bounded hops (`hops=1` by default), which lets a workflow cross a shared claim or task neighborhood without materializing a custom traversal in Python
+
+That means a workflow can ask for "the next task" or "the top memories" without relying on Python-side sorts or implicit object insertion order.
+
+### Intelligence-Reactive Nodes
+
+Graphs can also declare intelligence-reactive nodes. In the Python layer, this is exposed through `intelligence_subscriptions=[...]` on `StateGraph.add_node(...)`. In the native graph IR, those subscriptions are compiled into node metadata alongside other routing and reactive definitions.
+
+The runtime matches committed `IntelligenceDeltaSummary` entries against those subscriptions after patch commit. Matching nodes are scheduled through the existing reactive frontier machinery:
+
+- the trigger happens only after the intelligence patch is committed
+- duplicate no-op writes do not retrigger the frontier
+- pending reruns are checkpointed and restored the same way as other reactive frontiers
+- the matching decision uses the committed post-step record shape, not a Python-side cache
+- claim subscriptions can match on `subject`, `relation`, and `object` directly, and those semantic filters also work with `kind=all` when the intent is "react only to claim deltas with this graph pattern"
+
+This keeps intelligence-triggered reruns deterministic and replayable rather than turning them into out-of-band callbacks or ad hoc observer logic.
+
+### Why This Lives In Native State
+
+The point of this model is not only convenience. It gives the runtime one place to preserve:
+
+- deterministic commit timing
+- checkpoint and replay behavior
+- subgraph/session isolation
+- stream and metadata inspection
+- memoization invalidation when structured reasoning state changes
+
+Because intelligence writes are part of ordinary patch application, they also participate in the same persistent session rules as other child state in subgraphs.
 
 ## Concurrency Model
 
@@ -169,6 +254,8 @@ Knowledge-graph propagation is explicit:
 - parent and child knowledge graphs do not automatically merge outside explicit state/output bindings
 
 That separation matters for graph-aware workflows because it prevents hidden cross-session mutation. A child session can maintain its own reactive frontier and graph-local memory without silently mutating the parent graph state.
+
+The same separation applies to intelligence state. Child intelligence records are part of the child snapshot, not a shared mutable parent side table. Ephemeral subgraphs get a fresh intelligence store per invocation. Persistent subgraphs reuse the committed child-local intelligence store for that session.
 
 ## Knowledge-Graph State
 

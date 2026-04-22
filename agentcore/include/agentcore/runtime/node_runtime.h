@@ -142,6 +142,7 @@ struct ExecutionContext {
     BlobStore& blobs;
     StringInterner& strings;
     const KnowledgeGraphStore& knowledge_graph;
+    const IntelligenceStore& intelligence;
     const TaskJournal& task_journal;
     ToolRegistry& tools;
     ModelRegistry& models;

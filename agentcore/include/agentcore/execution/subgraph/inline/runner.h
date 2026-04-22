@@ -39,7 +39,8 @@ struct InlineSingleBranchSubgraphResult {
     StateStore initial_state,
     const std::vector<std::byte>& runtime_config_payload,
     ToolRegistry& tools,
-    ModelRegistry& models
+    ModelRegistry& models,
+    bool capture_trace = true
 );
 
 } // namespace agentcore
