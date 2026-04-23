@@ -377,6 +377,14 @@ bool parse_join_merge_strategy(
         *strategy = JoinMergeStrategy::LogicalAnd;
         return true;
     }
+    if (text == "concat_sequence") {
+        *strategy = JoinMergeStrategy::ConcatSequence;
+        return true;
+    }
+    if (text == "merge_messages") {
+        *strategy = JoinMergeStrategy::MergeMessages;
+        return true;
+    }
 
     *error_message = "unsupported join merge strategy: " + text;
     return false;

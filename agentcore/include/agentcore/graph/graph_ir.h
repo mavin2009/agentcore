@@ -77,7 +77,9 @@ enum class JoinMergeStrategy : uint8_t {
     MaxInt64,
     MinInt64,
     LogicalOr,
-    LogicalAnd
+    LogicalAnd,
+    ConcatSequence,
+    MergeMessages
 };
 
 struct FieldMergeRule {

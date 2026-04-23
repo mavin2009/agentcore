@@ -75,6 +75,146 @@ graph.add_node(
 
 That cache lives in the native runtime, not in Python. The current implementation keys it by the declared `read_keys` plus the runtime config payload and invalidates cached entries when one of those state keys changes.
 
+## Use Declared Schema Reducers
+
+If your state schema is a declared `TypedDict` or similar annotation-bearing type, AgentCore can infer a small reducer subset directly from supported `Annotated[...]` metadata on join barriers.
+
+```python
+import operator
+from typing_extensions import Annotated, TypedDict
+
+from agentcore.graph import START, StateGraph
+
+
+class ReviewState(TypedDict, total=False):
+    score: Annotated[int, operator.add]
+    notes: Annotated[list[str], operator.add]
+    approved: Annotated[bool, operator.or_]
+    summary: str
+
+
+graph = StateGraph(ReviewState, name="schema_join", worker_count=4)
+graph.add_fanout("fanout")
+graph.add_node("left", lambda state, config: {"score": 1, "notes": ["left"], "approved": False})
+graph.add_node("right", lambda state, config: {"score": 2, "notes": ["right"], "approved": True})
+graph.add_join(
+    "join",
+    lambda state, config: {
+        "summary": f"{state['score']}::{','.join(state['notes'])}::{state['approved']}",
+    },
+)
+graph.add_edge(START, "fanout")
+graph.add_edge("fanout", "left")
+graph.add_edge("fanout", "right")
+graph.add_edge(["left", "right"], "join")
+graph.set_finish_point("join")
+```
+
+The currently inferred reducer subset is deliberately small:
+
+- `Annotated[int, operator.add]`
+- `Annotated[int, min]`
+- `Annotated[int, max]`
+- `Annotated[list[T], operator.add]`
+- `Annotated[list[dict], add_messages]`
+- `Annotated[bool, operator.or_]`
+- `Annotated[bool, operator.and_]`
+
+List concatenation is handled by the native join engine as tagged sequence concatenation and is returned to Python as a regular list. For merge behavior outside that subset, keep the graph explicit with `merge={...}` on the join node or by using a dedicated aggregation step.
+
+## Use Message State
+
+Agent-style message history can use `MessagesState` or an explicit `Annotated[..., add_messages]` field. At join barriers, this compiles to a native message merge: new ids append, matching ids replace the existing message in place, and messages without ids append.
+
+```python
+from agentcore.graph import START, MessagesState, StateGraph
+
+
+class AgentState(MessagesState, total=False):
+    summary: str
+
+
+graph = StateGraph(AgentState, name="message_join", worker_count=4)
+graph.add_fanout("fanout")
+graph.add_node("draft", lambda state, config: {
+    "messages": [{"id": "draft", "role": "assistant", "content": "draft answer"}],
+})
+graph.add_node("revise", lambda state, config: {
+    "messages": [{"id": "draft", "role": "assistant", "content": "revised answer"}],
+})
+graph.add_join("join", lambda state, config: {
+    "summary": state["messages"][-1]["content"],
+})
+graph.add_edge(START, "fanout")
+graph.add_edge("fanout", "draft")
+graph.add_edge("fanout", "revise")
+graph.add_edge(["draft", "revise"], "join")
+graph.set_finish_point("join")
+```
+
+## Reuse Prompt Templates
+
+Prompt construction is intentionally a small Python layer over the native model registry rather than a second orchestration system. Templates render into the same values already accepted by `compiled.models.invoke(...)` and `runtime.invoke_model(...)`.
+
+```python
+from agentcore import ChatPromptTemplate, PromptTemplate, StateGraph
+from agentcore.graph import END, START
+
+
+summary_prompt = PromptTemplate(
+    "Summarize the request in {style} style.\n\nRequest:\n{request}"
+).partial(style="brief")
+
+review_prompt = ChatPromptTemplate.from_messages(
+    [
+        ("system", "You are a careful code reviewer."),
+        ("user", "Review this diff:\n{diff}"),
+    ]
+)
+
+
+def summarize(state, config, runtime):
+    prompt = summary_prompt.render(request=state["request"])
+    review = review_prompt.render(diff=state["diff"])
+    summary = runtime.invoke_model(
+        "summarizer",
+        prompt,
+        decode="text",
+    )
+    critique = runtime.invoke_model(
+        "reviewer",
+        review,
+        decode="text",
+    )
+    return {"summary": summary, "critique": critique}
+
+
+graph = StateGraph(dict, name="prompt_demo")
+graph.add_node("summarize", summarize)
+graph.add_edge(START, "summarize")
+graph.add_edge("summarize", END)
+```
+
+Rendered prompt objects can also be passed to `compiled.models.invoke(...)` directly:
+
+```python
+compiled = graph.compile()
+
+reply = compiled.models.invoke(
+    "summarizer",
+    summary_prompt.render(request="Explain checkpoint commit rules."),
+    decode="text",
+)
+```
+
+For the built-in native chat adapters, rendered chat prompts default to role-prefixed text because the current provider adapters consume text prompt payloads. If you register a custom Python-backed model handler that expects structured messages, use:
+
+```python
+messages = review_prompt.render(diff="...").to_model_input(mode="messages")
+```
+
+That returns a JSON-friendly message list such as `[{ "role": "system", "content": "..." }, ...]`.
+
 ## Use Higher-Level Builders For Common Shapes
 
 `StateGraph` remains the core Python API, but the package now also includes an optional pattern layer for workflow shapes that otherwise require a lot of repetitive builder code.
@@ -506,6 +646,14 @@ The executable coverage for those shapes lives in [`../../python/tests/agent_wor
 - fan-out and join with merge strategies
 
 If you use `add_subgraph(...)`, the runtime propagates the Python `config` into child runs. That config must therefore be pickle-serializable.
+
+When parent and child graphs already share a declared schema, there is also a shorter shared-state form:
+
+```python
+parent.add_node("specialist_child", specialist_graph)
+```
+
+That shorthand binds the overlapping schema fields by name for both input and output. It is intended for the shared-state default only. Use `add_subgraph(...)` when you need explicit field bindings, namespaces, persistent sessions, or knowledge-graph propagation settings.
 
 ## Persistent Subgraph Sessions
 

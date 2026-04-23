@@ -1,10 +1,12 @@
-from agentcore import END, START, StateGraph
+from agentcore import ChatPromptTemplate, END, PromptTemplate, START, StateGraph
 
 
 custom_tool_calls = []
 custom_model_calls = []
+prompt_text_model_calls = []
+prompt_messages_model_calls = []
 arity_tool_calls = {"zero": 0, "one": 0}
-arity_model_calls = {"one": 0, "two": 0}
+arity_model_calls = {"one": 0, "two": 0, "messages": 0}
 
 
 async def custom_tool_handler(request, metadata):
@@ -49,6 +51,25 @@ def two_arg_model_handler(prompt, schema):
     return {"summary": f"{prompt['topic']}::{schema['style']}"}
 
 
+def prompt_text_model_handler(prompt, schema, metadata):
+    prompt_text_model_calls.append((prompt, schema, dict(metadata)))
+    assert isinstance(prompt, str)
+    return {
+        "prompt": prompt,
+        "schema_style": schema["style"],
+        "max_tokens": metadata["max_tokens"],
+    }
+
+
+def prompt_messages_model_handler(prompt):
+    arity_model_calls["messages"] += 1
+    prompt_messages_model_calls.append(prompt)
+    return {
+        "messages": prompt,
+        "message_count": len(prompt),
+    }
+
+
 def adapter_node(state, config, runtime):
     topic = str(state.get("topic", "unset"))
     put_details = runtime.invoke_tool_with_metadata(
@@ -79,6 +100,23 @@ def adapter_node(state, config, runtime):
         max_tokens=11,
         decode="json",
     )
+    runtime_chat_prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", "You are a careful adapter for {audience}."),
+            ("user", "Summarize the topic {topic} with tags {tags}."),
+        ]
+    ).partial(audience="operators")
+    rendered_runtime_chat_prompt = runtime_chat_prompt.render(
+        topic=fetched_topic,
+        tags=state.get("tags", ["runtime", "prompt"]),
+    )
+    prompt_template_details = runtime.invoke_model_with_metadata(
+        "py_prompt_text",
+        rendered_runtime_chat_prompt,
+        schema={"style": "brief"},
+        max_tokens=17,
+        decode="json",
+    )
     return {
         "stored": put_details["output"],
         "fetched_topic": fetched_topic,
@@ -93,6 +131,9 @@ def adapter_node(state, config, runtime):
         "custom_confidence": custom_model_details["confidence"],
         "custom_model_error_category": custom_model_details["error_category"],
         "custom_model_token_usage": custom_model_details["token_usage"],
+        "prompt_template_text": prompt_template_details["output"]["prompt"],
+        "prompt_template_schema_style": prompt_template_details["output"]["schema_style"],
+        "prompt_template_max_tokens": prompt_template_details["output"]["max_tokens"],
     }
 
 
@@ -167,6 +208,17 @@ compiled.models.register(
     decode_prompt="json",
     decode_schema="json",
 )
+compiled.models.register(
+    "py_prompt_text",
+    prompt_text_model_handler,
+    decode_prompt="text",
+    decode_schema="json",
+)
+compiled.models.register(
+    "py_prompt_messages",
+    prompt_messages_model_handler,
+    decode_prompt="json",
+)
 
 tool_specs = {spec["name"]: spec for spec in compiled.tools.list()}
 assert {"kv_store", "py_upper", "py_zero", "py_echo"} <= set(tool_specs)
@@ -190,6 +242,8 @@ assert {
     "py_summarizer",
     "py_prompt_only",
     "py_prompt_schema",
+    "py_prompt_text",
+    "py_prompt_messages",
     "grok_builtin",
     "gemini_builtin",
 } <= set(model_specs)
@@ -261,6 +315,59 @@ assert compiled.models.invoke(
     "summary": "NATIVE-ADAPTERS::brief",
 }
 
+direct_prompt_template = PromptTemplate(
+    "Summarize {topic} for {audience}.\nContext:\n{context}"
+).partial(audience="operators")
+direct_prompt_result = compiled.models.invoke(
+    "py_prompt_text",
+    direct_prompt_template.render(
+        topic="NATIVE-ADAPTERS",
+        context={"mode": "direct", "surface": "compiled.models"},
+    ),
+    schema={"style": "bullet"},
+    max_tokens=9,
+    decode="json",
+)
+assert direct_prompt_result == {
+    "prompt": "Summarize NATIVE-ADAPTERS for operators.\nContext:\n{\n  \"mode\": \"direct\",\n  \"surface\": \"compiled.models\"\n}",
+    "schema_style": "bullet",
+    "max_tokens": 9,
+}
+
+direct_chat_prompt = ChatPromptTemplate.from_messages(
+    [
+        ("system", "You are a concise {role}."),
+        ("user", "Topic: {topic}\nChecklist:\n{checklist}"),
+    ]
+).partial(role="reviewer")
+direct_chat_result = compiled.models.invoke(
+    "py_prompt_text",
+    direct_chat_prompt.render(
+        topic="NATIVE-ADAPTERS",
+        checklist=["clarity", "determinism"],
+    ),
+    schema={"style": "brief"},
+    max_tokens=13,
+    decode="json",
+)
+assert "SYSTEM:\nYou are a concise reviewer." in direct_chat_result["prompt"]
+assert "USER:\nTopic: NATIVE-ADAPTERS" in direct_chat_result["prompt"]
+assert direct_chat_result["schema_style"] == "brief"
+assert direct_chat_result["max_tokens"] == 13
+
+structured_messages = direct_chat_prompt.render(
+    topic="NATIVE-ADAPTERS",
+    checklist=["clarity", "determinism"],
+).to_model_input(mode="messages")
+messages_result = compiled.models.invoke(
+    "py_prompt_messages",
+    structured_messages,
+    decode="json",
+)
+assert messages_result["message_count"] == 2
+assert messages_result["messages"][0]["role"] == "system"
+assert messages_result["messages"][1]["role"] == "user"
+
 final_state = compiled.invoke({"topic": "native-adapters"})
 assert final_state["stored"] == "ok"
 assert final_state["fetched_topic"] == "native-adapters"
@@ -275,13 +382,20 @@ assert final_state["custom_summary"] == "NATIVE-ADAPTERS::brief::11"
 assert final_state["custom_confidence"] == 0.75
 assert final_state["custom_model_error_category"] == "none"
 assert final_state["custom_model_token_usage"] == len("NATIVE-ADAPTERS")
+assert "SYSTEM:\nYou are a careful adapter for operators." in final_state["prompt_template_text"]
+assert "USER:\nSummarize the topic native-adapters" in final_state["prompt_template_text"]
+assert final_state["prompt_template_schema_style"] == "brief"
+assert final_state["prompt_template_max_tokens"] == 17
 
 assert len(custom_tool_calls) >= 2
 assert len(custom_model_calls) >= 2
 assert arity_tool_calls == {"zero": 1, "one": 1}
-assert arity_model_calls == {"one": 1, "two": 1}
+assert arity_model_calls == {"one": 1, "two": 1, "messages": 1}
 assert custom_tool_calls[0][0] == {"text": "native-adapters"}
 assert custom_tool_calls[0][1]["name"] == "py_upper"
 assert custom_model_calls[0][1] == {"style": "brief"}
+assert len(prompt_text_model_calls) >= 3
+assert prompt_text_model_calls[0][1] == {"style": "bullet"}
+assert prompt_messages_model_calls[0][0]["role"] == "system"
 
 print("python adapters runtime smoke passed")

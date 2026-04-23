@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import inspect
+import operator
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Sequence
+from typing import Annotated, Any, Iterable, Sequence, TypedDict, get_args, get_origin, get_type_hints
 
 from ..adapters.registry import (
     ModelRegistryView,
@@ -14,6 +15,7 @@ from ..adapters.registry import (
     _raise_adapter_error,
     encode_adapter_payload,
 )
+from ..prompts.templates import _coerce_prompt_value_for_model_input
 from .. import _agentcore_native as _native
 
 START = "__start__"
@@ -38,6 +40,8 @@ _VALID_MERGE_STRATEGIES = {
     "min_int64",
     "logical_or",
     "logical_and",
+    "concat_sequence",
+    "merge_messages",
 }
 _VALID_INTELLIGENCE_KINDS = {
     "all",
@@ -60,6 +64,47 @@ class Command:
     update: dict[str, Any] | None = None
     goto: str | None = None
     wait: bool = False
+
+
+def _coerce_message_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return list(value)
+    if isinstance(value, tuple):
+        return list(value)
+    return [value]
+
+
+def _message_id(value: Any) -> str | None:
+    raw_id = value.get("id") if isinstance(value, Mapping) else getattr(value, "id", None)
+    if raw_id is None:
+        return None
+    text = str(raw_id)
+    return text if text else None
+
+
+def add_messages(left: Any = None, right: Any = None) -> list[Any]:
+    """Merge message lists by appending new messages and replacing matching ids."""
+
+    merged: list[Any] = []
+    index_by_id: dict[str, int] = {}
+    for message in [*_coerce_message_list(left), *_coerce_message_list(right)]:
+        message_id = _message_id(message)
+        if message_id is not None and message_id in index_by_id:
+            merged[index_by_id[message_id]] = message
+            continue
+        if message_id is not None:
+            index_by_id[message_id] = len(merged)
+        merged.append(message)
+    return merged
+
+
+add_messages.__agentcore_reducer__ = "add_messages"  # type: ignore[attr-defined]
+
+
+class MessagesState(TypedDict, total=False):
+    messages: Annotated[list[dict[str, Any]], add_messages]
 
 
 @dataclass(frozen=True)
@@ -1166,11 +1211,13 @@ class RuntimeContext:
         decode: str = "auto",
     ) -> dict[str, Any]:
         self._require_runtime()
+        normalized_prompt = _coerce_prompt_value_for_model_input(prompt)
+        normalized_schema = _coerce_prompt_value_for_model_input(schema)
         details = _native._runtime_invoke_model_with_details(
             self._native_runtime,
             str(name),
-            encode_adapter_payload(prompt),
-            encode_adapter_payload(schema),
+            encode_adapter_payload(normalized_prompt),
+            encode_adapter_payload(normalized_schema),
             int(max_tokens),
         )
         return _decode_response_details(details, decode=decode)
@@ -1331,19 +1378,226 @@ def _normalize_string_sequence(value: Any, *, field_name: str) -> tuple[str, ...
     return tuple(normalized)
 
 
+def _is_non_string_sequence(value: Any) -> bool:
+    return isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray, memoryview))
+
+
+def _infer_node_name(action: Any) -> str:
+    if not callable(action):
+        raise TypeError("node actions must be callable when no explicit name is provided")
+    inferred = getattr(action, "__name__", None)
+    if not isinstance(inferred, str) or not inferred or inferred == "<lambda>":
+        raise ValueError(
+            "callable-only node registration requires a named callable; "
+            "pass an explicit node name for lambdas or anonymous callables"
+        )
+    return inferred
+
+
+def _infer_subgraph_node_name(graph: Any) -> str:
+    inferred = getattr(graph, "name", None)
+    if not isinstance(inferred, str) or not inferred:
+        inferred = getattr(graph, "_name", None)
+    if not isinstance(inferred, str) or not inferred:
+        raise ValueError("subgraph-only node registration requires a graph with a stable name")
+    return inferred
+
+
+def _unwrap_schema_annotation(annotation: Any) -> Any:
+    while True:
+        origin = get_origin(annotation)
+        if origin is None:
+            return annotation
+        origin_name = getattr(origin, "__qualname__", getattr(origin, "__name__", ""))
+        if origin_name == "Annotated":
+            annotation = get_args(annotation)[0]
+            continue
+        if origin_name in {"Union", "UnionType"}:
+            union_args = [entry for entry in get_args(annotation) if entry is not type(None)]
+            if len(union_args) == 1:
+                annotation = union_args[0]
+                continue
+        return annotation
+
+
+def _schema_reducer_metadata_to_merge_strategy(annotation: Any, metadata: Any) -> str | None:
+    if isinstance(metadata, str):
+        normalized = metadata.strip().lower()
+        if normalized in _VALID_MERGE_STRATEGIES:
+            return normalized
+        return None
+
+    base = _unwrap_schema_annotation(annotation)
+    base_origin = get_origin(base)
+    if metadata is add_messages or getattr(metadata, "__agentcore_reducer__", None) == "add_messages":
+        if base is list or base_origin is list:
+            return "merge_messages"
+        return None
+    if metadata in {operator.add, operator.iadd}:
+        if base is int:
+            return "sum_int64"
+        if base is list or base_origin is list:
+            return "concat_sequence"
+        return None
+    if metadata in {operator.or_, operator.ior}:
+        if base is bool:
+            return "logical_or"
+        return None
+    if metadata in {operator.and_, operator.iand}:
+        if base is bool:
+            return "logical_and"
+        return None
+    if metadata is max and base is int:
+        return "max_int64"
+    if metadata is min and base is int:
+        return "min_int64"
+    return None
+
+
+def _extract_state_schema_hints(state_schema: Any) -> dict[str, Any]:
+    if state_schema is None or state_schema is dict:
+        return {}
+    try:
+        hints = get_type_hints(state_schema, include_extras=True)
+        if isinstance(hints, dict):
+            return dict(hints)
+    except Exception:
+        pass
+    raw_annotations = getattr(state_schema, "__annotations__", None)
+    if isinstance(raw_annotations, dict):
+        return dict(raw_annotations)
+    return {}
+
+
+def _extract_state_schema_fields(state_schema: Any) -> tuple[str, ...]:
+    return tuple(_extract_state_schema_hints(state_schema).keys())
+
+
+def _infer_schema_merge_rules(state_schema: Any) -> dict[str, str]:
+    normalized: dict[str, str] = {}
+    for field_name, annotation in _extract_state_schema_hints(state_schema).items():
+        origin = get_origin(annotation)
+        origin_name = getattr(origin, "__qualname__", getattr(origin, "__name__", ""))
+        if origin_name != "Annotated":
+            continue
+        base, *metadata_items = get_args(annotation)
+        for metadata in metadata_items:
+            strategy = _schema_reducer_metadata_to_merge_strategy(base, metadata)
+            if strategy is not None:
+                normalized[field_name] = strategy
+                break
+    return normalized
+
+
+def _merge_with_schema_rules(schema_merge: dict[str, str], merge: Any) -> dict[str, str]:
+    normalized = dict(schema_merge)
+    normalized.update(_normalize_merge_rules(merge))
+    return normalized
+
+
+def _normalize_compile_name(name: Any) -> str | None:
+    if name is None:
+        return None
+    if not isinstance(name, str) or not name:
+        raise TypeError("compile name must be a non-empty string or None")
+    return name
+
+
+def _validate_compile_compat_options(
+    *,
+    checkpointer: Any,
+    interrupt_before: Any,
+    interrupt_after: Any,
+    store: Any,
+) -> None:
+    unsupported: list[str] = []
+    if checkpointer is not None:
+        unsupported.append("checkpointer")
+    if interrupt_before is not None:
+        unsupported.append("interrupt_before")
+    if interrupt_after is not None:
+        unsupported.append("interrupt_after")
+    if store is not None:
+        unsupported.append("store")
+    if unsupported:
+        joined = ", ".join(unsupported)
+        raise NotImplementedError(
+            f"compile(...) does not currently support {joined}; "
+            "use AgentCore's native wait/resume, metadata, and persistent subgraph session surfaces instead"
+        )
+
+
+def _validate_direct_subgraph_node_options(
+    *,
+    kind: str,
+    stop_after: bool,
+    allow_fan_out: bool,
+    create_join_scope: bool,
+    join_incoming_branches: bool,
+    deterministic: bool,
+    read_keys: Sequence[str] | None,
+    cache_size: int,
+    intelligence_subscriptions: Sequence[IntelligenceSubscription | Mapping[str, Any]] | None,
+    merge: dict[str, Any] | None,
+) -> None:
+    unsupported: list[str] = []
+    if str(kind).strip().lower() != "compute":
+        unsupported.append("kind")
+    if stop_after:
+        unsupported.append("stop_after")
+    if allow_fan_out:
+        unsupported.append("allow_fan_out")
+    if create_join_scope:
+        unsupported.append("create_join_scope")
+    if join_incoming_branches:
+        unsupported.append("join_incoming_branches")
+    if deterministic:
+        unsupported.append("deterministic")
+    if read_keys:
+        unsupported.append("read_keys")
+    if int(cache_size) != 16:
+        unsupported.append("cache_size")
+    if intelligence_subscriptions:
+        unsupported.append("intelligence_subscriptions")
+    if merge:
+        unsupported.append("merge")
+    if unsupported:
+        raise NotImplementedError(
+            "direct add_node(subgraph) supports only the shared-state default path; "
+            f"use add_subgraph(...) for advanced options such as {', '.join(unsupported)}"
+        )
+
+
+def _infer_shared_subgraph_bindings(parent_schema: Any, graph: Any) -> dict[str, str]:
+    child_schema = getattr(graph, "_state_schema", None)
+    parent_fields = set(_extract_state_schema_fields(parent_schema))
+    child_fields = set(_extract_state_schema_fields(child_schema))
+    shared_fields = sorted(parent_fields & child_fields)
+    if not shared_fields:
+        raise NotImplementedError(
+            "direct add_node(subgraph) requires parent and child graphs to declare overlapping schema fields; "
+            "use add_subgraph(...) with explicit inputs/outputs when the shared state shape is implicit"
+        )
+    return {field: field for field in shared_fields}
+
+
 class StateGraph:
     def __init__(self, state_schema: Any = None, *, name: str | None = None, worker_count: int = 1):
         self._state_schema = state_schema
         self._name = name or getattr(state_schema, "__name__", "agentcore_state_graph")
         self._worker_count = max(1, int(worker_count))
+        self._schema_fields = _extract_state_schema_fields(state_schema)
+        self._schema_merge = _infer_schema_merge_rules(state_schema)
         self._nodes: dict[str, _NodeSpec] = {}
         self._edges: list[tuple[str, str]] = []
         self._conditional_edges: dict[str, tuple[Any, dict[Any, str]]] = {}
         self._entry_point: str | None = None
+        self._pending_join_targets: set[str] = set()
+        self._synthetic_router_index = 0
 
     def add_node(
         self,
-        name: str,
+        name: str | Any,
         action: Any | None = None,
         *,
         kind: str = "compute",
@@ -1357,8 +1611,36 @@ class StateGraph:
         intelligence_subscriptions: Sequence[IntelligenceSubscription | Mapping[str, Any]] | None = None,
         merge: dict[str, Any] | None = None,
     ) -> "StateGraph":
+        if action is None and isinstance(name, (StateGraph, CompiledStateGraph)):
+            action = name
+            name = _infer_subgraph_node_name(action)
+        if action is None and not isinstance(name, str):
+            action = name
+            name = _infer_node_name(action)
+        if not isinstance(name, str) or not name:
+            raise TypeError("node name must be a non-empty string")
+        if isinstance(action, (StateGraph, CompiledStateGraph)):
+            _validate_direct_subgraph_node_options(
+                kind=kind,
+                stop_after=stop_after,
+                allow_fan_out=allow_fan_out,
+                create_join_scope=create_join_scope,
+                join_incoming_branches=join_incoming_branches,
+                deterministic=deterministic,
+                read_keys=read_keys,
+                cache_size=cache_size,
+                intelligence_subscriptions=intelligence_subscriptions,
+                merge=merge,
+            )
+            bindings = _infer_shared_subgraph_bindings(self._state_schema, action)
+            return self.add_subgraph(
+                name,
+                action,
+                inputs=bindings,
+                outputs=bindings,
+            )
         if action is not None and not callable(action):
-            raise TypeError("node actions must be callable or None")
+            raise TypeError("node actions must be callable, subgraphs, or None")
 
         normalized_kind = _normalize_node_kind(kind)
         if normalized_kind == "subgraph":
@@ -1373,18 +1655,26 @@ class StateGraph:
             for subscription in (intelligence_subscriptions or ())
         )
 
+        is_join_node = bool(join_incoming_branches or name in self._pending_join_targets)
+        normalized_merge = _normalize_merge_rules(merge)
+        effective_merge = (
+            _merge_with_schema_rules(self._schema_merge, normalized_merge)
+            if is_join_node
+            else normalized_merge
+        )
+
         self._nodes[name] = _NodeSpec(
             action=action,
             kind=normalized_kind,
             stop_after=bool(stop_after),
             allow_fan_out=bool(allow_fan_out),
             create_join_scope=bool(create_join_scope),
-            join_incoming_branches=bool(join_incoming_branches),
+            join_incoming_branches=is_join_node,
             deterministic=bool(deterministic),
             read_keys=normalized_read_keys,
             cache_size=normalized_cache_size,
             intelligence_subscriptions=normalized_intelligence_subscriptions,
-            merge=_normalize_merge_rules(merge),
+            merge=effective_merge,
         )
         if self._entry_point is None:
             self._entry_point = name
@@ -1446,6 +1736,11 @@ class StateGraph:
                 raise ValueError("persistent subgraphs require session_id_from")
         elif session_id_from is not None:
             raise ValueError("ephemeral subgraphs must not declare session_id_from")
+        if name in self._pending_join_targets:
+            raise NotImplementedError(
+                "LangGraph-style multi-source joins into subgraph nodes are not supported directly; "
+                "add an explicit join node before the subgraph"
+            )
 
         self._nodes[name] = _NodeSpec(
             action=None,
@@ -1464,7 +1759,15 @@ class StateGraph:
             self._entry_point = name
         return self
 
-    def add_edge(self, source: str, target: str) -> "StateGraph":
+    def add_edge(self, source: str | Sequence[str], target: str) -> "StateGraph":
+        if _is_non_string_sequence(source):
+            normalized_sources = _normalize_string_sequence(source, field_name="source")
+            if not normalized_sources:
+                raise ValueError("source must contain at least one node name")
+            self._mark_join_target(target)
+            for entry in normalized_sources:
+                self.add_edge(entry, target)
+            return self
         if source == START:
             self.set_entry_point(target)
             return self
@@ -1479,6 +1782,8 @@ class StateGraph:
     ) -> "StateGraph":
         if not callable(path):
             raise TypeError("conditional routing functions must be callable")
+        if source == START:
+            return self.set_conditional_entry_point(path, path_map)
         self._conditional_edges[source] = (path, dict(path_map or {}))
         return self
 
@@ -1486,9 +1791,54 @@ class StateGraph:
         self._entry_point = name
         return self
 
-    def compile(self, *, worker_count: int | None = None) -> "CompiledStateGraph":
+    def set_finish_point(self, name: str) -> "StateGraph":
+        return self.add_edge(name, END)
+
+    def set_conditional_entry_point(
+        self,
+        path: Any,
+        path_map: dict[Any, str] | None = None,
+    ) -> "StateGraph":
+        if not callable(path):
+            raise TypeError("conditional entry routing functions must be callable")
+        router_name = self._allocate_synthetic_router_name("entry_router")
+        self.add_node(router_name, None, kind="control")
+        self._conditional_edges[router_name] = (path, dict(path_map or {}))
+        self._entry_point = router_name
+        return self
+
+    def add_sequence(self, nodes: Sequence[Any]) -> "StateGraph":
+        if not _is_non_string_sequence(nodes):
+            raise TypeError("nodes must be a non-string sequence")
+        ordered_names = [self._register_sequence_entry(entry) for entry in nodes]
+        if not ordered_names:
+            raise ValueError("nodes must contain at least one entry")
+        for source, target in zip(ordered_names, ordered_names[1:]):
+            self.add_edge(source, target)
+        return self
+
+    def compile(
+        self,
+        *,
+        worker_count: int | None = None,
+        name: str | None = None,
+        debug: bool | None = None,
+        checkpointer: Any | None = None,
+        interrupt_before: Any | None = None,
+        interrupt_after: Any | None = None,
+        store: Any | None = None,
+    ) -> "CompiledStateGraph":
+        if debug is not None and not isinstance(debug, bool):
+            raise TypeError("debug must be a bool or None")
+        _validate_compile_compat_options(
+            checkpointer=checkpointer,
+            interrupt_before=interrupt_before,
+            interrupt_after=interrupt_after,
+            store=store,
+        )
         return self._compile_internal(
             worker_count=self._worker_count if worker_count is None else max(1, int(worker_count)),
+            name_override=_normalize_compile_name(name),
             subgraph_cache={},
             compile_stack=set(),
         )
@@ -1497,6 +1847,7 @@ class StateGraph:
         self,
         *,
         worker_count: int,
+        name_override: str | None = None,
         subgraph_cache: dict[int, "CompiledStateGraph"],
         compile_stack: set[int],
     ) -> "CompiledStateGraph":
@@ -1507,7 +1858,7 @@ class StateGraph:
         compile_stack.add(graph_identity)
         try:
             native_graph = _native._create_graph(
-                name=self._name,
+                name=self._name if name_override is None else name_override,
                 worker_count=worker_count,
             )
             owned_subgraphs: list[CompiledStateGraph] = []
@@ -1567,7 +1918,12 @@ class StateGraph:
                 _native._add_edge(native_graph, source, self._map_target_name(target))
 
             _native._finalize(native_graph)
-            return CompiledStateGraph(native_graph, self._name, owned_subgraphs=owned_subgraphs)
+            return CompiledStateGraph(
+                native_graph,
+                self._name if name_override is None else name_override,
+                state_schema=self._state_schema,
+                owned_subgraphs=owned_subgraphs,
+            )
         finally:
             compile_stack.remove(graph_identity)
 
@@ -1588,6 +1944,7 @@ class StateGraph:
 
         compiled = graph._compile_internal(
             worker_count=graph._worker_count,
+            name_override=None,
             subgraph_cache=subgraph_cache,
             compile_stack=compile_stack,
         )
@@ -1604,6 +1961,50 @@ class StateGraph:
         if target == END:
             return _native._INTERNAL_END_NODE_NAME
         return target
+
+    def _mark_join_target(self, target: str) -> None:
+        if not isinstance(target, str) or not target:
+            raise TypeError("target must be a non-empty string")
+        self._pending_join_targets.add(target)
+        existing = self._nodes.get(target)
+        if existing is not None:
+            if existing.subgraph is not None:
+                raise NotImplementedError(
+                    "LangGraph-style multi-source joins into subgraph nodes are not supported directly; "
+                    "add an explicit join node before the subgraph"
+                )
+            existing.join_incoming_branches = True
+            existing.merge = _merge_with_schema_rules(self._schema_merge, existing.merge)
+
+    def _allocate_synthetic_router_name(self, label: str) -> str:
+        while True:
+            name = f"__agentcore_{label}_{self._synthetic_router_index}"
+            self._synthetic_router_index += 1
+            if name not in self._nodes:
+                return name
+
+    def _register_sequence_entry(self, entry: Any) -> str:
+        if isinstance(entry, str):
+            if entry not in self._nodes:
+                raise KeyError(
+                    f"sequence entry {entry!r} is not a registered node; "
+                    "pass a callable or a (name, action) pair to register it inline"
+                )
+            return entry
+        if _is_non_string_sequence(entry):
+            if len(entry) != 2:
+                raise TypeError("sequence node tuples must contain exactly two elements")
+            entry_name, entry_action = entry
+            if not isinstance(entry_name, str) or not entry_name:
+                raise TypeError("sequence node tuples must start with a non-empty string name")
+            self.add_node(entry_name, entry_action)
+            return entry_name
+        if isinstance(entry, (StateGraph, CompiledStateGraph)):
+            inferred_name = _infer_subgraph_node_name(entry)
+        else:
+            inferred_name = _infer_node_name(entry)
+        self.add_node(inferred_name, entry)
+        return inferred_name
 
     def _build_callback(self, node_name: str):
         node_spec = self._nodes[node_name]
@@ -1667,10 +2068,12 @@ class CompiledStateGraph:
         native_graph: Any,
         name: str,
         *,
+        state_schema: Any | None = None,
         owned_subgraphs: Sequence["CompiledStateGraph"] | None = None,
     ):
         self._native_graph = native_graph
         self._name = name
+        self._state_schema = state_schema
         self._owned_subgraphs = list(owned_subgraphs or [])
         self._tool_registry_view = ToolRegistryView(native_graph)
         self._model_registry_view = ModelRegistryView(native_graph)

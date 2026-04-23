@@ -7,10 +7,12 @@
 #include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <functional>
+#include <initializer_list>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -249,11 +251,124 @@ enum JoinProofStateKey : StateKey {
     kJoinAsyncResult = 6,
     kJoinSyncValue = 7,
     kJoinAccumulator = 8,
-    kJoinConsensus = 9
+    kJoinConsensus = 9,
+    kJoinSequence = 10,
+    kJoinMessages = 11
 };
 
 std::atomic<int> g_active_parallel_nodes{0};
 std::atomic<int> g_max_parallel_nodes{0};
+
+constexpr std::byte kTestSequenceBlobTag{0x04};
+constexpr std::byte kTestMessageBlobTag{0x05};
+
+void append_test_sequence_u64(std::vector<std::byte>& output, uint64_t value) {
+    for (std::size_t byte_index = 0; byte_index < sizeof(uint64_t); ++byte_index) {
+        output.push_back(static_cast<std::byte>((value >> (byte_index * 8U)) & 0xFFU));
+    }
+}
+
+uint64_t read_test_sequence_u64(const std::byte* data, std::size_t size, std::size_t* offset) {
+    assert(*offset <= size);
+    assert(size - *offset >= sizeof(uint64_t));
+    uint64_t value = 0;
+    for (std::size_t byte_index = 0; byte_index < sizeof(uint64_t); ++byte_index) {
+        value |= static_cast<uint64_t>(
+            std::to_integer<unsigned char>(data[*offset + byte_index])
+        ) << (byte_index * 8U);
+    }
+    *offset += sizeof(uint64_t);
+    return value;
+}
+
+BlobRef append_test_sequence_blob(
+    BlobStore& blobs,
+    std::initializer_list<std::string_view> items
+) {
+    std::vector<std::byte> bytes;
+    bytes.reserve(1U + sizeof(uint64_t) + items.size() * sizeof(uint64_t));
+    bytes.push_back(kTestSequenceBlobTag);
+    append_test_sequence_u64(bytes, static_cast<uint64_t>(items.size()));
+    for (std::string_view item : items) {
+        append_test_sequence_u64(bytes, static_cast<uint64_t>(item.size()));
+        const auto* raw = reinterpret_cast<const std::byte*>(item.data());
+        bytes.insert(bytes.end(), raw, raw + item.size());
+    }
+    return blobs.append(bytes.data(), bytes.size());
+}
+
+std::vector<std::string> read_test_sequence_blob(const BlobStore& blobs, BlobRef ref) {
+    const auto buffer = blobs.read_buffer(ref);
+    const std::byte* data = buffer.first;
+    const std::size_t size = buffer.second;
+    assert(data != nullptr);
+    assert(size >= 1U + sizeof(uint64_t));
+    assert(data[0] == kTestSequenceBlobTag);
+
+    std::size_t offset = 1U;
+    const uint64_t count = read_test_sequence_u64(data, size, &offset);
+    std::vector<std::string> items;
+    items.reserve(static_cast<std::size_t>(count));
+    for (uint64_t index = 0; index < count; ++index) {
+        const uint64_t item_size = read_test_sequence_u64(data, size, &offset);
+        assert(item_size <= static_cast<uint64_t>(size - offset));
+        items.emplace_back(
+            reinterpret_cast<const char*>(data + offset),
+            static_cast<std::size_t>(item_size)
+        );
+        offset += static_cast<std::size_t>(item_size);
+    }
+    assert(offset == size);
+    return items;
+}
+
+BlobRef append_test_message_blob(
+    BlobStore& blobs,
+    std::initializer_list<std::pair<std::string_view, std::string_view>> messages
+) {
+    std::vector<std::byte> bytes;
+    bytes.reserve(1U + sizeof(uint64_t) + messages.size() * (2U * sizeof(uint64_t)));
+    bytes.push_back(kTestMessageBlobTag);
+    append_test_sequence_u64(bytes, static_cast<uint64_t>(messages.size()));
+    for (const auto& [id, payload] : messages) {
+        append_test_sequence_u64(bytes, static_cast<uint64_t>(id.size()));
+        const auto* id_bytes = reinterpret_cast<const std::byte*>(id.data());
+        bytes.insert(bytes.end(), id_bytes, id_bytes + id.size());
+        append_test_sequence_u64(bytes, static_cast<uint64_t>(payload.size()));
+        const auto* payload_bytes = reinterpret_cast<const std::byte*>(payload.data());
+        bytes.insert(bytes.end(), payload_bytes, payload_bytes + payload.size());
+    }
+    return blobs.append(bytes.data(), bytes.size());
+}
+
+std::vector<std::string> read_test_message_blob(const BlobStore& blobs, BlobRef ref) {
+    const auto buffer = blobs.read_buffer(ref);
+    const std::byte* data = buffer.first;
+    const std::size_t size = buffer.second;
+    assert(data != nullptr);
+    assert(size >= 1U + sizeof(uint64_t));
+    assert(data[0] == kTestMessageBlobTag);
+
+    std::size_t offset = 1U;
+    const uint64_t count = read_test_sequence_u64(data, size, &offset);
+    std::vector<std::string> payloads;
+    payloads.reserve(static_cast<std::size_t>(count));
+    for (uint64_t index = 0; index < count; ++index) {
+        const uint64_t id_size = read_test_sequence_u64(data, size, &offset);
+        assert(id_size <= static_cast<uint64_t>(size - offset));
+        offset += static_cast<std::size_t>(id_size);
+
+        const uint64_t payload_size = read_test_sequence_u64(data, size, &offset);
+        assert(payload_size <= static_cast<uint64_t>(size - offset));
+        payloads.emplace_back(
+            reinterpret_cast<const char*>(data + offset),
+            static_cast<std::size_t>(payload_size)
+        );
+        offset += static_cast<std::size_t>(payload_size);
+    }
+    assert(offset == size);
+    return payloads;
+}
 
 NodeResult ingest_kg_node(ExecutionContext& context) {
     const InternedStringId runtime = context.strings.intern("agentcore");
@@ -728,6 +843,42 @@ NodeResult join_branch_d_node(ExecutionContext& context) {
         context.strings.intern("writes"),
         context.strings.intern("artifact_d"),
         context.blobs.append_string("d")
+    });
+    return NodeResult::success(std::move(patch), 0.98F);
+}
+
+NodeResult sequence_join_left_node(ExecutionContext& context) {
+    StatePatch patch;
+    patch.updates.push_back(FieldUpdate{
+        kJoinSequence,
+        append_test_sequence_blob(context.blobs, {"left"})
+    });
+    return NodeResult::success(std::move(patch), 0.98F);
+}
+
+NodeResult sequence_join_right_node(ExecutionContext& context) {
+    StatePatch patch;
+    patch.updates.push_back(FieldUpdate{
+        kJoinSequence,
+        append_test_sequence_blob(context.blobs, {"right"})
+    });
+    return NodeResult::success(std::move(patch), 0.98F);
+}
+
+NodeResult message_join_left_node(ExecutionContext& context) {
+    StatePatch patch;
+    patch.updates.push_back(FieldUpdate{
+        kJoinMessages,
+        append_test_message_blob(context.blobs, {{"replace", "left-replace"}, {"", "left-anon"}})
+    });
+    return NodeResult::success(std::move(patch), 0.98F);
+}
+
+NodeResult message_join_right_node(ExecutionContext& context) {
+    StatePatch patch;
+    patch.updates.push_back(FieldUpdate{
+        kJoinMessages,
+        append_test_message_blob(context.blobs, {{"new", "right-new"}, {"replace", "right-replace"}})
     });
     return NodeResult::success(std::move(patch), 0.98F);
 }
@@ -2112,6 +2263,104 @@ GraphDefinition make_parallel_join_graph() {
     return graph;
 }
 
+GraphDefinition make_sequence_join_graph() {
+    GraphDefinition graph;
+    graph.id = 42;
+    graph.name = "sequence_join_test";
+    graph.entry = 1;
+    graph.nodes = {
+        NodeDefinition{
+            1,
+            NodeKind::Control,
+            "fanout_sequence_join",
+            node_policy_mask(NodePolicyFlag::AllowFanOut) |
+                node_policy_mask(NodePolicyFlag::CreateJoinScope),
+            0U,
+            0U,
+            fanout_node,
+            {}
+        },
+        NodeDefinition{2, NodeKind::Compute, "sequence_left", 0U, 0U, 0U, sequence_join_left_node, {}},
+        NodeDefinition{3, NodeKind::Compute, "sequence_right", 0U, 0U, 0U, sequence_join_right_node, {}},
+        NodeDefinition{
+            4,
+            NodeKind::Aggregate,
+            "sequence_join",
+            node_policy_mask(NodePolicyFlag::JoinIncomingBranches),
+            0U,
+            0U,
+            stop_node,
+            {},
+            std::vector<FieldMergeRule>{
+                FieldMergeRule{kJoinSequence, JoinMergeStrategy::ConcatSequence}
+            }
+        },
+        NodeDefinition{5, NodeKind::Control, "stop", node_policy_mask(NodePolicyFlag::StopAfterNode), 0U, 0U, stop_node, {}}
+    };
+    graph.edges = {
+        EdgeDefinition{1, 1, 2, EdgeKind::OnSuccess, nullptr, 100U},
+        EdgeDefinition{2, 1, 3, EdgeKind::OnSuccess, nullptr, 90U},
+        EdgeDefinition{3, 2, 4, EdgeKind::OnSuccess, nullptr, 100U},
+        EdgeDefinition{4, 3, 4, EdgeKind::OnSuccess, nullptr, 100U},
+        EdgeDefinition{5, 4, 5, EdgeKind::OnSuccess, nullptr, 100U}
+    };
+    graph.bind_outgoing_edges(1, std::vector<EdgeId>{1, 2});
+    graph.bind_outgoing_edges(2, std::vector<EdgeId>{3});
+    graph.bind_outgoing_edges(3, std::vector<EdgeId>{4});
+    graph.bind_outgoing_edges(4, std::vector<EdgeId>{5});
+    graph.sort_edges_by_priority();
+    return graph;
+}
+
+GraphDefinition make_message_join_graph() {
+    GraphDefinition graph;
+    graph.id = 43;
+    graph.name = "message_join_test";
+    graph.entry = 1;
+    graph.nodes = {
+        NodeDefinition{
+            1,
+            NodeKind::Control,
+            "fanout_message_join",
+            node_policy_mask(NodePolicyFlag::AllowFanOut) |
+                node_policy_mask(NodePolicyFlag::CreateJoinScope),
+            0U,
+            0U,
+            fanout_node,
+            {}
+        },
+        NodeDefinition{2, NodeKind::Compute, "message_left", 0U, 0U, 0U, message_join_left_node, {}},
+        NodeDefinition{3, NodeKind::Compute, "message_right", 0U, 0U, 0U, message_join_right_node, {}},
+        NodeDefinition{
+            4,
+            NodeKind::Aggregate,
+            "message_join",
+            node_policy_mask(NodePolicyFlag::JoinIncomingBranches),
+            0U,
+            0U,
+            stop_node,
+            {},
+            std::vector<FieldMergeRule>{
+                FieldMergeRule{kJoinMessages, JoinMergeStrategy::MergeMessages}
+            }
+        },
+        NodeDefinition{5, NodeKind::Control, "stop", node_policy_mask(NodePolicyFlag::StopAfterNode), 0U, 0U, stop_node, {}}
+    };
+    graph.edges = {
+        EdgeDefinition{1, 1, 2, EdgeKind::OnSuccess, nullptr, 100U},
+        EdgeDefinition{2, 1, 3, EdgeKind::OnSuccess, nullptr, 90U},
+        EdgeDefinition{3, 2, 4, EdgeKind::OnSuccess, nullptr, 100U},
+        EdgeDefinition{4, 3, 4, EdgeKind::OnSuccess, nullptr, 100U},
+        EdgeDefinition{5, 4, 5, EdgeKind::OnSuccess, nullptr, 100U}
+    };
+    graph.bind_outgoing_edges(1, std::vector<EdgeId>{1, 2});
+    graph.bind_outgoing_edges(2, std::vector<EdgeId>{3});
+    graph.bind_outgoing_edges(3, std::vector<EdgeId>{4});
+    graph.bind_outgoing_edges(4, std::vector<EdgeId>{5});
+    graph.sort_edges_by_priority();
+    return graph;
+}
+
 GraphDefinition make_async_join_graph() {
     GraphDefinition graph;
     graph.id = 15;
@@ -3289,6 +3538,59 @@ void test_join_scope_merges_branch_state_and_knowledge_graph() {
     assert(std::get<int64_t>(state.load(kJoinAccumulator)) == 10);
 }
 
+void test_join_scope_concatenates_sequence_reducer() {
+    ExecutionEngine engine(4);
+    InputEnvelope input;
+    input.initial_field_count = 11;
+    const BlobRef base_sequence = append_test_sequence_blob(input.initial_blobs, {"base"});
+    input.initial_patch.updates.push_back(FieldUpdate{kJoinSequence, base_sequence});
+
+    const RunId run_id = engine.start(make_sequence_join_graph(), input);
+    const RunResult result = engine.run_to_completion(run_id);
+    assert(result.status == ExecutionStatus::Completed);
+
+    const WorkflowState& state = engine.state(run_id);
+    const Value merged_value = state.load(kJoinSequence);
+    assert(std::holds_alternative<BlobRef>(merged_value));
+    const std::vector<std::string> merged = read_test_sequence_blob(
+        engine.state_store(run_id).blobs(),
+        std::get<BlobRef>(merged_value)
+    );
+    const std::vector<std::string> expected{"base", "left", "right"};
+    assert(merged == expected);
+}
+
+void test_join_scope_merges_messages_by_id() {
+    ExecutionEngine engine(4);
+    InputEnvelope input;
+    input.initial_field_count = 12;
+    const BlobRef base_messages = append_test_message_blob(
+        input.initial_blobs,
+        {{"keep", "base-keep"}, {"replace", "base-old"}, {"", "base-anon"}}
+    );
+    input.initial_patch.updates.push_back(FieldUpdate{kJoinMessages, base_messages});
+
+    const RunId run_id = engine.start(make_message_join_graph(), input);
+    const RunResult result = engine.run_to_completion(run_id);
+    assert(result.status == ExecutionStatus::Completed);
+
+    const WorkflowState& state = engine.state(run_id);
+    const Value merged_value = state.load(kJoinMessages);
+    assert(std::holds_alternative<BlobRef>(merged_value));
+    const std::vector<std::string> merged = read_test_message_blob(
+        engine.state_store(run_id).blobs(),
+        std::get<BlobRef>(merged_value)
+    );
+    const std::vector<std::string> expected{
+        "base-keep",
+        "right-replace",
+        "base-anon",
+        "left-anon",
+        "right-new"
+    };
+    assert(merged == expected);
+}
+
 void test_structural_join_validation() {
     std::string error_message;
 
@@ -4111,6 +4413,12 @@ int main() {
         {"test_parallel_scheduler_fanout", [] { agentcore::test_parallel_scheduler_fanout(); }},
         {"test_join_scope_merges_branch_state_and_knowledge_graph", [] {
              agentcore::test_join_scope_merges_branch_state_and_knowledge_graph();
+         }},
+        {"test_join_scope_concatenates_sequence_reducer", [] {
+             agentcore::test_join_scope_concatenates_sequence_reducer();
+         }},
+        {"test_join_scope_merges_messages_by_id", [] {
+             agentcore::test_join_scope_merges_messages_by_id();
          }},
         {"test_structural_join_validation", [] { agentcore::test_structural_join_validation(); }},
         {"test_join_runtime_rejects_conflicting_writes_without_rule", [] {

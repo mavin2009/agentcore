@@ -201,6 +201,12 @@ The current Python merge strategies include:
 - `min_int64`
 - `logical_or`
 - `logical_and`
+- `concat_sequence`
+- `merge_messages`
+
+`concat_sequence` is the native fast path behind `Annotated[list[T], operator.add]`. Python list values are stored as tagged sequence blobs, and the join barrier concatenates those records in deterministic branch order.
+
+`merge_messages` is the native fast path behind `MessagesState` and `Annotated[list[dict], add_messages]`. It stores message history as a tagged message blob. During a join, messages with matching non-empty `id` values replace the existing record while preserving that record's position; messages without ids append. This gives common agent message history the same deterministic commit behavior as other state without requiring a Python reducer callback at the barrier.
 
 The executable smoke coverage for this lives in [`../../python/tests/agent_workflows_smoke.py`](../../python/tests/agent_workflows_smoke.py).
 

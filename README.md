@@ -44,6 +44,9 @@ These are the core choices behind the project.
 
 - Native C++ runtime with Python bindings
 - `StateGraph`-style Python builder and execution surface
+- Migration-friendly Python builder helpers for existing graph code: callable-only nodes, `add_sequence(...)`, finish points, conditional entry points, and multi-source join edges
+- Declared-schema conveniences for Python graphs: supported `Annotated[...]` reducer inference on join barriers, including list concatenation and ID-aware message merging, plus direct shared-state subgraph nodes when parent and child schemas overlap
+- Python prompt templates for reusable text and chat prompts
 - Multi-worker scheduler with async wait handling
 - Checkpoints, replay, proof digests, and public stream events
 - Subgraph composition with persistent child sessions
@@ -90,6 +93,55 @@ print(final_state)
 ```
 
 From there, the same compiled graph can also expose metadata, stream events, batch execution, pause/resume, tool and model registries, and persistent subgraph sessions.
+
+## Message State
+
+For agent workflows that keep chat history in state, AgentCore exposes a small message helper instead of requiring users to hand-roll reducers. `MessagesState` declares a `messages` field backed by a native ID-aware merge strategy: messages with matching non-empty `id` values replace the earlier message in place, while messages without ids append.
+
+```python
+from agentcore.graph import MessagesState, StateGraph
+
+
+class AgentState(MessagesState, total=False):
+    summary: str
+
+
+graph = StateGraph(AgentState, name="agent", worker_count=4)
+```
+
+This keeps message history compatible with the ordinary `StateGraph` surface while avoiding Python callback work at join barriers.
+
+## Prompt Templates
+
+AgentCore keeps prompt composition as a thin Python layer instead of pushing prompt policy into the runtime core. The engine still sees explicit model inputs; Python gets reusable templates that plug directly into `compiled.models.invoke(...)` and `RuntimeContext.invoke_model(...)`.
+
+```python
+from agentcore import ChatPromptTemplate, PromptTemplate
+
+
+summary_prompt = PromptTemplate(
+    "Summarize the request in {style} style.\n\nRequest:\n{request}"
+)
+
+chat_prompt = ChatPromptTemplate.from_messages(
+    [
+        ("system", "You are a concise reviewer."),
+        ("user", "Review this change:\n{diff}"),
+    ]
+)
+
+rendered_summary = summary_prompt.render(
+    request="Add persistent child sessions to the runtime.",
+    style="brief",
+)
+
+rendered_chat = chat_prompt.render(diff="Rename child snapshot store fields.")
+
+text_payload = rendered_chat.to_model_input()
+message_payload = rendered_chat.to_model_input(mode="messages")
+```
+
+Built-in native chat adapters currently consume text prompt payloads, so rendered chat prompts flatten to role-prefixed text by default. If you register a custom Python-backed model handler that expects structured messages, the same rendered chat prompt can be passed as `mode="messages"` instead.
 
 ## Intelligence State Model
 

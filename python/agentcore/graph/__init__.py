@@ -8,7 +8,9 @@ from .state import (
     IntelligenceView,
     RuntimeContext,
     START,
+    MessagesState,
     StateGraph,
+    add_messages,
 )
 
 __all__ = [
@@ -21,5 +23,7 @@ __all__ = [
     "IntelligenceView",
     "RuntimeContext",
     "START",
+    "MessagesState",
     "StateGraph",
+    "add_messages",
 ]

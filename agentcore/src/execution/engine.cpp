@@ -7,7 +7,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <chrono>
+#include <cstddef>
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
@@ -38,12 +40,214 @@ constexpr uint32_t kTraceFlagManualInterrupt = 1U << 27;
 constexpr uint32_t kTraceFlagManualStateEdit = 1U << 26;
 constexpr uint32_t kTraceFlagRecordedEffect = 1U << 25;
 constexpr uint32_t kTraceFlagIntelligenceReactive = 1U << 24;
+constexpr std::byte kSequenceBlobTag{0x04};
+constexpr std::byte kMessageBlobTag{0x05};
+constexpr std::size_t kSequenceHeaderSize = 1U + sizeof(uint64_t);
+constexpr std::size_t kMessageHeaderSize = 1U + sizeof(uint64_t);
 
 struct BranchFieldWrite {
     uint32_t branch_id{0};
     const StateStore* source_state{nullptr};
     Value value;
 };
+
+struct MessageRecordView {
+    std::string id;
+    const std::byte* payload{nullptr};
+    std::size_t payload_size{0};
+};
+
+void append_u64(std::vector<std::byte>& output, uint64_t value) {
+    for (std::size_t byte_index = 0; byte_index < sizeof(uint64_t); ++byte_index) {
+        output.push_back(static_cast<std::byte>((value >> (byte_index * 8U)) & 0xFFU));
+    }
+}
+
+void write_u64_at(std::vector<std::byte>& output, std::size_t offset, uint64_t value) {
+    assert(offset <= output.size());
+    assert(output.size() - offset >= sizeof(uint64_t));
+    for (std::size_t byte_index = 0; byte_index < sizeof(uint64_t); ++byte_index) {
+        output[offset + byte_index] =
+            static_cast<std::byte>((value >> (byte_index * 8U)) & 0xFFU);
+    }
+}
+
+bool read_u64(const std::byte* data, std::size_t size, std::size_t* offset, uint64_t* value) {
+    if (*offset > size || size - *offset < sizeof(uint64_t)) {
+        return false;
+    }
+    uint64_t decoded = 0;
+    for (std::size_t byte_index = 0; byte_index < sizeof(uint64_t); ++byte_index) {
+        decoded |= static_cast<uint64_t>(
+            std::to_integer<unsigned char>(data[*offset + byte_index])
+        ) << (byte_index * 8U);
+    }
+    *value = decoded;
+    *offset += sizeof(uint64_t);
+    return true;
+}
+
+bool append_sequence_items_from_blob(
+    const BlobStore& source_blobs,
+    BlobRef ref,
+    std::vector<std::byte>& output,
+    uint64_t* item_count,
+    std::string* error_message
+) {
+    const auto buffer = source_blobs.read_buffer(ref);
+    const std::byte* data = buffer.first;
+    const std::size_t size = buffer.second;
+    if (data == nullptr || size < kSequenceHeaderSize || data[0] != kSequenceBlobTag) {
+        if (error_message != nullptr) {
+            *error_message = "sequence concat merge requires tagged sequence blob values";
+        }
+        return false;
+    }
+
+    std::size_t offset = 1U;
+    uint64_t count = 0;
+    if (!read_u64(data, size, &offset, &count)) {
+        if (error_message != nullptr) {
+            *error_message = "sequence concat merge encountered a truncated sequence header";
+        }
+        return false;
+    }
+
+    const std::size_t item_payload_start = offset;
+    for (uint64_t index = 0; index < count; ++index) {
+        uint64_t item_size = 0;
+        if (!read_u64(data, size, &offset, &item_size)) {
+            if (error_message != nullptr) {
+                *error_message = "sequence concat merge encountered a truncated item header";
+            }
+            return false;
+        }
+        if (item_size > static_cast<uint64_t>(size - offset)) {
+            if (error_message != nullptr) {
+                *error_message = "sequence concat merge encountered a truncated item payload";
+            }
+            return false;
+        }
+        offset += static_cast<std::size_t>(item_size);
+    }
+
+    if (offset != size) {
+        if (error_message != nullptr) {
+            *error_message = "sequence concat merge encountered trailing sequence bytes";
+        }
+        return false;
+    }
+
+    output.insert(output.end(), data + item_payload_start, data + size);
+    *item_count += count;
+    return true;
+}
+
+bool append_message_records_from_blob(
+    const BlobStore& source_blobs,
+    BlobRef ref,
+    std::vector<MessageRecordView>& records,
+    std::unordered_map<std::string, std::size_t>& index_by_id,
+    std::string* error_message
+) {
+    const auto buffer = source_blobs.read_buffer(ref);
+    const std::byte* data = buffer.first;
+    const std::size_t size = buffer.second;
+    if (data == nullptr || size < kMessageHeaderSize || data[0] != kMessageBlobTag) {
+        if (error_message != nullptr) {
+            *error_message = "message merge requires tagged message blob values";
+        }
+        return false;
+    }
+
+    std::size_t offset = 1U;
+    uint64_t count = 0;
+    if (!read_u64(data, size, &offset, &count)) {
+        if (error_message != nullptr) {
+            *error_message = "message merge encountered a truncated message header";
+        }
+        return false;
+    }
+
+    for (uint64_t index = 0; index < count; ++index) {
+        uint64_t id_size = 0;
+        if (!read_u64(data, size, &offset, &id_size) ||
+            id_size > static_cast<uint64_t>(size - offset)) {
+            if (error_message != nullptr) {
+                *error_message = "message merge encountered a truncated message id";
+            }
+            return false;
+        }
+        std::string id(
+            reinterpret_cast<const char*>(data + offset),
+            static_cast<std::size_t>(id_size)
+        );
+        offset += static_cast<std::size_t>(id_size);
+
+        uint64_t payload_size = 0;
+        if (!read_u64(data, size, &offset, &payload_size) ||
+            payload_size > static_cast<uint64_t>(size - offset)) {
+            if (error_message != nullptr) {
+                *error_message = "message merge encountered a truncated message payload";
+            }
+            return false;
+        }
+
+        MessageRecordView record{
+            std::move(id),
+            data + offset,
+            static_cast<std::size_t>(payload_size)
+        };
+        offset += static_cast<std::size_t>(payload_size);
+
+        if (record.id.empty()) {
+            records.push_back(std::move(record));
+            continue;
+        }
+
+        auto existing = index_by_id.find(record.id);
+        if (existing == index_by_id.end()) {
+            const std::size_t record_index = records.size();
+            index_by_id.emplace(record.id, record_index);
+            records.push_back(std::move(record));
+        } else {
+            records[existing->second] = std::move(record);
+        }
+    }
+
+    if (offset != size) {
+        if (error_message != nullptr) {
+            *error_message = "message merge encountered trailing message bytes";
+        }
+        return false;
+    }
+
+    return true;
+}
+
+BlobRef append_merged_message_blob(
+    BlobStore& destination_blobs,
+    const std::vector<MessageRecordView>& records
+) {
+    std::size_t byte_count = kMessageHeaderSize;
+    for (const MessageRecordView& record : records) {
+        byte_count += sizeof(uint64_t) + record.id.size() +
+            sizeof(uint64_t) + record.payload_size;
+    }
+
+    std::vector<std::byte> merged;
+    merged.reserve(byte_count);
+    merged.push_back(kMessageBlobTag);
+    append_u64(merged, static_cast<uint64_t>(records.size()));
+    for (const MessageRecordView& record : records) {
+        append_u64(merged, static_cast<uint64_t>(record.id.size()));
+        const auto* id_bytes = reinterpret_cast<const std::byte*>(record.id.data());
+        merged.insert(merged.end(), id_bytes, id_bytes + record.id.size());
+        append_u64(merged, static_cast<uint64_t>(record.payload_size));
+        merged.insert(merged.end(), record.payload, record.payload + record.payload_size);
+    }
+    return destination_blobs.append(merged.data(), merged.size());
+}
 
 CheckpointPolicy checkpoint_policy_for_profile(ExecutionProfile profile) {
     switch (profile) {
@@ -910,6 +1114,94 @@ std::optional<Value> merge_join_field_values(
                 }
             }
             return Value{value};
+        }
+        case JoinMergeStrategy::ConcatSequence: {
+            std::vector<std::byte> merged;
+            merged.reserve(kSequenceHeaderSize);
+            merged.push_back(kSequenceBlobTag);
+            append_u64(merged, 0U);
+
+            uint64_t item_count = 0;
+            if (const Value* base_value = base_state.find(key); base_value != nullptr && !std::holds_alternative<std::monostate>(*base_value)) {
+                if (!std::holds_alternative<BlobRef>(*base_value)) {
+                    return fail_merge(
+                        "join barrier " + join_node.name +
+                        " requires sequence baseline for ConcatSequence on state key " + std::to_string(key)
+                    );
+                }
+                if (!append_sequence_items_from_blob(
+                        base_state.blobs(),
+                        std::get<BlobRef>(*base_value),
+                        merged,
+                        &item_count,
+                        error_message
+                    )) {
+                    return std::nullopt;
+                }
+            }
+
+            for (const BranchFieldWrite& write : writes) {
+                if (!std::holds_alternative<BlobRef>(write.value)) {
+                    return fail_merge(
+                        "join barrier " + join_node.name +
+                        " requires sequence branch values for ConcatSequence on state key " + std::to_string(key)
+                    );
+                }
+                if (!append_sequence_items_from_blob(
+                        write.source_state->blobs(),
+                        std::get<BlobRef>(write.value),
+                        merged,
+                        &item_count,
+                        error_message
+                    )) {
+                    return std::nullopt;
+                }
+            }
+
+            write_u64_at(merged, 1U, item_count);
+            return Value{destination_state.blobs().append(merged.data(), merged.size())};
+        }
+        case JoinMergeStrategy::MergeMessages: {
+            std::vector<MessageRecordView> records;
+            std::unordered_map<std::string, std::size_t> index_by_id;
+
+            if (const Value* base_value = base_state.find(key); base_value != nullptr && !std::holds_alternative<std::monostate>(*base_value)) {
+                if (!std::holds_alternative<BlobRef>(*base_value)) {
+                    return fail_merge(
+                        "join barrier " + join_node.name +
+                        " requires message baseline for MergeMessages on state key " + std::to_string(key)
+                    );
+                }
+                if (!append_message_records_from_blob(
+                        base_state.blobs(),
+                        std::get<BlobRef>(*base_value),
+                        records,
+                        index_by_id,
+                        error_message
+                    )) {
+                    return std::nullopt;
+                }
+            }
+
+            for (const BranchFieldWrite& write : writes) {
+                if (!std::holds_alternative<BlobRef>(write.value)) {
+                    return fail_merge(
+                        "join barrier " + join_node.name +
+                        " requires message branch values for MergeMessages on state key " + std::to_string(key)
+                    );
+                }
+                if (!append_message_records_from_blob(
+                        write.source_state->blobs(),
+                        std::get<BlobRef>(write.value),
+                        records,
+                        index_by_id,
+                        error_message
+                    )) {
+                    return std::nullopt;
+                }
+            }
+
+            return Value{append_merged_message_blob(destination_state.blobs(), records)};
         }
     }
 

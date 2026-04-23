@@ -6,8 +6,10 @@
 #include "agentcore/execution/proof.h"
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <utility>
 
@@ -20,6 +22,8 @@ namespace {
 constexpr std::byte kPickleBlobTag{0x01};
 constexpr std::byte kJsonBlobTag{0x02};
 constexpr std::byte kBytesBlobTag{0x03};
+constexpr std::byte kSequenceBlobTag{0x04};
+constexpr std::byte kMessageBlobTag{0x05};
 
 [[nodiscard]] PyObject* unicode_from_utf8(std::string_view value) {
     return PyUnicode_FromStringAndSize(value.data(), static_cast<Py_ssize_t>(value.size()));
@@ -63,6 +67,27 @@ std::string fetch_python_error() {
 
 [[nodiscard]] bool tagged_buffer_has_payload(const std::byte* bytes, std::size_t size, std::byte tag) {
     return bytes != nullptr && size != 0U && bytes[0] == tag;
+}
+
+void append_u64(std::vector<std::byte>& output, uint64_t value) {
+    for (std::size_t byte_index = 0; byte_index < sizeof(uint64_t); ++byte_index) {
+        output.push_back(static_cast<std::byte>((value >> (byte_index * 8U)) & 0xFFU));
+    }
+}
+
+bool read_u64(const std::byte* data, std::size_t size, std::size_t* offset, uint64_t* value) {
+    if (*offset > size || size - *offset < sizeof(uint64_t)) {
+        return false;
+    }
+    uint64_t decoded = 0;
+    for (std::size_t byte_index = 0; byte_index < sizeof(uint64_t); ++byte_index) {
+        decoded |= static_cast<uint64_t>(
+            std::to_integer<unsigned char>(data[*offset + byte_index])
+        ) << (byte_index * 8U);
+    }
+    *value = decoded;
+    *offset += sizeof(uint64_t);
+    return true;
 }
 
 bool lookup_state_key_in_python_dict(
@@ -179,6 +204,28 @@ PyObject* load_object_from_pickle_bytes(const std::vector<std::byte>& bytes, std
     return load_object_from_pickle_buffer(bytes.data(), bytes.size(), err);
 }
 
+PyObject* load_object_from_pickle_payload(const std::byte* bytes, std::size_t size, std::string* err) {
+    PyObject* p = get_pickle_module();
+    if (!p) { *err = fetch_python_error(); return nullptr; }
+    static PyObject* loads = PyObject_GetAttrString(p, "loads");
+
+    PyObject* b = PyBytes_FromStringAndSize(
+        reinterpret_cast<const char*>(bytes),
+        static_cast<Py_ssize_t>(size)
+    );
+    if (b == nullptr) {
+        if (err != nullptr) {
+            *err = fetch_python_error();
+        }
+        return nullptr;
+    }
+
+    PyObject* res = PyObject_CallFunctionObjArgs(loads, b, nullptr);
+    Py_DECREF(b);
+    if (!res && err != nullptr) *err = fetch_python_error();
+    return res;
+}
+
 PyObject* load_object_from_pickle_buffer(const std::byte* bytes, std::size_t size, std::string* err) {
     PyObject* p = get_pickle_module();
     if (!p) { *err = fetch_python_error(); return nullptr; }
@@ -205,6 +252,281 @@ PyObject* load_object_from_pickle_buffer(const std::byte* bytes, std::size_t siz
     Py_DECREF(b);
     if (!res && err != nullptr) *err = fetch_python_error();
     return res;
+}
+
+bool extract_message_id(PyObject* message, std::string* id, std::string* err) {
+    id->clear();
+
+    PyObject* borrowed_id = nullptr;
+    PyObject* owned_id = nullptr;
+    if (PyDict_Check(message)) {
+        borrowed_id = PyDict_GetItemString(message, "id");
+    } else {
+        owned_id = PyObject_GetAttrString(message, "id");
+        if (owned_id == nullptr) {
+            if (PyErr_ExceptionMatches(PyExc_AttributeError)) {
+                PyErr_Clear();
+            } else if (err != nullptr) {
+                *err = fetch_python_error();
+                return false;
+            }
+        }
+    }
+
+    PyObject* id_obj = owned_id != nullptr ? owned_id : borrowed_id;
+    if (id_obj == nullptr || id_obj == Py_None) {
+        Py_XDECREF(owned_id);
+        return true;
+    }
+
+    PyObject* id_text = nullptr;
+    if (PyUnicode_Check(id_obj)) {
+        id_text = id_obj;
+        Py_INCREF(id_text);
+    } else {
+        id_text = PyObject_Str(id_obj);
+        if (id_text == nullptr) {
+            Py_XDECREF(owned_id);
+            if (err != nullptr) {
+                *err = fetch_python_error();
+            }
+            return false;
+        }
+    }
+
+    std::string id_error;
+    *id = python_string(id_text, &id_error);
+    Py_DECREF(id_text);
+    Py_XDECREF(owned_id);
+    if (!id_error.empty()) {
+        if (err != nullptr) {
+            *err = std::move(id_error);
+        }
+        return false;
+    }
+    return true;
+}
+
+bool dump_python_sequence_as_blob(PyObject* value, BlobStore& blobs, BlobRef* output, std::string* err) {
+    PyObject* sequence = PySequence_Fast(value, "expected a Python sequence");
+    if (sequence == nullptr) {
+        if (err != nullptr) {
+            *err = fetch_python_error();
+        }
+        return false;
+    }
+
+    const Py_ssize_t item_count = PySequence_Fast_GET_SIZE(sequence);
+    PyObject** items = PySequence_Fast_ITEMS(sequence);
+
+    std::vector<std::byte> bytes;
+    bytes.reserve(1U + sizeof(uint64_t) + static_cast<std::size_t>(item_count) * sizeof(uint64_t));
+    bytes.push_back(kSequenceBlobTag);
+    append_u64(bytes, static_cast<uint64_t>(item_count));
+
+    for (Py_ssize_t index = 0; index < item_count; ++index) {
+        std::vector<std::byte> item_bytes;
+        if (!dump_object_as_pickle_bytes(items[index], &item_bytes, err)) {
+            Py_DECREF(sequence);
+            return false;
+        }
+        append_u64(bytes, static_cast<uint64_t>(item_bytes.size()));
+        bytes.insert(bytes.end(), item_bytes.begin(), item_bytes.end());
+    }
+
+    Py_DECREF(sequence);
+    *output = blobs.append(bytes.data(), bytes.size());
+    return true;
+}
+
+bool dump_python_messages_as_blob(PyObject* value, BlobStore& blobs, BlobRef* output, std::string* err) {
+    PyObject* sequence = nullptr;
+    if (PyList_Check(value) || PyTuple_Check(value)) {
+        sequence = PySequence_Fast(value, "message state values must be a sequence");
+    } else {
+        sequence = PyTuple_Pack(1, value);
+    }
+    if (sequence == nullptr) {
+        if (err != nullptr) {
+            *err = fetch_python_error();
+        }
+        return false;
+    }
+
+    const Py_ssize_t item_count = PySequence_Fast_GET_SIZE(sequence);
+    PyObject** items = PySequence_Fast_ITEMS(sequence);
+
+    std::vector<std::byte> bytes;
+    bytes.reserve(1U + sizeof(uint64_t) + static_cast<std::size_t>(item_count) * (2U * sizeof(uint64_t)));
+    bytes.push_back(kMessageBlobTag);
+    append_u64(bytes, static_cast<uint64_t>(item_count));
+
+    for (Py_ssize_t index = 0; index < item_count; ++index) {
+        std::string id;
+        if (!extract_message_id(items[index], &id, err)) {
+            Py_DECREF(sequence);
+            return false;
+        }
+
+        std::vector<std::byte> item_bytes;
+        if (!dump_object_as_pickle_bytes(items[index], &item_bytes, err)) {
+            Py_DECREF(sequence);
+            return false;
+        }
+
+        append_u64(bytes, static_cast<uint64_t>(id.size()));
+        const auto* id_bytes = reinterpret_cast<const std::byte*>(id.data());
+        bytes.insert(bytes.end(), id_bytes, id_bytes + id.size());
+        append_u64(bytes, static_cast<uint64_t>(item_bytes.size()));
+        bytes.insert(bytes.end(), item_bytes.begin(), item_bytes.end());
+    }
+
+    Py_DECREF(sequence);
+    *output = blobs.append(bytes.data(), bytes.size());
+    return true;
+}
+
+PyObject* load_sequence_blob_to_python_list(const std::byte* bytes, std::size_t size, std::string* err) {
+    if (bytes == nullptr || size < 1U + sizeof(uint64_t) || bytes[0] != kSequenceBlobTag) {
+        if (err != nullptr) {
+            *err = "sequence payload is empty or invalid";
+        }
+        return nullptr;
+    }
+
+    std::size_t offset = 1U;
+    uint64_t item_count = 0;
+    if (!read_u64(bytes, size, &offset, &item_count)) {
+        if (err != nullptr) {
+            *err = "sequence payload is missing item count";
+        }
+        return nullptr;
+    }
+    if (item_count > static_cast<uint64_t>(std::numeric_limits<Py_ssize_t>::max())) {
+        if (err != nullptr) {
+            *err = "sequence payload has too many items for Python";
+        }
+        return nullptr;
+    }
+
+    PyObject* list = PyList_New(static_cast<Py_ssize_t>(item_count));
+    if (list == nullptr) {
+        if (err != nullptr) {
+            *err = fetch_python_error();
+        }
+        return nullptr;
+    }
+
+    for (uint64_t index = 0; index < item_count; ++index) {
+        uint64_t item_size = 0;
+        if (!read_u64(bytes, size, &offset, &item_size) ||
+            item_size > static_cast<uint64_t>(size - offset)) {
+            Py_DECREF(list);
+            if (err != nullptr) {
+                *err = "sequence payload is truncated";
+            }
+            return nullptr;
+        }
+
+        PyObject* item = load_object_from_pickle_payload(
+            bytes + offset,
+            static_cast<std::size_t>(item_size),
+            err
+        );
+        if (item == nullptr) {
+            Py_DECREF(list);
+            return nullptr;
+        }
+        PyList_SET_ITEM(list, static_cast<Py_ssize_t>(index), item);
+        offset += static_cast<std::size_t>(item_size);
+    }
+
+    if (offset != size) {
+        Py_DECREF(list);
+        if (err != nullptr) {
+            *err = "sequence payload has trailing bytes";
+        }
+        return nullptr;
+    }
+
+    return list;
+}
+
+PyObject* load_message_blob_to_python_list(const std::byte* bytes, std::size_t size, std::string* err) {
+    if (bytes == nullptr || size < 1U + sizeof(uint64_t) || bytes[0] != kMessageBlobTag) {
+        if (err != nullptr) {
+            *err = "message payload is empty or invalid";
+        }
+        return nullptr;
+    }
+
+    std::size_t offset = 1U;
+    uint64_t item_count = 0;
+    if (!read_u64(bytes, size, &offset, &item_count)) {
+        if (err != nullptr) {
+            *err = "message payload is missing item count";
+        }
+        return nullptr;
+    }
+    if (item_count > static_cast<uint64_t>(std::numeric_limits<Py_ssize_t>::max())) {
+        if (err != nullptr) {
+            *err = "message payload has too many items for Python";
+        }
+        return nullptr;
+    }
+
+    PyObject* list = PyList_New(static_cast<Py_ssize_t>(item_count));
+    if (list == nullptr) {
+        if (err != nullptr) {
+            *err = fetch_python_error();
+        }
+        return nullptr;
+    }
+
+    for (uint64_t index = 0; index < item_count; ++index) {
+        uint64_t id_size = 0;
+        if (!read_u64(bytes, size, &offset, &id_size) ||
+            id_size > static_cast<uint64_t>(size - offset)) {
+            Py_DECREF(list);
+            if (err != nullptr) {
+                *err = "message payload is truncated at id";
+            }
+            return nullptr;
+        }
+        offset += static_cast<std::size_t>(id_size);
+
+        uint64_t payload_size = 0;
+        if (!read_u64(bytes, size, &offset, &payload_size) ||
+            payload_size > static_cast<uint64_t>(size - offset)) {
+            Py_DECREF(list);
+            if (err != nullptr) {
+                *err = "message payload is truncated";
+            }
+            return nullptr;
+        }
+
+        PyObject* item = load_object_from_pickle_payload(
+            bytes + offset,
+            static_cast<std::size_t>(payload_size),
+            err
+        );
+        if (item == nullptr) {
+            Py_DECREF(list);
+            return nullptr;
+        }
+        PyList_SET_ITEM(list, static_cast<Py_ssize_t>(index), item);
+        offset += static_cast<std::size_t>(payload_size);
+    }
+
+    if (offset != size) {
+        Py_DECREF(list);
+        if (err != nullptr) {
+            *err = "message payload has trailing bytes";
+        }
+        return nullptr;
+    }
+
+    return list;
 }
 
 PyObject* load_object_from_json_bytes(const std::vector<std::byte>& bytes, std::string* err) {
@@ -1872,6 +2194,12 @@ PyObject* GraphHandle::convert_value_to_python(const Value& value, const BlobSto
         if (tagged_buffer_has_payload(buffer.first, buffer.second, kJsonBlobTag)) {
             return load_object_from_json_buffer(buffer.first, buffer.second, error_message);
         }
+        if (tagged_buffer_has_payload(buffer.first, buffer.second, kSequenceBlobTag)) {
+            return load_sequence_blob_to_python_list(buffer.first, buffer.second, error_message);
+        }
+        if (tagged_buffer_has_payload(buffer.first, buffer.second, kMessageBlobTag)) {
+            return load_message_blob_to_python_list(buffer.first, buffer.second, error_message);
+        }
         bool is_bytes = tagged_buffer_has_payload(buffer.first, buffer.second, kBytesBlobTag);
         return PyMemoryView_FromMemory(
             const_cast<char*>(reinterpret_cast<const char*>(is_bytes ? buffer.first + 1 : buffer.first)),
@@ -1882,9 +2210,24 @@ PyObject* GraphHandle::convert_value_to_python(const Value& value, const BlobSto
     Py_RETURN_NONE;
 }
 
-bool GraphHandle::convert_python_value(PyObject* value, BlobStore& blobs, StringInterner& strings, Value* output, std::string* error_message) {
+bool GraphHandle::convert_python_value(
+    PyObject* value,
+    BlobStore& blobs,
+    StringInterner& strings,
+    Value* output,
+    std::string* error_message,
+    bool encode_as_messages
+) {
     if (value == Py_None) {
         *output = std::monostate{};
+        return true;
+    }
+    if (encode_as_messages) {
+        BlobRef ref;
+        if (!dump_python_messages_as_blob(value, blobs, &ref, error_message)) {
+            return false;
+        }
+        *output = ref;
         return true;
     }
     if (PyBool_Check(value)) {
@@ -1907,6 +2250,14 @@ bool GraphHandle::convert_python_value(PyObject* value, BlobStore& blobs, String
         char* buffer; Py_ssize_t size;
         PyBytes_AsStringAndSize(value, &buffer, &size);
         *output = append_tagged_blob(blobs, kBytesBlobTag, reinterpret_cast<const std::byte*>(buffer), static_cast<std::size_t>(size));
+        return true;
+    }
+    if (PyList_Check(value)) {
+        BlobRef ref;
+        if (!dump_python_sequence_as_blob(value, blobs, &ref, error_message)) {
+            return false;
+        }
+        *output = ref;
         return true;
     }
 
@@ -1980,7 +2331,11 @@ bool GraphHandle::add_node(
 
     std::vector<FieldMergeRule> rules;
     for (const auto& [field, strategy] : merge_rules) {
-        rules.push_back({ensure_state_key_locked(field), strategy});
+        const StateKey state_key = ensure_state_key_locked(field);
+        if (strategy == JoinMergeStrategy::MergeMessages) {
+            message_state_keys_.insert(state_key);
+        }
+        rules.push_back({state_key, strategy});
     }
 
     node_bindings_.push_back({
@@ -2710,8 +3065,21 @@ bool GraphHandle::convert_mapping_to_patch(
             }
         }
 
+        bool encode_as_messages = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            encode_as_messages = message_state_keys_.find(state_key) != message_state_keys_.end();
+        }
+
         Value val;
-        if (!convert_python_value(value, blobs, strings, &val, error_message)) {
+        if (!convert_python_value(
+                value,
+                blobs,
+                strings,
+                &val,
+                error_message,
+                encode_as_messages
+            )) {
             return false;
         }
 

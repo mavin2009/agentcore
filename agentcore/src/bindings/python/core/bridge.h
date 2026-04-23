@@ -127,7 +127,8 @@ public:
         BlobStore& blobs,
         StringInterner& strings,
         Value* output,
-        std::string* error_message
+        std::string* error_message,
+        bool encode_as_messages = false
     );
 
     bool ensure_finalized(std::string* error_message);
@@ -192,6 +193,7 @@ private:
     mutable std::mutex mutex_;
     std::shared_ptr<std::vector<std::string>> state_names_;
     std::shared_ptr<std::unordered_map<std::string, StateKey>> state_keys_by_name_;
+    std::unordered_set<StateKey> message_state_keys_;
     PyObject* state_key_lookup_{nullptr};
     std::unordered_map<RunId, PyObject*> active_configs_;
 };

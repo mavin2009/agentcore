@@ -7,6 +7,7 @@ import json
 from typing import Any
 
 from .. import _agentcore_native as _native
+from ..prompts.templates import _coerce_prompt_value_for_model_input
 
 
 _VALID_DECODE_MODES = {"auto", "bytes", "text", "json"}
@@ -576,11 +577,13 @@ class ModelRegistryView:
         max_tokens: int = 0,
         decode: str = "auto",
     ) -> dict[str, Any]:
+        normalized_prompt = _coerce_prompt_value_for_model_input(prompt)
+        normalized_schema = _coerce_prompt_value_for_model_input(schema)
         details = _native._invoke_model_with_details(
             self._native_graph,
             str(name),
-            encode_adapter_payload(prompt),
-            encode_adapter_payload(schema),
+            encode_adapter_payload(normalized_prompt),
+            encode_adapter_payload(normalized_schema),
             int(max_tokens),
         )
         return _decode_response_details(details, decode=decode)

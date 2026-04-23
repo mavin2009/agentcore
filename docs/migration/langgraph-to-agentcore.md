@@ -75,6 +75,7 @@ graph = StateGraph(dict, name="research", worker_count=4)
 - Node functions that return partial state updates as dictionaries.
 - Command-style routing with `goto`.
 - Batch and streaming entry points.
+- Sequence-style builder flows such as `add_sequence(...)`, `set_finish_point(...)`, and conditional entry routing.
 
 ## What Usually Changes
 
@@ -93,6 +94,15 @@ AgentCore callbacks may accept:
 - `(state, config, runtime)`
 
 The optional `runtime` argument exposes native services such as `RuntimeContext.record_once(...)`.
+
+Named callables can also be registered without repeating the node name:
+
+```python
+graph.add_node(planner_step)
+graph.add_sequence([planner_step, reviewer_step])
+```
+
+Lambdas and anonymous callables still need explicit names.
 
 ### 3. Pause / Resume
 
@@ -145,7 +155,57 @@ Streamed and traced events may carry:
 
 That is especially useful once you start using persistent subgraphs or nested graphs.
 
-### 5. Subgraphs
+### 5. Builder Conveniences
+
+The native `agentcore.graph.StateGraph` now accepts several migration-friendly builder patterns directly:
+
+```python
+graph.add_sequence([("draft", draft), ("review", review)])
+graph.set_finish_point("review")
+graph.set_conditional_entry_point(route_start, {"draft": "draft", "fallback": "fallback"})
+graph.add_edge(["planner", "critic"], "synthesize")
+```
+
+Those patterns are intentionally additive. They keep the Python surface close to familiar graph-builder flows while still compiling into AgentCore's native execution model.
+
+### 6. Schema-Driven Reducers
+
+If your state schema already uses `TypedDict` plus `Annotated[...]` reducers, AgentCore can now infer the reducer subset that maps directly to the native join engine:
+
+```python
+import operator
+from typing_extensions import Annotated, TypedDict
+
+
+class ReviewState(TypedDict, total=False):
+    score: Annotated[int, operator.add]
+    notes: Annotated[list[str], operator.add]
+    approved: Annotated[bool, operator.or_]
+```
+
+For agent message history, use the built-in message reducer:
+
+```python
+from agentcore.graph import MessagesState, add_messages
+
+
+class AgentState(MessagesState, total=False):
+    summary: str
+```
+
+Today the inferred subset is:
+
+- `Annotated[int, operator.add]`
+- `Annotated[int, min]`
+- `Annotated[int, max]`
+- `Annotated[list[T], operator.add]`
+- `Annotated[list[dict], add_messages]`
+- `Annotated[bool, operator.or_]`
+- `Annotated[bool, operator.and_]`
+
+Those reducers are applied automatically when a node becomes a join barrier. List concatenation runs in the native join engine by concatenating tagged sequence blobs, so it preserves deterministic branch order without calling back into Python at the barrier. Message merging uses a native message blob: messages with matching non-empty `id` values replace earlier messages in place, while messages without ids append. If your schema depends on reducer functions outside that subset, keep the migration explicit with `merge={...}` or a dedicated aggregation node.
+
+### 7. Subgraphs
 
 Instead of manually calling a child graph from inside a parent node, AgentCore can make subgraphs explicit:
 
@@ -168,6 +228,14 @@ That gives you:
 - built-in session reuse
 - namespaced stream visibility
 - deterministic same-session conflict rejection
+
+When the parent and child already share a declared state schema, there is also a shorter path:
+
+```python
+parent.add_node("specialist_child", specialist_graph)
+```
+
+That direct form binds the overlapping schema fields by name for both input and output. It is intentionally the shared-state default only. Use `add_subgraph(...)` when you need explicit bindings, namespaces, persistent sessions, or knowledge-graph propagation rules.
 
 ## Minimal Example
 
@@ -207,24 +275,61 @@ compiled = graph.compile()
 result = compiled.invoke({"count": 0})
 ```
 
+Using the migration-friendly builder helpers, the same shape can also be written as:
+
+```python
+from agentcore.graph import StateGraph
+
+
+def step(state, config):
+    return {"count": int(state.get("count", 0)) + 1}
+
+
+graph = StateGraph(dict, worker_count=2)
+graph.add_node(step)
+graph.set_entry_point("step")
+graph.set_finish_point("step")
+compiled = graph.compile()
+```
+
 ## Common Translation Table
 
 | LangGraph pattern | AgentCore pattern |
 | --- | --- |
 | `StateGraph(...)` | `StateGraph(..., worker_count=N)` |
+| `add_node(step_fn)` | same for named callables |
+| `add_sequence([...])` | same |
+| `set_finish_point("x")` | same |
+| `set_conditional_entry_point(...)` | same |
+| `add_edge(["a", "b"], "join")` | same builder shape, compiled as an explicit join target |
+| `TypedDict` + supported `Annotated[...]` reducers | same reducer intent for native join barriers |
+| `MessagesState` / `add_messages` message history | same import from `agentcore.graph`; compiled to native ID-aware message merge |
+| `add_node("child", child_graph)` with shared declared schema | supported as shared-state subgraph shorthand |
 | `dict` state updates | same |
 | `Command(update=..., goto=...)` | same shape |
 | `interrupt()` + resume command | `Command(wait=True)` + `invoke_until_pause_with_metadata(...)` / `resume_with_metadata(...)` |
 | manual child graph invocation + `thread_id` persistence | `add_subgraph(..., session_mode="persistent", session_id_from=...)` |
 | ad hoc stream inspection | `stream(...)` and `invoke_with_metadata(...)` with namespace and session metadata |
 
+## Compile-Time Differences
+
+`compile(...)` accepts `name=` and `debug=` for migration convenience, but some LangGraph-specific persistence arguments remain explicit differences today.
+
+- `checkpointer=`
+- `interrupt_before=`
+- `interrupt_after=`
+- `store=`
+
+Those currently raise a clear `NotImplementedError` instead of being silently ignored. The intent is to keep the migration seam honest: if a workflow depends on those exact semantics, the port should move to AgentCore's native wait/resume, metadata, and persistent subgraph session surfaces rather than appearing to work while dropping behavior.
+
 ## Recommended Migration Order
 
 1. Run your existing graph against the generated compatibility layer from `./build/python`.
 2. Switch imports to `agentcore.graph`.
 3. Keep returning dict patches and `Command(...)` values.
-4. Replace manual child-graph persistence with `add_subgraph(...)`.
-5. Replace interrupt-style flows with explicit wait/resume surfaces where needed.
+4. Move chat history fields to `MessagesState` or `Annotated[list[dict], add_messages]` when you need ID-aware message merging.
+5. Replace manual child-graph persistence with `add_subgraph(...)`.
+6. Replace interrupt-style flows with explicit wait/resume surfaces where needed.
 6. Add `invoke_with_metadata(...)` or `stream(...)` once you want better observability.
 
 ## Related Pages

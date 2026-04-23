@@ -1,5 +1,7 @@
 import asyncio
+import operator
 
+from agentcore import ChatPromptTemplate, PromptTemplate
 from agentcore.graph import (
     Command,
     END,
@@ -7,9 +9,396 @@ from agentcore.graph import (
     IntelligenceRouter,
     IntelligenceRule,
     IntelligenceSubscription,
+    MessagesState,
     RuntimeContext,
     StateGraph,
+    add_messages,
 )
+from langgraph.graph import END as COMPAT_END
+from langgraph.graph import MessagesState as CompatMessagesState
+from langgraph.graph import START as COMPAT_START
+from langgraph.graph import StateGraph as CompatStateGraph
+from langgraph.graph import add_messages as compat_add_messages
+from typing_extensions import Annotated, TypedDict
+
+
+summary_prompt = PromptTemplate(
+    "Agent: {agent}\nQuestion: {question}\nContext:\n{context}"
+).partial(agent="planner")
+rendered_summary_prompt = summary_prompt.render(
+    question="How should we test prompt infrastructure?",
+    context={"focus": ["rendering", "model invocation"]},
+)
+assert "Agent: planner" in rendered_summary_prompt.text
+assert '"focus": [' in rendered_summary_prompt.text
+assert summary_prompt.variables == ("agent", "question", "context")
+
+chat_prompt = ChatPromptTemplate.from_messages(
+    [
+        ("system", "You are a careful {role}."),
+        ("user", "Question: {question}\nConstraints:\n{constraints}"),
+    ],
+    name="planning_chat",
+).partial(role="planner")
+rendered_chat_prompt = chat_prompt.render(
+    question="How should we wire prompt templates?",
+    constraints=["keep the API small", "make it reusable"],
+)
+assert rendered_chat_prompt.as_messages()[0]["role"] == "system"
+assert rendered_chat_prompt.as_messages()[1]["role"] == "user"
+assert "SYSTEM:\nYou are a careful planner." in rendered_chat_prompt.to_text()
+assert rendered_chat_prompt.to_model_input(mode="messages")[1]["role"] == "user"
+assert chat_prompt.variables == ("role", "question", "constraints")
+
+
+def draft_step(state, config):
+    steps = list(state.get("steps", []))
+    steps.append("draft")
+    return {"steps": steps}
+
+
+def review_step(state, config):
+    steps = list(state.get("steps", []))
+    steps.append("review")
+    return {"steps": steps, "done": True}
+
+
+sequence_graph = StateGraph(dict, name="python_sequence_migration_smoke", worker_count=2)
+sequence_graph.add_sequence([("draft", draft_step), review_step])
+sequence_graph.set_finish_point("review_step")
+sequence_compiled = sequence_graph.compile(name="python_sequence_override", debug=True)
+assert sequence_compiled.name == "python_sequence_override"
+sequence_result = sequence_compiled.invoke({"steps": []})
+assert sequence_result["steps"] == ["draft", "review"]
+assert sequence_result["done"] is True
+try:
+    sequence_graph.compile(checkpointer=object())
+    raise AssertionError("compile(checkpointer=...) should have raised")
+except NotImplementedError:
+    pass
+
+
+def route_entry(state, config):
+    configurable = dict(config.get("configurable", {}))
+    return configurable.get("entry", "left")
+
+
+def left_branch(state, config):
+    return {"entry_branch": "left"}
+
+
+def right_branch(state, config):
+    return {"entry_branch": "right"}
+
+
+conditional_entry_graph = StateGraph(
+    dict,
+    name="python_conditional_entry_smoke",
+    worker_count=2,
+)
+conditional_entry_graph.add_node("left", left_branch)
+conditional_entry_graph.add_node("right", right_branch)
+conditional_entry_graph.add_conditional_edges(
+    START,
+    route_entry,
+    {"left": "left", "right": "right"},
+)
+conditional_entry_graph.set_finish_point("left")
+conditional_entry_graph.set_finish_point("right")
+conditional_entry_compiled = conditional_entry_graph.compile()
+assert conditional_entry_compiled.invoke({}, config={"configurable": {"entry": "left"}})["entry_branch"] == "left"
+assert conditional_entry_compiled.invoke({}, config={"configurable": {"entry": "right"}})["entry_branch"] == "right"
+
+
+def join_left(state, config):
+    return {"left_done": True}
+
+
+def join_right(state, config):
+    return {"right_done": True}
+
+
+def join_node(state, config):
+    return {"joined": bool(state["left_done"] and state["right_done"])}
+
+
+join_graph = StateGraph(dict, name="python_join_sequence_smoke", worker_count=4)
+join_graph.add_fanout("fanout")
+join_graph.add_node("left", join_left)
+join_graph.add_node("right", join_right)
+join_graph.add_node("join", join_node)
+join_graph.add_edge(START, "fanout")
+join_graph.add_edge("fanout", "left")
+join_graph.add_edge("fanout", "right")
+join_graph.add_edge(["left", "right"], "join")
+join_graph.set_finish_point("join")
+join_result = join_graph.compile().invoke({})
+assert join_result["joined"] is True
+
+
+def compat_route_entry(state, config):
+    configurable = dict((config or {}).get("configurable", {}))
+    return configurable.get("entry", "draft")
+
+
+def compat_draft(state, config):
+    steps = list(state.get("steps", []))
+    steps.append("draft")
+    return {"steps": steps}
+
+
+def compat_review(state, config):
+    steps = list(state.get("steps", []))
+    steps.append("review")
+    return {"steps": steps, "compat_done": True}
+
+
+compat_graph = CompatStateGraph(dict, name="python_langgraph_compat_smoke", worker_count=2)
+compat_graph.add_sequence([("draft", compat_draft), ("review", compat_review)])
+compat_graph.add_node("fallback", lambda state, config: {"steps": ["fallback"], "compat_done": False})
+compat_graph.set_conditional_entry_point(
+    compat_route_entry,
+    {"draft": "draft", "fallback": "fallback"},
+)
+compat_graph.set_finish_point("review")
+compat_graph.set_finish_point("fallback")
+compat_compiled = compat_graph.compile(name="python_langgraph_compat_override", debug=False)
+assert compat_compiled.invoke({"steps": []}, config={"configurable": {"entry": "draft"}}) == {
+    "steps": ["draft", "review"],
+    "compat_done": True,
+}
+assert compat_compiled.invoke({"steps": []}, config={"configurable": {"entry": "fallback"}}) == {
+    "steps": ["fallback"],
+    "compat_done": False,
+}
+try:
+    compat_graph.compile(checkpointer=object())
+    raise AssertionError("compat compile(checkpointer=...) should have raised")
+except NotImplementedError:
+    pass
+
+
+class ReducerState(TypedDict, total=False):
+    count: Annotated[int, operator.add]
+    notes: Annotated[list[str], operator.add]
+    seen: Annotated[bool, operator.or_]
+    floor: Annotated[int, min]
+    ceiling: Annotated[int, max]
+    summary: str
+
+
+def reduce_left(state, config):
+    return {"count": 1, "notes": ["left"], "seen": False, "floor": 10, "ceiling": 10}
+
+
+def reduce_right(state, config):
+    return {"count": 2, "notes": ["right"], "seen": True, "floor": 3, "ceiling": 12}
+
+
+def reduce_join(state, config):
+    return {
+        "summary": f"{state['count']}|{','.join(state['notes'])}|{int(state['seen'])}|{state['floor']}|{state['ceiling']}"
+    }
+
+
+reducer_graph = StateGraph(ReducerState, name="python_reducer_schema_smoke", worker_count=4)
+reducer_graph.add_fanout("fanout")
+reducer_graph.add_node("left", reduce_left)
+reducer_graph.add_node("right", reduce_right)
+reducer_graph.add_node("join", reduce_join)
+reducer_graph.add_edge(START, "fanout")
+reducer_graph.add_edge("fanout", "left")
+reducer_graph.add_edge("fanout", "right")
+reducer_graph.add_edge(["left", "right"], "join")
+reducer_graph.set_finish_point("join")
+reducer_result = reducer_graph.compile().invoke(
+    {"count": 5, "notes": ["base"], "seen": False, "floor": 7, "ceiling": 11}
+)
+assert reducer_result["count"] == 8
+assert reducer_result["notes"] == ["base", "left", "right"]
+assert reducer_result["seen"] is True
+assert reducer_result["floor"] == 3
+assert reducer_result["ceiling"] == 12
+assert reducer_result["summary"] == "8|base,left,right|1|3|12"
+
+
+class NativeMessageState(MessagesState, total=False):
+    summary: str
+
+
+def message_left(state, config):
+    return {
+        "messages": [
+            {"id": "replace", "role": "assistant", "content": "left-replace"},
+            {"role": "tool", "content": "left-anon"},
+        ]
+    }
+
+
+def message_right(state, config):
+    return {
+        "messages": [
+            {"id": "new", "role": "assistant", "content": "right-new"},
+            {"id": "replace", "role": "assistant", "content": "right-replace"},
+        ]
+    }
+
+
+def summarize_messages(state, config):
+    return {"summary": ",".join(message["content"] for message in state["messages"])}
+
+
+message_graph = StateGraph(NativeMessageState, name="python_message_schema_smoke", worker_count=4)
+message_graph.add_fanout("fanout")
+message_graph.add_node("left", message_left)
+message_graph.add_node("right", message_right)
+message_graph.add_join("join", summarize_messages)
+message_graph.add_edge(START, "fanout")
+message_graph.add_edge("fanout", "left")
+message_graph.add_edge("fanout", "right")
+message_graph.add_edge(["left", "right"], "join")
+message_graph.set_finish_point("join")
+message_result = message_graph.compile().invoke(
+    {
+        "messages": [
+            {"id": "keep", "role": "user", "content": "base-keep"},
+            {"id": "replace", "role": "assistant", "content": "base-old"},
+            {"role": "user", "content": "base-anon"},
+        ]
+    }
+)
+assert [message["content"] for message in message_result["messages"]] == [
+    "base-keep",
+    "right-replace",
+    "base-anon",
+    "left-anon",
+    "right-new",
+]
+assert message_result["summary"] == "base-keep,right-replace,base-anon,left-anon,right-new"
+assert add_messages(
+    [{"id": "x", "content": "old"}, {"content": "anon"}],
+    [{"id": "x", "content": "new"}],
+) == [{"id": "x", "content": "new"}, {"content": "anon"}]
+
+
+class SharedSubgraphState(TypedDict, total=False):
+    topic: str
+    steps: int
+    answer: str
+
+
+def prepare_shared(state, config):
+    return {
+        "topic": "agentcore-runtime",
+        "steps": int(state.get("steps", 0)) + 1,
+    }
+
+
+def child_shared_step(state, config):
+    return {
+        "steps": int(state.get("steps", 0)) + 1,
+        "answer": f"{state['topic']}::shared-child",
+    }
+
+
+shared_child = StateGraph(SharedSubgraphState, name="python_shared_child", worker_count=2)
+shared_child.add_node("child_step", child_shared_step)
+shared_child.add_edge(START, "child_step")
+shared_child.set_finish_point("child_step")
+
+shared_parent = StateGraph(SharedSubgraphState, name="python_shared_parent", worker_count=2)
+shared_parent.add_sequence([("prepare", prepare_shared), ("shared_child", shared_child)])
+shared_result = shared_parent.compile().invoke({})
+assert shared_result["topic"] == "agentcore-runtime"
+assert shared_result["steps"] == 2
+assert shared_result["answer"] == "agentcore-runtime::shared-child"
+
+
+compat_reducer_graph = CompatStateGraph(ReducerState, name="python_compat_reducer_smoke", worker_count=4)
+compat_reducer_graph.add_fanout("fanout")
+compat_reducer_graph.add_node("left", lambda state, config: {"count": 1, "notes": ["left"], "seen": False, "floor": 10, "ceiling": 10})
+compat_reducer_graph.add_node("right", lambda state, config: {"count": 2, "notes": ["right"], "seen": True, "floor": 3, "ceiling": 12})
+compat_reducer_graph.add_join(
+    "join",
+    lambda state, config: {
+        "summary": f"{state['count']}|{','.join(state['notes'])}|{int(state['seen'])}|{state['floor']}|{state['ceiling']}"
+    },
+)
+compat_reducer_graph.add_edge(COMPAT_START, "fanout")
+compat_reducer_graph.add_edge("fanout", "left")
+compat_reducer_graph.add_edge("fanout", "right")
+compat_reducer_graph.add_edge(["left", "right"], "join")
+compat_reducer_graph.set_finish_point("join")
+compat_reducer_result = compat_reducer_graph.compile().invoke(
+    {"count": 5, "notes": ["base"], "seen": False, "floor": 7, "ceiling": 11}
+)
+assert compat_reducer_result["count"] == 8
+assert compat_reducer_result["notes"] == ["base", "left", "right"]
+assert compat_reducer_result["seen"] is True
+assert compat_reducer_result["floor"] == 3
+assert compat_reducer_result["ceiling"] == 12
+assert compat_reducer_result["summary"] == "8|base,left,right|1|3|12"
+
+
+class CompatMessageState(CompatMessagesState, total=False):
+    summary: str
+
+
+compat_message_graph = CompatStateGraph(CompatMessageState, name="python_compat_message_schema_smoke", worker_count=4)
+compat_message_graph.add_fanout("fanout")
+compat_message_graph.add_node("left", message_left)
+compat_message_graph.add_node("right", message_right)
+compat_message_graph.add_join("join", summarize_messages)
+compat_message_graph.add_edge(COMPAT_START, "fanout")
+compat_message_graph.add_edge("fanout", "left")
+compat_message_graph.add_edge("fanout", "right")
+compat_message_graph.add_edge(["left", "right"], "join")
+compat_message_graph.set_finish_point("join")
+compat_message_result = compat_message_graph.compile().invoke(
+    {
+        "messages": [
+            {"id": "keep", "role": "user", "content": "base-keep"},
+            {"id": "replace", "role": "assistant", "content": "base-old"},
+            {"role": "user", "content": "base-anon"},
+        ]
+    }
+)
+assert [message["content"] for message in compat_message_result["messages"]] == [
+    "base-keep",
+    "right-replace",
+    "base-anon",
+    "left-anon",
+    "right-new",
+]
+assert compat_message_result["summary"] == "base-keep,right-replace,base-anon,left-anon,right-new"
+assert compat_add_messages(
+    [{"id": "x", "content": "old"}, {"content": "anon"}],
+    [{"id": "x", "content": "new"}],
+) == [{"id": "x", "content": "new"}, {"content": "anon"}]
+
+
+compat_shared_child = CompatStateGraph(SharedSubgraphState, name="python_compat_shared_child", worker_count=2)
+compat_shared_child.add_node(
+    "child_step",
+    lambda state, config: {
+        "steps": int(state.get("steps", 0)) + 1,
+        "answer": f"{state['topic']}::compat-shared-child",
+    },
+)
+compat_shared_child.add_edge(COMPAT_START, "child_step")
+compat_shared_child.set_finish_point("child_step")
+
+compat_shared_parent = CompatStateGraph(SharedSubgraphState, name="python_compat_shared_parent", worker_count=2)
+compat_shared_parent.add_sequence(
+    [
+        ("prepare", lambda state, config: {"topic": "compat-runtime", "steps": int(state.get("steps", 0)) + 1}),
+        ("compat_shared_child", compat_shared_child),
+    ]
+)
+compat_shared_result = compat_shared_parent.compile().invoke({})
+assert compat_shared_result["topic"] == "compat-runtime"
+assert compat_shared_result["steps"] == 2
+assert compat_shared_result["answer"] == "compat-runtime::compat-shared-child"
 
 
 async def planner(state, config):

@@ -13,6 +13,13 @@ Exports:
 - `START`
 - `END`
 - `Command`
+- `MessagesState`
+- `add_messages`
+- `PromptTemplate`
+- `MessageTemplate`
+- `ChatPromptTemplate`
+- `RenderedPrompt`
+- `RenderedChatPrompt`
 - `IntelligenceView`
 - `IntelligenceRule`
 - `IntelligenceRouter`
@@ -35,14 +42,17 @@ StateGraph(state_schema=None, *, name=None, worker_count=1)
 
 Builder methods:
 
-- `add_node(name, action=None, *, kind="compute", stop_after=False, allow_fan_out=False, create_join_scope=False, join_incoming_branches=False, deterministic=False, read_keys=None, cache_size=16, intelligence_subscriptions=None, merge=None)`
+- `add_node(name_or_action, action=None, *, kind="compute", stop_after=False, allow_fan_out=False, create_join_scope=False, join_incoming_branches=False, deterministic=False, read_keys=None, cache_size=16, intelligence_subscriptions=None, merge=None)`
 - `add_fanout(name, action=None, *, kind="control", create_join_scope=True)`
 - `add_join(name, action=None, *, merge=None, kind="aggregate")`
 - `add_subgraph(name, graph, *, inputs=None, outputs=None, namespace=None, propagate_knowledge_graph=False, session_mode="ephemeral", session_id_from=None)`
 - `add_edge(source, target)`
 - `add_conditional_edges(source, path, path_map=None)`
+- `add_sequence(nodes)`
 - `set_entry_point(name)`
-- `compile(*, worker_count=None)`
+- `set_finish_point(name)`
+- `set_conditional_entry_point(path, path_map=None)`
+- `compile(*, worker_count=None, name=None, debug=None, checkpointer=None, interrupt_before=None, interrupt_after=None, store=None)`
 
 Supported Python node kinds:
 
@@ -54,6 +64,40 @@ Supported Python node kinds:
 - `human`
 
 Subgraphs are added through `add_subgraph(...)` rather than `add_node(..., kind="subgraph")`.
+
+Migration-friendly builder notes:
+
+- `add_node(...)` accepts either `(name, action)` or a named callable by itself. Lambdas and anonymous callables still require an explicit name.
+- `add_node(name, graph)` and `add_node(graph)` also accept a `StateGraph` or `CompiledStateGraph` directly when the parent and child declare overlapping schema fields. In that case the shared fields are bound by name for both input and output, which gives a compact shared-state subgraph path without writing bindings by hand.
+- `add_sequence([...])` accepts registered node names, named callables, or `(name, action)` pairs and wires them in order.
+- `add_edge([...], target)` treats a sequence source as a multi-source join edge and marks the target as a join node automatically.
+- `add_conditional_edges(START, ...)` is accepted as an alias for `set_conditional_entry_point(...)`.
+
+Schema-driven reducer notes:
+
+- If `state_schema` is a declared schema with `Annotated[...]` fields, a supported reducer subset is inferred automatically for join barriers.
+- `Annotated[int, operator.add]` maps to `sum_int64`.
+- `Annotated[int, min]` maps to `min_int64`.
+- `Annotated[int, max]` maps to `max_int64`.
+- `Annotated[list[T], operator.add]` maps to `concat_sequence`.
+- `Annotated[list[dict], add_messages]` maps to `merge_messages`.
+- `Annotated[bool, operator.or_]` maps to `logical_or`.
+- `Annotated[bool, operator.and_]` maps to `logical_and`.
+- List concatenation is implemented as a native tagged sequence merge. Python list values are stored as sequence blobs, concatenated in deterministic join order, and decoded back to Python lists.
+- Message merging is implemented as a native tagged message merge. Messages with a non-empty `id` replace the existing message with that id while preserving that message's position; messages without an id append.
+- Reducers outside that subset are not inferred automatically today. Use explicit `merge={...}` rules or a post-join aggregation node when you need a merge shape the native join engine does not currently expose.
+
+Message state helpers:
+
+```python
+from agentcore.graph import MessagesState, add_messages
+
+
+class AgentState(MessagesState, total=False):
+    summary: str
+```
+
+`MessagesState` declares a `messages` field using `Annotated[list[dict], add_messages]`. The standalone `add_messages(left, right)` helper has the same append-or-replace-by-id behavior in Python, and the schema metadata compiles to the native `merge_messages` strategy at join barriers.
 
 Subgraph session rules:
 
@@ -88,6 +132,13 @@ Metadata and stream events include the usual run/node identifiers plus:
 - `namespaces`
 
 `invoke_with_metadata(...)`, `invoke_until_pause_with_metadata(...)`, and `resume_with_metadata(...)` also include the committed intelligence snapshot under `details["intelligence"]`.
+
+`compile(...)` compatibility notes:
+
+- `name=` overrides the compiled graph name for that compiled instance.
+- `debug=` is accepted for migration convenience and does not change runtime behavior.
+- `checkpointer=`, `interrupt_before=`, `interrupt_after=`, and `store=` currently raise a clear `NotImplementedError` so migration failures stay explicit instead of silently ignoring LangGraph-specific durability semantics.
+- Direct `add_node(subgraph)` is intentionally limited to the shared-schema default path. Use `add_subgraph(...)` when you need namespaces, persistent sessions, knowledge-graph propagation, or explicit field bindings.
 
 Registry properties:
 
@@ -137,6 +188,93 @@ Methods:
 
 `SpecialistTeam` lowers a common multi-agent shape into a dispatch fan-out, optional per-specialist preparation, subgraph invocation, and aggregate/join node. Persistent specialists can infer `session_id_from` automatically when exactly one input binding maps a parent field to child `session_id`.
 
+### `agentcore.prompts`
+
+These prompt helpers live under [`../../python/agentcore/prompts`](../../python/agentcore/prompts) and are also exported from `agentcore` directly.
+
+#### `PromptTemplate`
+
+```python
+PromptTemplate(template, *, defaults=None, name=None)
+```
+
+Current surface:
+
+- `.variables`
+- `.partial(**defaults)`
+- `.render(values=None, **kwargs)`
+- `.format(values=None, **kwargs)`
+- `.to_model_input()`
+
+`PromptTemplate` renders to `RenderedPrompt`, which stringifies mappings and sequences in a stable JSON-friendly form when no explicit format specifier is provided.
+
+#### `MessageTemplate`
+
+```python
+MessageTemplate(role, template, *, defaults=None, name=None)
+```
+
+Current surface:
+
+- `.variables`
+- `.partial(**defaults)`
+- `.render(values=None, **kwargs)`
+- `.format(values=None, **kwargs)`
+
+`MessageTemplate.render(...)` returns a `PromptMessage`.
+
+#### `ChatPromptTemplate`
+
+```python
+ChatPromptTemplate.from_messages(messages, *, name=None, separator="\n\n")
+```
+
+Accepted message forms:
+
+- `MessageTemplate(...)`
+- `PromptMessage(...)`
+- `(role, template)` pairs
+- mappings with `role` plus `template` or `content`
+
+Current surface:
+
+- `.variables`
+- `.partial(**defaults)`
+- `.render(values=None, **kwargs)`
+- `.format(values=None, **kwargs)`
+- `.as_messages(values=None, **kwargs)`
+- `.to_model_input(mode="text" | "messages")`
+
+`render(...)` returns `RenderedChatPrompt`.
+
+#### `RenderedPrompt`
+
+```python
+RenderedPrompt(text, *, name=None)
+```
+
+Current surface:
+
+- `.text`
+- `.to_model_input()`
+
+`RenderedPrompt` stringifies to its rendered text and can be passed directly to model invocation surfaces.
+
+#### `RenderedChatPrompt`
+
+```python
+RenderedChatPrompt(messages, *, name=None, separator="\n\n")
+```
+
+Current surface:
+
+- `.messages`
+- `.as_messages()`
+- `.to_text(include_roles=True, separator=None)`
+- `.to_model_input(mode="text" | "messages")`
+
+Built-in native chat adapters currently consume text prompt payloads, so `mode="text"` is the default. `mode="messages"` returns a JSON-friendly message list for custom Python-backed model handlers that register with `decode_prompt="json"`.
+
 ### `Command`
 
 ```python
@@ -165,6 +303,8 @@ Current surface:
 - `runtime.invoke_tool_with_metadata(name, request, decode="auto")`
 - `runtime.invoke_model(name, prompt, schema=None, max_tokens=0, decode="auto")`
 - `runtime.invoke_model_with_metadata(name, prompt, schema=None, max_tokens=0, decode="auto")`
+
+`prompt` may be a plain Python value, `PromptTemplate`, `ChatPromptTemplate`, `RenderedPrompt`, or `RenderedChatPrompt`. Prompt objects are normalized before the request crosses into the native registry.
 
 `runtime.intelligence` is the preferred grouped surface for intelligence operations. Current methods:
 
@@ -259,6 +399,8 @@ The `producer` callable is invoked only when no previously committed recorded ef
 - `register_gemini_generate_content(name="gemini", *, policy=None, transport=None, provider_model_name="", endpoint_path="", system_prompt="")`
 - `invoke(name, prompt, *, schema=None, max_tokens=0, decode="auto")`
 - `invoke_with_metadata(name, prompt, *, schema=None, max_tokens=0, decode="auto")`
+
+`prompt` accepts the same rendered prompt objects supported by `RuntimeContext.invoke_model(...)`. `schema` may also be a prompt object if you want to generate a text or JSON schema payload through the same rendering surface.
 
 Invocation details currently include:
 
