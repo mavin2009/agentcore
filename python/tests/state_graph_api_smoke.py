@@ -1,5 +1,6 @@
 import asyncio
 import operator
+from typing import Annotated, TypedDict
 
 from agentcore import ChatPromptTemplate, PromptTemplate
 from agentcore.graph import (
@@ -14,12 +15,19 @@ from agentcore.graph import (
     StateGraph,
     add_messages,
 )
-from langgraph.graph import END as COMPAT_END
-from langgraph.graph import MessagesState as CompatMessagesState
-from langgraph.graph import START as COMPAT_START
-from langgraph.graph import StateGraph as CompatStateGraph
-from langgraph.graph import add_messages as compat_add_messages
-from typing_extensions import Annotated, TypedDict
+
+try:
+    from langgraph.graph import END as COMPAT_END
+    from langgraph.graph import MessagesState as CompatMessagesState
+    from langgraph.graph import START as COMPAT_START
+    from langgraph.graph import StateGraph as CompatStateGraph
+    from langgraph.graph import add_messages as compat_add_messages
+except ModuleNotFoundError:
+    from agentcore_langgraph_native.langgraph_compat import END as COMPAT_END
+    from agentcore_langgraph_native.langgraph_compat import MessagesState as CompatMessagesState
+    from agentcore_langgraph_native.langgraph_compat import START as COMPAT_START
+    from agentcore_langgraph_native.langgraph_compat import StateGraph as CompatStateGraph
+    from agentcore_langgraph_native.langgraph_compat import add_messages as compat_add_messages
 
 
 summary_prompt = PromptTemplate(

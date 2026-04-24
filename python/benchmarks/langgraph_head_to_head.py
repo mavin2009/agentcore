@@ -12,8 +12,7 @@ import sys
 import time
 import importlib
 from pathlib import Path
-from typing import Any
-from typing_extensions import Annotated, TypedDict
+from typing import Any, Annotated, TypedDict
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -276,7 +275,7 @@ def _bench_native_memory() -> dict[str, Any]:
     if runtime == "langgraph":
         _prefer_installed_langgraph()
         import operator
-        from typing_extensions import Annotated, TypedDict
+        from typing import Annotated, TypedDict
 
         from langgraph.checkpoint.memory import InMemorySaver
         from langgraph.graph import END, START, StateGraph
@@ -430,7 +429,7 @@ def _bench_native_resume() -> dict[str, Any]:
 
     if runtime == "langgraph":
         _prefer_installed_langgraph()
-        from typing_extensions import TypedDict
+        from typing import TypedDict
 
         from langgraph.checkpoint.memory import InMemorySaver
         from langgraph.graph import END, START, StateGraph
@@ -559,7 +558,7 @@ def _bench_native_fanout() -> dict[str, Any]:
     if runtime == "langgraph":
         _prefer_installed_langgraph()
         import operator
-        from typing_extensions import Annotated, TypedDict
+        from typing import Annotated, TypedDict
 
         from langgraph.checkpoint.memory import InMemorySaver
         from langgraph.graph import END, START, StateGraph

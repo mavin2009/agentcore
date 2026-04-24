@@ -3,8 +3,7 @@ import json
 import os
 import resource
 import time
-from typing import Any
-from typing_extensions import TypedDict
+from typing import Any, TypedDict
 
 # Import LangGraph
 try:
