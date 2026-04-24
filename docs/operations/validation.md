@@ -51,6 +51,9 @@ PYTHONPATH=./build/python python3 ./python/tests/state_graph_api_smoke.py
 PYTHONPATH=./build/python python3 ./python/tests/agent_workflows_smoke.py
 PYTHONPATH=./build/python python3 ./python/tests/patterns_smoke.py
 PYTHONPATH=./build/python python3 ./python/tests/adapters_runtime_smoke.py
+PYTHONPATH=./build/python python3 ./python/tests/mcp_runtime_smoke.py
+PYTHONPATH=./build/python python3 ./python/tests/mcp_launcher_smoke.py
+PYTHONPATH=./build/python python3 ./python/tests/opentelemetry_smoke.py
 ```
 
 What they cover:
@@ -62,6 +65,8 @@ What they cover:
 - metadata and streaming surfaces
 - Python runtime helper injection and recorded-effect replay
 - Python adapter registration, discovery, direct invocation, and runtime invocation
+- MCP stdio client handshake, tool discovery, tool calls, prompt retrieval, resource reads, completions, roots, sampling, elicitation, logging control, subscriptions, notifications, and registry mirroring
+- OpenTelemetry run spans, node spans, and run/node metrics from the compiled graph API
 - built-in native provider registration for OpenAI-compatible chat, xAI Grok chat, and Gemini `generateContent`
 - Python-backed custom tool/model handlers registered into the native registries
 - single-agent and multi-agent flows
@@ -91,6 +96,9 @@ PYTHONPATH=/tmp/agentcore-wheel-test python3 ./python/tests/state_graph_api_smok
 PYTHONPATH=/tmp/agentcore-wheel-test python3 ./python/tests/agent_workflows_smoke.py
 PYTHONPATH=/tmp/agentcore-wheel-test python3 ./python/tests/patterns_smoke.py
 PYTHONPATH=/tmp/agentcore-wheel-test python3 ./python/tests/adapters_runtime_smoke.py
+PYTHONPATH=/tmp/agentcore-wheel-test python3 ./python/tests/mcp_runtime_smoke.py
+PYTHONPATH=/tmp/agentcore-wheel-test python3 ./python/tests/mcp_launcher_smoke.py
+PYTHONPATH=/tmp/agentcore-wheel-test python3 ./python/tests/opentelemetry_smoke.py
 ```
 
 That path proves the installed wheel, not the build tree, still supports:
@@ -99,6 +107,8 @@ That path proves the installed wheel, not the build tree, still supports:
 - graph-owned adapter registry configuration and invocation
 - built-in provider adapter registration for OpenAI-compatible chat, xAI Grok chat, and Gemini `generateContent`
 - custom Python-backed adapter handlers routed through the native registry seam
+- MCP stdio interoperability, prompt/resource/completion handling, optional client/server MCP features, and mirrored-tool invocation through the installed wheel
+- OpenTelemetry observer integration over the installed wheel
 - multi-agent and subgraph flows
 - higher-level pipeline and specialist-team builders
 - persistent-session reuse and resume

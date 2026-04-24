@@ -20,6 +20,7 @@ Exports:
 - `ChatPromptTemplate`
 - `RenderedPrompt`
 - `RenderedChatPrompt`
+- `RenderedMCPPrompt`
 - `IntelligenceView`
 - `IntelligenceRule`
 - `IntelligenceRouter`
@@ -31,6 +32,9 @@ Exports:
 - `PipelineStep`
 - `SpecialistTeam`
 - `Specialist`
+- `mcp`
+- `observability`
+- `OpenTelemetryObserver`
 
 ### `StateGraph`
 
@@ -111,15 +115,19 @@ Subgraph session rules:
 Execution methods:
 
 - `invoke(input_state=None, *, config=None)`
-- `invoke_with_metadata(input_state=None, *, config=None, include_subgraphs=True)`
-- `invoke_until_pause_with_metadata(input_state=None, *, config=None, include_subgraphs=True)`
-- `resume_with_metadata(checkpoint_id, *, include_subgraphs=True)`
-- `stream(input_state=None, *, config=None, include_subgraphs=True, stream_mode="events")`
-- `ainvoke(input_state=None, *, config=None)`
-- `ainvoke_with_metadata(input_state=None, *, config=None, include_subgraphs=True)`
-- `astream(input_state=None, *, config=None, include_subgraphs=True, stream_mode="events")`
-- `batch(inputs, *, config=None)`
-- `abatch(inputs, *, config=None)`
+- `invoke_with_metadata(input_state=None, *, config=None, include_subgraphs=True, telemetry=None)`
+- `invoke_until_pause_with_metadata(input_state=None, *, config=None, include_subgraphs=True, telemetry=None)`
+- `resume_with_metadata(checkpoint_id, *, include_subgraphs=True, telemetry=None)`
+- `stream(input_state=None, *, config=None, include_subgraphs=True, stream_mode="events", telemetry=None)`
+- `ainvoke(input_state=None, *, config=None, telemetry=None)`
+- `ainvoke_with_metadata(input_state=None, *, config=None, include_subgraphs=True, telemetry=None)`
+- `astream(input_state=None, *, config=None, include_subgraphs=True, stream_mode="events", telemetry=None)`
+- `batch(inputs, *, config=None, telemetry=None)`
+- `abatch(inputs, *, config=None, telemetry=None)`
+
+The same `telemetry=` keyword is also accepted by `invoke(...)`:
+
+- `invoke(input_state=None, *, config=None, telemetry=None)`
 
 Current stream mode support:
 
@@ -127,11 +135,63 @@ Current stream mode support:
 
 Metadata and stream events include the usual run/node identifiers plus:
 
+- `sequence`
+- `graph_id`
+- `node_id`
+- `branch_id`
+- `checkpoint_id`
+- `node_kind`
+- `result`
+- `ts_start_ns`
+- `ts_end_ns`
+- `duration_ns`
+- `confidence`
+- `patch_count`
+- `flags`
 - `session_id`
 - `session_revision`
 - `namespaces`
 
 `invoke_with_metadata(...)`, `invoke_until_pause_with_metadata(...)`, and `resume_with_metadata(...)` also include the committed intelligence snapshot under `details["intelligence"]`.
+
+OpenTelemetry notes:
+
+- `telemetry=True` constructs a default `OpenTelemetryObserver()`
+- passing an explicit `OpenTelemetryObserver(...)` lets you control tracer/meter injection, node-span emission, and metric emission
+- without `telemetry=...`, these methods stay on their usual execution path
+
+### `agentcore.observability`
+
+The observability helpers live under [`../../python/agentcore/observability`](../../python/agentcore/observability).
+
+#### `OpenTelemetryObserver`
+
+```python
+OpenTelemetryObserver(
+    *,
+    tracer=None,
+    meter=None,
+    tracer_provider=None,
+    meter_provider=None,
+    instrumentation_scope="agentcore",
+    instrumentation_version=None,
+    run_span_name_prefix="agentcore",
+    emit_node_spans=True,
+    emit_metrics=True,
+)
+```
+
+Current observer entry points:
+
+- `capture_details(call, *, graph_name, operation, config=None, include_subgraphs=None)`
+- `capture_stream(call, *, graph_name, operation, config=None, include_subgraphs=None)`
+
+In normal application code you usually do not call those methods directly. Instead, pass the observer through the compiled graph methods:
+
+```python
+observer = OpenTelemetryObserver()
+details = compiled.invoke_with_metadata({"count": 0}, telemetry=observer)
+```
 
 `compile(...)` compatibility notes:
 
@@ -275,6 +335,23 @@ Current surface:
 
 Built-in native chat adapters currently consume text prompt payloads, so `mode="text"` is the default. `mode="messages"` returns a JSON-friendly message list for custom Python-backed model handlers that register with `decode_prompt="json"`.
 
+#### `RenderedMCPPrompt`
+
+```python
+RenderedMCPPrompt(messages, *, name=None, description=None, separator="\n\n")
+```
+
+Current surface:
+
+- `.messages`
+- `.name`
+- `.description`
+- `.as_messages()`
+- `.to_text(include_roles=True, separator=None)`
+- `.to_model_input(mode="text" | "messages" | "protocol")`
+
+`RenderedMCPPrompt` is returned by `agentcore.mcp.StdioMCPClient.get_prompt(...)`. `mode="text"` flattens the MCP prompt to a role-prefixed text transcript, inlining resource text when available. `mode="messages"` and `mode="protocol"` return message dictionaries with MCP-style content blocks.
+
 ### `Command`
 
 ```python
@@ -304,7 +381,7 @@ Current surface:
 - `runtime.invoke_model(name, prompt, schema=None, max_tokens=0, decode="auto")`
 - `runtime.invoke_model_with_metadata(name, prompt, schema=None, max_tokens=0, decode="auto")`
 
-`prompt` may be a plain Python value, `PromptTemplate`, `ChatPromptTemplate`, `RenderedPrompt`, or `RenderedChatPrompt`. Prompt objects are normalized before the request crosses into the native registry.
+`prompt` may be a plain Python value, `PromptTemplate`, `ChatPromptTemplate`, `RenderedPrompt`, `RenderedChatPrompt`, or `RenderedMCPPrompt`. Prompt objects are normalized before the request crosses into the native registry.
 
 `runtime.intelligence` is the preferred grouped surface for intelligence operations. Current methods:
 
@@ -384,6 +461,7 @@ The `producer` callable is invoked only when no previously committed recorded ef
 - `register_http(name="http_tool", *, policy=None, enable_mock_scheme=True, enable_file_scheme=True)`
 - `register_sqlite(name="sqlite_tool", *, policy=None)`
 - `register_http_json(name="http_json_tool", *, policy=None, transport=None, default_method="POST")`
+- `register_mcp_stdio(command, *, prefix=None, include=None, exclude=None, env=None, cwd=None, startup_timeout=10.0, request_timeout=30.0, tool_timeout=None, result_mode="auto", argument_key=None)`
 - `invoke(name, request, *, decode="auto")`
 - `invoke_with_metadata(name, request, *, decode="auto")`
 
@@ -417,6 +495,223 @@ Model invocation details also include:
 - `token_usage`
 
 Custom Python-backed registry handlers are still registered into the native graph-owned registries rather than a Python-only side table. That keeps direct invocation, runtime invocation through `RuntimeContext`, adapter discovery, and subgraph inheritance on the same native registry path.
+
+`register_mcp_stdio(...)` mirrors tools from an external MCP server over `stdio` into the graph-owned tool registry. Imported tools are normal AgentCore tools after registration, so graph nodes still call them through `runtime.invoke_tool(...)`.
+
+### `agentcore.mcp`
+
+The MCP bridge lives under `agentcore.mcp`.
+
+Exports:
+
+- `StdioMCPClient`
+- `MCPServer`
+- `MCPServerSession`
+- `MCPToolServer`
+- `MCPTool`
+- `MCPPrompt`
+- `MCPResource`
+- `MCPResourceTemplate`
+- `MCPTransportError`
+- `MCPProtocolError`
+- `MCP_LOG_LEVELS`
+- `MCP_PROTOCOL_VERSION`
+- `coerce_mcp_prompt_result(...)`
+- `coerce_mcp_resource_result(...)`
+- `coerce_mcp_tool_result(...)`
+- `completion_values(...)`
+- `config_main(...)`
+- `load_target_object(...)`
+- `log_level_enabled(...)`
+- `normalize_elicitation_result(...)`
+- `normalize_completion_result(...)`
+- `normalize_log_level(...)`
+- `normalize_mcp_root(...)`
+- `normalize_mcp_roots(...)`
+- `normalize_mcp_resource_result(...)`
+- `normalize_mcp_tool_result(...)`
+- `normalize_sampling_request(...)`
+- `normalize_sampling_result(...)`
+- `render_client_config(...)`
+- `resolve_server_target(...)`
+- `run_stdio_server(...)`
+- `sampling_result_to_text(...)`
+- `serve_main(...)`
+
+#### `StdioMCPClient`
+
+```python
+StdioMCPClient(
+    command,
+    *,
+    cwd=None,
+    env=None,
+    startup_timeout=10.0,
+    request_timeout=30.0,
+    client_name="agentcore",
+    client_version="0.1",
+    roots=None,
+    roots_list_changed=True,
+    sampling_handler=None,
+    elicitation_handler=None,
+    log_handler=None,
+    notification_handler=None,
+)
+```
+
+Current surface:
+
+- `.start()`
+- `.list_tools()`
+- `.call_tool(name, arguments=None, *, timeout=None, result_mode="auto")`
+- `.call_tool_raw(name, arguments=None, *, timeout=None)`
+- `.list_prompts()`
+- `.get_prompt(name, arguments=None, *, timeout=None)`
+- `.get_prompt_raw(name, arguments=None, *, timeout=None)`
+- `.list_resources()`
+- `.list_resource_templates()`
+- `.read_resource(uri, *, timeout=None, decode="auto")`
+- `.read_resource_raw(uri, *, timeout=None)`
+- `.complete(ref, argument_name, value, *, arguments=None, timeout=None)`
+- `.complete_prompt_argument(prompt_name, argument_name, value, *, arguments=None, timeout=None)`
+- `.complete_resource_argument(uri_template, argument_name, value, *, arguments=None, timeout=None)`
+- `.list_roots()`
+- `.set_roots(roots, *, notify=True)`
+- `.set_sampling_handler(handler)`
+- `.set_elicitation_handler(handler)`
+- `.set_log_handler(handler)`
+- `.set_notification_handler(handler)`
+- `.subscribe_resource(uri, *, timeout=None)`
+- `.unsubscribe_resource(uri, *, timeout=None)`
+- `.set_logging_level(level, *, timeout=None)`
+- `.drain_notifications()`
+- `.drain_logs()`
+- `.drain_resource_updates()`
+- `.close()`
+- `.server_info`
+- `.server_capabilities`
+- `.protocol_version`
+- `.list_change_counts`
+- `.resource_subscriptions`
+
+`call_tool(..., result_mode="auto")` normalizes successful structured/text results for convenience and returns the raw MCP result envelope when the upstream tool reports `isError=true`.
+
+`get_prompt(...)` returns `RenderedMCPPrompt`.
+
+If optional client capabilities are configured before `start()`, the client advertises them during MCP `initialize`.
+
+#### Installed MCP Launcher
+
+The published package installs:
+
+- `agentcore-mcp`
+- `agentcore-mcp-server`
+- `agentcore-mcp-config`
+
+The module entrypoint is also available as:
+
+```bash
+python -m agentcore.mcp serve --target package.module:build_server
+python -m agentcore.mcp config codex --name local-agentcore --target package.module:build_server
+```
+
+Launcher helpers exported from `agentcore.mcp`:
+
+- `load_target_object(target)`
+- `resolve_server_target(target, *, name=None, version=None, instructions=None)`
+- `run_stdio_server(target, *, name=None, version=None, instructions=None)`
+- `render_client_config(client, *, server_name, target, python_executable=None, env=None, cwd=None, gemini_scope="project")`
+- `serve_main(argv=None)`
+- `config_main(argv=None)`
+
+Accepted launcher targets:
+
+- `package.module:server`
+- `package.module:build_server`
+- `./local_server.py:server`
+- `./local_server.py:create_server`
+
+Resolved targets may be:
+
+- `MCPServer`
+- a zero-argument factory returning `MCPServer`
+- `CompiledStateGraph`
+- `StateGraph`
+- a tool registry compatible with `MCPServer.from_tool_registry(...)`
+
+#### `MCPServer`
+
+```python
+MCPServer(
+    *,
+    name="agentcore-mcp",
+    version="0.1",
+    instructions="",
+    request_timeout=30.0,
+    enable_logging=True,
+    resource_subscriptions_enabled=True,
+    list_changed_notifications_enabled=True,
+    auto_notify_catalog_changes=True,
+)
+```
+
+Current surface:
+
+- `.add_tool(name, handler, *, description="", input_schema=None, title="", annotations=None)`
+- `.tool(name=None, *, description="", input_schema=None, title="", annotations=None)`
+- `.list_tools()`
+- `.call_tool(name, arguments=None)`
+- `.current_session()`
+- `.list_client_roots(*, timeout=None)`
+- `.sample(messages, *, model_preferences=None, system_prompt=None, include_context=None, temperature=None, max_tokens=None, stop_sequences=None, metadata=None, timeout=None)`
+- `.elicit(message, requested_schema, *, timeout=None)`
+- `.log(level, data, *, logger=None)`
+- `.notify_tools_changed()`
+- `.notify_prompts_changed()`
+- `.notify_resources_changed()`
+- `.notify_resource_updated(uri)`
+- `.add_prompt(name, handler, *, description="", arguments=None, title="", argument_completions=None)`
+- `.add_prompt_template(name, template, *, description="", arguments=None, title="", argument_completions=None)`
+- `.prompt(name=None, *, description="", arguments=None, title="", argument_completions=None)`
+- `.list_prompts()`
+- `.get_prompt(name, arguments=None)`
+- `.add_resource(uri, handler, *, name="", description="", mime_type="", size=None, annotations=None)`
+- `.list_resources()`
+- `.read_resource(uri)`
+- `.add_resource_template(uri_template, handler, *, name="", description="", mime_type="", annotations=None, argument_completions=None)`
+- `.resource_template(uri_template=None, *, name="", description="", mime_type="", annotations=None, argument_completions=None)`
+- `.list_resource_templates()`
+- `.complete(ref, argument_name, value, *, arguments=None)`
+- `.serve_stdio(...)`
+- `.run_stdio()`
+- `MCPServer.from_tool_registry(tool_registry, *, name="agentcore-tools", version="0.1", descriptions=None, input_schemas=None)`
+- `MCPServer.from_compiled_graph(compiled_graph, *, name="agentcore-tools", version="0.1", descriptions=None, input_schemas=None)`
+
+The server implements MCP `initialize`, `ping`, `tools/list`, `tools/call`, `prompts/list`, `prompts/get`, `resources/list`, `resources/templates/list`, `resources/read`, `resources/subscribe`, `resources/unsubscribe`, `completion/complete`, `logging/setLevel`, and the optional client-facing request surfaces `roots/list`, `sampling/createMessage`, and `elicitation/create` over newline-delimited JSON-RPC on `stdio`.
+
+If a handler accepts metadata, the active session is injected under both `metadata["session"]` and `metadata["mcp"]`.
+
+#### `MCPServerSession`
+
+Current surface:
+
+- `.client_capabilities`
+- `.client_info`
+- `.logging_level`
+- `.initialized`
+- `.roots_change_count`
+- `.subscribed_resources`
+- `.list_roots(*, timeout=None)`
+- `.sample(messages, *, model_preferences=None, system_prompt=None, include_context=None, temperature=None, max_tokens=None, stop_sequences=None, metadata=None, timeout=None)`
+- `.elicit(message, requested_schema, *, timeout=None)`
+- `.send_log(level, data, *, logger=None)`
+- `.notify_tools_changed()`
+- `.notify_prompts_changed()`
+- `.notify_resources_changed()`
+- `.notify_resource_updated(uri)`
+- `.is_resource_subscribed(uri)`
+
+`MCPToolServer` remains available as a compatibility alias for the tool-oriented naming used by the earlier, smaller MCP surface.
 
 ### Python Node Callback Contract
 

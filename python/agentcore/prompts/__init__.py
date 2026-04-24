@@ -4,6 +4,7 @@ from .templates import (
     PromptMessage,
     PromptTemplate,
     RenderedChatPrompt,
+    RenderedMCPPrompt,
     RenderedPrompt,
 )
 
@@ -13,5 +14,6 @@ __all__ = [
     "PromptMessage",
     "PromptTemplate",
     "RenderedChatPrompt",
+    "RenderedMCPPrompt",
     "RenderedPrompt",
 ]

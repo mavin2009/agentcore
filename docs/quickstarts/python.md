@@ -25,6 +25,14 @@ python3 -m pip install --target /tmp/agentcore-wheel-test dist/agentcore_graph-*
 PYTHONPATH=/tmp/agentcore-wheel-test python3 -c "from agentcore.graph import StateGraph; print('ok')"
 ```
 
+That installed package also includes MCP helper commands:
+
+```bash
+agentcore-mcp --help
+agentcore-mcp-server --help
+agentcore-mcp-config --help
+```
+
 That wheel includes the `agentcore` package and the compatibility namespace under `agentcore_langgraph_native`. It intentionally does not install a top-level `langgraph` package into the environment.
 
 For published releases, the repository also includes cibuildwheel-based automation in `./.github/workflows/` that builds Linux `manylinux_2_28` wheels for CPython 3.9-3.12 and runs the Python smoke coverage against those built wheels before release.
@@ -215,6 +223,116 @@ messages = review_prompt.render(diff="...").to_model_input(mode="messages")
 
 That returns a JSON-friendly message list such as `[{ "role": "system", "content": "..." }, ...]`.
 
+## Bridge MCP Servers
+
+AgentCore includes an MCP `stdio` bridge. The most direct graph-facing path is still remote tool mirroring, because imported MCP tools become ordinary AgentCore tools after registration.
+
+```python
+import sys
+
+from agentcore.graph import END, START, StateGraph
+
+
+def enrich(state, config, runtime):
+    result = runtime.invoke_tool(
+        "remote_upper",
+        {"text": state["text"]},
+        decode="json",
+    )
+    return {"upper": result["upper"]}
+
+
+graph = StateGraph(dict, name="mcp_demo", worker_count=2)
+graph.add_node("enrich", enrich, kind="tool")
+graph.add_edge(START, "enrich")
+graph.add_edge("enrich", END)
+compiled = graph.compile()
+
+compiled.tools.register_mcp_stdio(
+    [sys.executable, "./python/tests/fixtures/mcp_stdio_server.py"],
+    prefix="remote",
+)
+
+result = compiled.invoke({"text": "hello"})
+```
+
+The mirrored tools are ordinary AgentCore tools after registration, so nodes still call them through `runtime.invoke_tool(...)`.
+
+If you want to call an MCP server directly outside a graph, use `agentcore.mcp.StdioMCPClient`:
+
+```python
+import sys
+
+from agentcore.mcp import StdioMCPClient
+
+
+def sampling_handler(request, client):
+    last_text = ""
+    for message in request["messages"]:
+        content = message["content"]
+        if content["type"] == "text":
+            last_text = str(content.get("text", ""))
+    return {
+        "role": "assistant",
+        "content": {"type": "text", "text": f"sample::{last_text}"},
+        "model": "fixture-sampler",
+        "stopReason": "endTurn",
+    }
+
+
+def elicitation_handler(request, client):
+    return {
+        "action": "accept",
+        "content": {"reviewer": "agentcore", "approved": True},
+    }
+
+
+with StdioMCPClient(
+    [sys.executable, "./python/tests/fixtures/mcp_stdio_server.py"],
+    roots=["file:///workspace/agentcore"],
+    sampling_handler=sampling_handler,
+    elicitation_handler=elicitation_handler,
+) as client:
+    tools = client.list_tools()
+    prompts = client.list_prompts()
+    resources = client.list_resources()
+    value = client.call_tool("upper", {"text": "hello"})
+    prompt = client.get_prompt(
+        "review_code",
+        {
+            "language": "python",
+            "repository": "agentcore",
+            "question": "How should we wire MCP?",
+        },
+    )
+    guide = client.read_resource("memo://guide/overview")
+    client.set_logging_level("warning")
+    client.subscribe_resource("memo://guide/overview")
+```
+
+`get_prompt(...)` returns `RenderedMCPPrompt`, which can be flattened to text or passed through the normal model-input path:
+
+```python
+text_payload = prompt.to_model_input()
+message_payload = prompt.to_model_input(mode="messages")
+```
+
+The current `stdio` MCP surface includes `initialize`, `ping`, `tools/list`, `tools/call`, `prompts/list`, `prompts/get`, `resources/list`, `resources/templates/list`, `resources/read`, `resources/subscribe`, `resources/unsubscribe`, `completion/complete`, `logging/setLevel`, `roots/list`, `sampling/createMessage`, `elicitation/create`, and the associated notifications for logs, list changes, roots changes, and resource updates.
+
+If you want to expose your own installed AgentCore server to Claude, Codex, or Gemini, render the client config directly:
+
+```bash
+agentcore-mcp-config claude --name local-agentcore --target ./my_server.py:build_server
+agentcore-mcp-config codex --name local-agentcore --target ./my_server.py:build_server
+agentcore-mcp-config gemini --name local-agentcore --target ./my_server.py:build_server
+```
+
+Those commands emit ready-to-paste client configuration that uses:
+
+```bash
+python -m agentcore.mcp serve --target ...
+```
+
 ## Use Higher-Level Builders For Common Shapes
 
 `StateGraph` remains the core Python API, but the package now also includes an optional pattern layer for workflow shapes that otherwise require a lot of repetitive builder code.
@@ -315,6 +433,45 @@ Each streamed event and trace event may also carry subgraph session metadata:
 - `namespaces`
 
 Metadata returned by `invoke_with_metadata(...)` also includes `details["intelligence"]` when the run commits intelligence records.
+
+## Export OpenTelemetry
+
+If your environment already uses OpenTelemetry, the compiled graph methods can emit spans and metrics with a single extra keyword argument.
+
+```python
+from agentcore.observability import OpenTelemetryObserver
+
+
+observer = OpenTelemetryObserver()
+
+details = compiled.invoke_with_metadata(
+    {"count": 0},
+    telemetry=observer,
+)
+events = list(
+    compiled.stream(
+        {"count": 0},
+        telemetry=observer,
+    )
+)
+```
+
+The same observer works with:
+
+- `invoke(...)`
+- `invoke_with_metadata(...)`
+- `invoke_until_pause_with_metadata(...)`
+- `resume_with_metadata(...)`
+- `stream(...)`
+- `ainvoke(...)`
+- `ainvoke_with_metadata(...)`
+- `astream(...)`
+- `batch(...)`
+- `abatch(...)`
+
+For quick experiments, `telemetry=True` is accepted as shorthand for a default observer.
+
+The observer is intentionally outside the native execution loop. If you do not pass `telemetry=...`, the graph stays on its usual runtime path. If you do pass telemetry for plain `invoke(...)`, AgentCore uses the same metadata path as `invoke_with_metadata(...)` so the observer has enough runtime detail to emit run and node telemetry.
 
 ## Node Return Forms
 

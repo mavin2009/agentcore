@@ -159,6 +159,81 @@ class RenderedChatPrompt:
         raise ValueError("mode must be 'text' or 'messages'")
 
 
+def _mcp_prompt_block_to_text(block: Mapping[str, Any]) -> str:
+    block_type = str(block.get("type", "text"))
+    if block_type == "text":
+        return _stringify_prompt_value(block.get("text", ""))
+    if block_type == "resource":
+        resource = dict(block.get("resource", {}) or {})
+        uri = str(resource.get("uri", ""))
+        mime_type = str(resource.get("mimeType", resource.get("mime_type", "")))
+        prefix = f"[RESOURCE uri={uri}"
+        if mime_type:
+            prefix += f" mimeType={mime_type}"
+        prefix += "]"
+        if resource.get("text") is not None:
+            return f"{prefix}\n{_stringify_prompt_value(resource.get('text'))}"
+        return prefix
+    if block_type == "image":
+        return f"[IMAGE mimeType={block.get('mimeType', '')}]"
+    if block_type == "audio":
+        return f"[AUDIO mimeType={block.get('mimeType', '')}]"
+    return _stringify_prompt_value(dict(block.items()))
+
+
+def _normalize_mcp_prompt_message(value: Mapping[str, Any]) -> dict[str, Any]:
+    message = dict(value.items())
+    role = str(message.get("role", "user"))
+    content = message.get("content", {"type": "text", "text": ""})
+    if isinstance(content, Mapping):
+        normalized_content = dict(content.items())
+    elif isinstance(content, str):
+        normalized_content = {"type": "text", "text": content}
+    else:
+        normalized_content = {"type": "text", "text": _stringify_prompt_value(content)}
+    if "type" not in normalized_content:
+        normalized_content["type"] = "text"
+    return {"role": role, "content": normalized_content}
+
+
+@dataclass(frozen=True)
+class RenderedMCPPrompt:
+    messages: tuple[dict[str, Any], ...]
+    name: str | None = None
+    description: str | None = None
+    separator: str = "\n\n"
+
+    def as_messages(self) -> list[dict[str, Any]]:
+        return [_normalize_mcp_prompt_message(message) for message in self.messages]
+
+    def to_text(
+        self,
+        *,
+        include_roles: bool = True,
+        separator: str | None = None,
+    ) -> str:
+        normalized_separator = self.separator if separator is None else str(separator)
+        parts: list[str] = []
+        for message in self.as_messages():
+            rendered = _mcp_prompt_block_to_text(dict(message["content"]))
+            if include_roles:
+                parts.append(f"{str(message['role']).upper()}:\n{rendered}")
+            else:
+                parts.append(rendered)
+        return normalized_separator.join(parts)
+
+    def __str__(self) -> str:
+        return self.to_text()
+
+    def to_model_input(self, *, mode: str = "text") -> Any:
+        normalized_mode = str(mode).strip().lower()
+        if normalized_mode == "text":
+            return self.to_text()
+        if normalized_mode in {"messages", "protocol"}:
+            return self.as_messages()
+        raise ValueError("mode must be 'text', 'messages', or 'protocol'")
+
+
 @dataclass(frozen=True)
 class PromptTemplate:
     template: str
@@ -352,7 +427,12 @@ class ChatPromptTemplate:
 
 
 def _coerce_prompt_value_for_model_input(value: Any) -> Any:
-    if isinstance(value, (PromptTemplate, ChatPromptTemplate, RenderedPrompt, RenderedChatPrompt)):
+    if isinstance(value, (
+        PromptTemplate,
+        ChatPromptTemplate,
+        RenderedPrompt,
+        RenderedChatPrompt,
+        RenderedMCPPrompt,
+    )):
         return value.to_model_input()
     return value
-

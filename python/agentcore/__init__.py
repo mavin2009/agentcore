@@ -14,6 +14,9 @@ from .graph import (
     StateGraph,
     add_messages,
 )
+from . import mcp as mcp
+from . import observability as observability
+from .observability import OpenTelemetryObserver
 from .patterns import PipelineGraph, PipelineStep, Specialist, SpecialistTeam
 from .prompts import (
     ChatPromptTemplate,
@@ -21,6 +24,7 @@ from .prompts import (
     PromptMessage,
     PromptTemplate,
     RenderedChatPrompt,
+    RenderedMCPPrompt,
     RenderedPrompt,
 )
 
@@ -36,11 +40,15 @@ __all__ = [
     "MessageTemplate",
     "MessagesState",
     "ModelRegistryView",
+    "OpenTelemetryObserver",
     "PipelineGraph",
     "PipelineStep",
+    "mcp",
+    "observability",
     "PromptMessage",
     "PromptTemplate",
     "RenderedChatPrompt",
+    "RenderedMCPPrompt",
     "RenderedPrompt",
     "RuntimeContext",
     "START",

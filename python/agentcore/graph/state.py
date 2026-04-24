@@ -194,6 +194,20 @@ def _normalize_config(config: Any) -> dict[str, Any]:
     raise TypeError("config must be a mapping or None")
 
 
+def _coerce_telemetry_observer(telemetry: Any) -> Any | None:
+    if telemetry is None or telemetry is False:
+        return None
+    if telemetry is True:
+        from ..observability import OpenTelemetryObserver
+
+        return OpenTelemetryObserver()
+    if hasattr(telemetry, "capture_details") and hasattr(telemetry, "capture_stream"):
+        return telemetry
+    raise TypeError(
+        "telemetry must be None, False, True, or an observer with capture_details(...) and capture_stream(...)"
+    )
+
+
 def _normalize_update(value: Any) -> dict[str, Any]:
     if value is None:
         return {}
@@ -2095,9 +2109,26 @@ class CompiledStateGraph:
         input_state: dict[str, Any] | None = None,
         *,
         config: dict[str, Any] | None = None,
+        telemetry: Any | None = None,
     ) -> dict[str, Any]:
         initial_state = {} if input_state is None else dict(input_state)
-        return _native._invoke(self._native_graph, initial_state, _normalize_config(config))
+        normalized_config = _normalize_config(config)
+        observer = _coerce_telemetry_observer(telemetry)
+        if observer is None:
+            return _native._invoke(self._native_graph, initial_state, normalized_config)
+        details = observer.capture_details(
+            lambda: _native._invoke_with_details(
+                self._native_graph,
+                initial_state,
+                normalized_config,
+                include_subgraphs=True,
+            ),
+            graph_name=self._name,
+            operation="invoke",
+            config=normalized_config,
+            include_subgraphs=True,
+        )
+        return dict(details["state"])
 
     def invoke_with_metadata(
         self,
@@ -2105,12 +2136,28 @@ class CompiledStateGraph:
         *,
         config: dict[str, Any] | None = None,
         include_subgraphs: bool = True,
+        telemetry: Any | None = None,
     ) -> dict[str, Any]:
         initial_state = {} if input_state is None else dict(input_state)
-        return _native._invoke_with_details(
-            self._native_graph,
-            initial_state,
-            _normalize_config(config),
+        normalized_config = _normalize_config(config)
+        observer = _coerce_telemetry_observer(telemetry)
+        if observer is None:
+            return _native._invoke_with_details(
+                self._native_graph,
+                initial_state,
+                normalized_config,
+                include_subgraphs=include_subgraphs,
+            )
+        return observer.capture_details(
+            lambda: _native._invoke_with_details(
+                self._native_graph,
+                initial_state,
+                normalized_config,
+                include_subgraphs=include_subgraphs,
+            ),
+            graph_name=self._name,
+            operation="invoke_with_metadata",
+            config=normalized_config,
             include_subgraphs=include_subgraphs,
         )
 
@@ -2120,12 +2167,28 @@ class CompiledStateGraph:
         *,
         config: dict[str, Any] | None = None,
         include_subgraphs: bool = True,
+        telemetry: Any | None = None,
     ) -> dict[str, Any]:
         initial_state = {} if input_state is None else dict(input_state)
-        return _native._invoke_until_pause_with_details(
-            self._native_graph,
-            initial_state,
-            _normalize_config(config),
+        normalized_config = _normalize_config(config)
+        observer = _coerce_telemetry_observer(telemetry)
+        if observer is None:
+            return _native._invoke_until_pause_with_details(
+                self._native_graph,
+                initial_state,
+                normalized_config,
+                include_subgraphs=include_subgraphs,
+            )
+        return observer.capture_details(
+            lambda: _native._invoke_until_pause_with_details(
+                self._native_graph,
+                initial_state,
+                normalized_config,
+                include_subgraphs=include_subgraphs,
+            ),
+            graph_name=self._name,
+            operation="invoke_until_pause_with_metadata",
+            config=normalized_config,
             include_subgraphs=include_subgraphs,
         )
 
@@ -2134,10 +2197,24 @@ class CompiledStateGraph:
         checkpoint_id: int,
         *,
         include_subgraphs: bool = True,
+        telemetry: Any | None = None,
     ) -> dict[str, Any]:
-        return _native._resume_with_details(
-            self._native_graph,
-            int(checkpoint_id),
+        observer = _coerce_telemetry_observer(telemetry)
+        if observer is None:
+            return _native._resume_with_details(
+                self._native_graph,
+                int(checkpoint_id),
+                include_subgraphs=include_subgraphs,
+            )
+        return observer.capture_details(
+            lambda: _native._resume_with_details(
+                self._native_graph,
+                int(checkpoint_id),
+                include_subgraphs=include_subgraphs,
+            ),
+            graph_name=self._name,
+            operation="resume_with_metadata",
+            config={"checkpoint_id": int(checkpoint_id)},
             include_subgraphs=include_subgraphs,
         )
 
@@ -2148,14 +2225,28 @@ class CompiledStateGraph:
         config: dict[str, Any] | None = None,
         include_subgraphs: bool = True,
         stream_mode: str = "events",
+        telemetry: Any | None = None,
     ):
         if stream_mode != "events":
             raise NotImplementedError("the native state graph layer currently supports only stream_mode='events'")
         initial_state = {} if input_state is None else dict(input_state)
-        for event in _native._stream(
+        normalized_config = _normalize_config(config)
+        observer = _coerce_telemetry_observer(telemetry)
+        event_sequence = _native._stream(
             self._native_graph,
             initial_state,
-            _normalize_config(config),
+            normalized_config,
+            include_subgraphs=include_subgraphs,
+        )
+        if observer is None:
+            for event in event_sequence:
+                yield event
+            return
+        for event in observer.capture_stream(
+            lambda: list(event_sequence),
+            graph_name=self._name,
+            operation="stream",
+            config=normalized_config,
             include_subgraphs=include_subgraphs,
         ):
             yield event
@@ -2165,8 +2256,9 @@ class CompiledStateGraph:
         input_state: dict[str, Any] | None = None,
         *,
         config: dict[str, Any] | None = None,
+        telemetry: Any | None = None,
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(self.invoke, input_state, config=config)
+        return await asyncio.to_thread(self.invoke, input_state, config=config, telemetry=telemetry)
 
     async def ainvoke_with_metadata(
         self,
@@ -2174,12 +2266,14 @@ class CompiledStateGraph:
         *,
         config: dict[str, Any] | None = None,
         include_subgraphs: bool = True,
+        telemetry: Any | None = None,
     ) -> dict[str, Any]:
         return await asyncio.to_thread(
             self.invoke_with_metadata,
             input_state,
             config=config,
             include_subgraphs=include_subgraphs,
+            telemetry=telemetry,
         )
 
     async def astream(
@@ -2189,6 +2283,7 @@ class CompiledStateGraph:
         config: dict[str, Any] | None = None,
         include_subgraphs: bool = True,
         stream_mode: str = "events",
+        telemetry: Any | None = None,
     ):
         events = await asyncio.to_thread(
             lambda: list(
@@ -2197,6 +2292,7 @@ class CompiledStateGraph:
                     config=config,
                     include_subgraphs=include_subgraphs,
                     stream_mode=stream_mode,
+                    telemetry=telemetry,
                 )
             )
         )
@@ -2208,11 +2304,12 @@ class CompiledStateGraph:
         inputs: Iterable[dict[str, Any] | None],
         *,
         config: dict[str, Any] | Sequence[dict[str, Any] | None] | None = None,
+        telemetry: Any | None = None,
     ) -> list[dict[str, Any]]:
         normalized_inputs = [None if item is None else dict(item) for item in inputs]
         normalized_configs = _normalize_batch_configs(config, len(normalized_inputs))
         return [
-            self.invoke(input_state, config=run_config)
+            self.invoke(input_state, config=run_config, telemetry=telemetry)
             for input_state, run_config in zip(normalized_inputs, normalized_configs)
         ]
 
@@ -2221,11 +2318,12 @@ class CompiledStateGraph:
         inputs: Iterable[dict[str, Any] | None],
         *,
         config: dict[str, Any] | Sequence[dict[str, Any] | None] | None = None,
+        telemetry: Any | None = None,
     ) -> list[dict[str, Any]]:
         normalized_inputs = [None if item is None else dict(item) for item in inputs]
         normalized_configs = _normalize_batch_configs(config, len(normalized_inputs))
         tasks = [
-            asyncio.create_task(self.ainvoke(input_state, config=run_config))
+            asyncio.create_task(self.ainvoke(input_state, config=run_config, telemetry=telemetry))
             for input_state, run_config in zip(normalized_inputs, normalized_configs)
         ]
         return [await task for task in tasks]

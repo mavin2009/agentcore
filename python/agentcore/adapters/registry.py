@@ -294,6 +294,7 @@ def _default_model_metadata(name: str, *, decode_prompt: str, decode_schema: str
 class ToolRegistryView:
     def __init__(self, native_graph: Any):
         self._native_graph = native_graph
+        self._mcp_clients: list[Any] = []
 
     def list(self) -> list[dict[str, Any]]:
         return list(_native._list_tools(self._native_graph))
@@ -383,6 +384,125 @@ class ToolRegistryView:
             default_method=str(default_method),
         )
 
+    def register_mcp_stdio(
+        self,
+        command: Any,
+        *,
+        prefix: str | None = None,
+        include: Any = None,
+        exclude: Any = None,
+        env: Any = None,
+        cwd: str | None = None,
+        startup_timeout: float = 10.0,
+        request_timeout: float = 30.0,
+        tool_timeout: float | None = None,
+        result_mode: str = "auto",
+        argument_key: str | None = None,
+    ) -> Any:
+        from ..mcp import StdioMCPClient
+
+        normalized_prefix = None if prefix is None else str(prefix).strip()
+        normalized_result_mode = str(result_mode).strip().lower()
+        if normalized_result_mode not in {"auto", "raw"}:
+            raise ValueError("result_mode must be 'auto' or 'raw'")
+        normalized_argument_key = None if argument_key is None else str(argument_key).strip()
+        if normalized_argument_key == "":
+            raise ValueError("argument_key must be None or a non-empty string")
+
+        include_names = None if include is None else {str(value) for value in include}
+        exclude_names = set() if exclude is None else {str(value) for value in exclude}
+        normalized_env = None if env is None else {str(key): str(value) for key, value in dict(env).items()}
+
+        client = StdioMCPClient(
+            command,
+            cwd=cwd,
+            env=normalized_env,
+            startup_timeout=float(startup_timeout),
+            request_timeout=float(request_timeout),
+        ).start()
+
+        try:
+            descriptors = client.list_tools()
+            for descriptor in descriptors:
+                remote_name = str(descriptor["name"])
+                if include_names is not None and remote_name not in include_names:
+                    continue
+                if remote_name in exclude_names:
+                    continue
+
+                local_name = remote_name if normalized_prefix is None else f"{normalized_prefix}_{remote_name}"
+                if self.describe(local_name) is not None:
+                    raise ValueError(f"tool name collision while registering MCP tool {local_name!r}")
+
+                display_name = str(descriptor.get("title") or remote_name)
+                description = str(descriptor.get("description") or "")
+                metadata = {
+                    "provider": "mcp",
+                    "implementation": "mcp_stdio_bridge",
+                    "display_name": display_name,
+                    "transport": "stdio",
+                    "auth": "none",
+                    "capabilities": [
+                        "sync",
+                        "async",
+                        "structured_request",
+                        "structured_response",
+                    ],
+                    "request_format": "json",
+                    "response_format": f"mcp:{normalized_result_mode}",
+                    "description": description,
+                    "upstream_tool_name": remote_name,
+                    "server_name": str(client.server_info.get("name", "")),
+                    "server_version": str(client.server_info.get("version", "")),
+                }
+
+                def native_handler(
+                    request: Any,
+                    handler_metadata: dict[str, Any],
+                    *,
+                    bound_remote_name: str = remote_name,
+                    bound_client: Any = client,
+                    bound_timeout: float | None = tool_timeout,
+                    bound_result_mode: str = normalized_result_mode,
+                    bound_argument_key: str | None = normalized_argument_key,
+                ) -> Any:
+                    if request is None:
+                        arguments: dict[str, Any] = {}
+                    elif hasattr(request, "items"):
+                        arguments = dict(request.items())
+                    elif bound_argument_key is not None:
+                        arguments = {bound_argument_key: request}
+                    else:
+                        raise TypeError(
+                            "MCP tool requests must be mappings unless argument_key is provided"
+                        )
+
+                    if bound_result_mode == "raw":
+                        return bound_client.call_tool_raw(
+                            bound_remote_name,
+                            arguments,
+                            timeout=bound_timeout,
+                        )
+                    return bound_client.call_tool(
+                        bound_remote_name,
+                        arguments,
+                        timeout=bound_timeout,
+                        result_mode=bound_result_mode,
+                    )
+
+                self.register(
+                    local_name,
+                    native_handler,
+                    decode_input="json",
+                    metadata=_merge_metadata(metadata, None),
+                )
+        except Exception:
+            client.close()
+            raise
+
+        self._mcp_clients.append(client)
+        return client
+
     def invoke_with_metadata(
         self,
         name: str,
@@ -408,6 +528,13 @@ class ToolRegistryView:
         if not details.get("ok", False):
             _raise_adapter_error("tool", str(name), details)
         return details["output"]
+
+    def __del__(self) -> None:
+        for client in self._mcp_clients:
+            try:
+                client.close()
+            except Exception:
+                pass
 
 
 class ModelRegistryView:

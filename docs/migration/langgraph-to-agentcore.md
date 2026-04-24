@@ -155,6 +155,20 @@ Streamed and traced events may carry:
 
 That is especially useful once you start using persistent subgraphs or nested graphs.
 
+### 4a. OpenTelemetry
+
+If your existing application already exports OpenTelemetry data, AgentCore can attach to that stack without changing the graph shape itself:
+
+```python
+from agentcore.observability import OpenTelemetryObserver
+
+
+observer = OpenTelemetryObserver()
+details = compiled.invoke_with_metadata({"count": 0}, telemetry=observer)
+```
+
+For a quick first pass, `telemetry=True` is also accepted on `invoke(...)`, `invoke_with_metadata(...)`, `stream(...)`, pause, resume, and batch helpers.
+
 ### 5. Builder Conveniences
 
 The native `agentcore.graph.StateGraph` now accepts several migration-friendly builder patterns directly:
@@ -237,6 +251,19 @@ parent.add_node("specialist_child", specialist_graph)
 
 That direct form binds the overlapping schema fields by name for both input and output. It is intentionally the shared-state default only. Use `add_subgraph(...)` when you need explicit bindings, namespaces, persistent sessions, or knowledge-graph propagation rules.
 
+### 8. External Tool Ecosystem
+
+If part of your existing stack already exposes tools through MCP, AgentCore can mirror those tools into the graph-owned registry instead of forcing a parallel tool-integration path:
+
+```python
+compiled.tools.register_mcp_stdio(
+    ["python3", "./python/tests/fixtures/mcp_stdio_server.py"],
+    prefix="remote",
+)
+```
+
+After registration, graph nodes keep using the same `runtime.invoke_tool(...)` surface they already use for built-in or Python-backed adapters. If you also need prompt or context interop, the direct `agentcore.mcp.StdioMCPClient` surface now covers prompt retrieval, resource reads, completions, roots, sampling, elicitation, logging control, and resource subscriptions in addition to tool calls over `stdio`.
+
 ## Minimal Example
 
 LangGraph:
@@ -310,6 +337,7 @@ compiled = graph.compile()
 | `interrupt()` + resume command | `Command(wait=True)` + `invoke_until_pause_with_metadata(...)` / `resume_with_metadata(...)` |
 | manual child graph invocation + `thread_id` persistence | `add_subgraph(..., session_mode="persistent", session_id_from=...)` |
 | ad hoc stream inspection | `stream(...)` and `invoke_with_metadata(...)` with namespace and session metadata |
+| OpenTelemetry export | `telemetry=True` or `OpenTelemetryObserver()` on compiled graph execution methods |
 
 ## Compile-Time Differences
 
@@ -331,6 +359,7 @@ Those currently raise a clear `NotImplementedError` instead of being silently ig
 5. Replace manual child-graph persistence with `add_subgraph(...)`.
 6. Replace interrupt-style flows with explicit wait/resume surfaces where needed.
 6. Add `invoke_with_metadata(...)` or `stream(...)` once you want better observability.
+7. If your application already has an OpenTelemetry stack, add `telemetry=True` or `OpenTelemetryObserver()` after the behavior is stable.
 
 ## Related Pages
 

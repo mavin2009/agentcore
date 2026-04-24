@@ -751,6 +751,10 @@ bool parse_transport_kind(
         *transport = AdapterTransportKind::InProcess;
         return true;
     }
+    if (normalized == "stdio") {
+        *transport = AdapterTransportKind::Stdio;
+        return true;
+    }
     if (normalized == "http") {
         *transport = AdapterTransportKind::Http;
         return true;

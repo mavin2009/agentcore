@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "agentcore-graph"
-version = "0.1.7"
+version = "0.1.8"
 description = "Native agent-graph runtime with C++ execution, explicit state patches, resumable checkpoints, and Python bindings."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -28,6 +28,17 @@ classifiers = [
   "Topic :: System :: Distributed Computing",
 ]
 dependencies = []
+
+[project.optional-dependencies]
+otel = [
+  "opentelemetry-api>=1.24,<2",
+  "opentelemetry-sdk>=1.24,<2",
+]
+
+[project.scripts]
+agentcore-mcp = "agentcore.mcp.launcher:main"
+agentcore-mcp-server = "agentcore.mcp.launcher:serve_main"
+agentcore-mcp-config = "agentcore.mcp.launcher:config_main"
 
 [project.urls]
 Homepage = "https://github.com/mavin2009/agentcore"
@@ -66,7 +77,7 @@ sdist.exclude = [
 [tool.cibuildwheel]
 build = "cp39-manylinux_x86_64 cp310-manylinux_x86_64 cp311-manylinux_x86_64 cp312-manylinux_x86_64"
 build-verbosity = 1
-test-command = "python {project}/python/tests/state_graph_api_smoke.py && python {project}/python/tests/agent_workflows_smoke.py && python {project}/python/tests/patterns_smoke.py && python {project}/python/tests/adapters_runtime_smoke.py"
+test-command = "python {project}/python/tests/state_graph_api_smoke.py && python {project}/python/tests/agent_workflows_smoke.py && python {project}/python/tests/patterns_smoke.py && python {project}/python/tests/adapters_runtime_smoke.py && python {project}/python/tests/mcp_runtime_smoke.py && python {project}/python/tests/mcp_launcher_smoke.py && python {project}/python/tests/opentelemetry_smoke.py"
 
 [tool.cibuildwheel.linux]
 archs = ["x86_64"]

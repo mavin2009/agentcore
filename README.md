@@ -1,5 +1,13 @@
 # AgentCore
 
+<p align="left">
+  <a href="https://pypi.org/project/agentcore-graph/"><img alt="PyPI version" src="https://img.shields.io/pypi/v/agentcore-graph"></a>
+  <a href="https://pypi.org/project/agentcore-graph/"><img alt="Python versions" src="https://img.shields.io/pypi/pyversions/agentcore-graph"></a>
+  <a href="https://github.com/mavin2009/agentcore/actions/workflows/wheels.yml"><img alt="Wheel builds" src="https://github.com/mavin2009/agentcore/actions/workflows/wheels.yml/badge.svg"></a>
+  <a href="./LICENSE"><img alt="License" src="https://img.shields.io/github/license/mavin2009/agentcore"></a>
+  <img alt="C++20" src="https://img.shields.io/badge/C%2B%2B-20-blue">
+</p>
+
 AgentCore is a native agent-graph runtime written in C++20 with a compact Python surface.
 
 It is built for stateful graph workflows that do more than simple request-response orchestration: branching control flow, tool and model calls, pause/resume behavior, replayable execution, long-lived subgraphs, and workflows that need graph-shaped memory rather than a single opaque state blob.
@@ -9,6 +17,18 @@ From Python, AgentCore exposes a `StateGraph`-style builder and compiled runtime
 The project is organized around a small core set of subsystems: graph IR, state storage, execution, scheduling, checkpoint/trace infrastructure, and tool/model adapters. The intent is to keep the middle of the runtime understandable while still supporting features such as multi-worker execution, persistent subgraph sessions, deterministic memoization for supported nodes, and knowledge-graph-backed state.
 
 AgentCore is an independent project. It is not affiliated with Amazon Web Services, AWS AgentCore, or any related AWS-branded product or service.
+
+## Quick Links
+
+- [Install](#install)
+- [First Python Graph](#first-python-graph)
+- [Message State](#message-state)
+- [MCP Interoperability](#mcp-interoperability)
+- [OpenTelemetry](#opentelemetry)
+- [Intelligence State Model](#intelligence-state-model)
+- [Build From Source](#build-from-source)
+- [Documentation Index](./docs/README.md)
+- [Performance Numbers](./docs/comparisons/langgraph-head-to-head.md)
 
 <p align="center">
   <img src="./assets/arch.png" alt="AgentCore architecture" width="820" />
@@ -54,6 +74,8 @@ These are the core choices behind the project.
 - Structured intelligence state for tasks, claims, evidence, decisions, and memories
 - Deterministic memoization for supported pure nodes
 - Tool and model registries with built-in OpenAI-compatible chat, xAI Grok chat, Gemini `generateContent`, HTTP JSON, SQLite-style, and local model adapters
+- MCP interoperability over `stdio`, including tool mirroring, prompts, resources, completions, roots, sampling, elicitation, logging, subscriptions, and exposing AgentCore-owned tools/prompts/resources to external MCP clients
+- Opt-in OpenTelemetry spans and metrics over invoke, stream, and pause/resume metadata surfaces
 - Validation-focused benchmarks and smoke coverage in both native and Python paths
 
 ## Install
@@ -65,6 +87,18 @@ python3 -m pip install agentcore-graph
 ```
 
 The published package name is `agentcore-graph`, and the import package is `agentcore`.
+
+If you want the packaged OpenTelemetry dependencies as well:
+
+```bash
+python3 -m pip install "agentcore-graph[otel]"
+```
+
+The Python package also installs MCP helper commands:
+
+- `agentcore-mcp`
+- `agentcore-mcp-server`
+- `agentcore-mcp-config`
 
 Current published wheels target Linux `x86_64` for CPython `3.9` through `3.12`. Source builds remain available from this repository.
 
@@ -142,6 +176,90 @@ message_payload = rendered_chat.to_model_input(mode="messages")
 ```
 
 Built-in native chat adapters currently consume text prompt payloads, so rendered chat prompts flatten to role-prefixed text by default. If you register a custom Python-backed model handler that expects structured messages, the same rendered chat prompt can be passed as `mode="messages"` instead.
+
+## MCP Interoperability
+
+AgentCore now includes a fuller MCP surface over `stdio`. The goal is to make external tool and context ecosystems reachable without introducing a second execution model into the runtime core.
+
+From Python, you can mirror tools from an MCP server directly into the graph-owned tool registry:
+
+```python
+compiled.tools.register_mcp_stdio(
+    ["python3", "./python/tests/fixtures/mcp_stdio_server.py"],
+    prefix="remote",
+)
+```
+
+AgentCore also exposes a direct MCP client surface for tools, prompts, resources, completions, roots, sampling, elicitation, logging control, and subscriptions:
+
+```python
+from agentcore.mcp import StdioMCPClient
+
+
+with StdioMCPClient(
+    ["python3", "./python/tests/fixtures/mcp_stdio_server.py"],
+    roots=["file:///workspace/agentcore"],
+) as client:
+    prompt = client.get_prompt("review_code", {
+        "language": "python",
+        "repository": "agentcore",
+        "question": "How should we wire MCP?",
+    })
+    resource = client.read_resource("memo://guide/overview")
+    client.set_logging_level("warning")
+    client.subscribe_resource("memo://guide/overview")
+```
+
+The current `stdio` MCP surface includes `initialize`, `ping`, `tools/list`, `tools/call`, `prompts/list`, `prompts/get`, `resources/list`, `resources/templates/list`, `resources/read`, `resources/subscribe`, `resources/unsubscribe`, `completion/complete`, `logging/setLevel`, `roots/list`, `sampling/createMessage`, `elicitation/create`, and the associated MCP notifications for logs, list changes, roots changes, and resource updates.
+
+If you want to expose your own AgentCore MCP server after installation, the packaged launcher can serve a module or Python file target directly:
+
+```bash
+agentcore-mcp-server --target ./my_server.py:build_server
+```
+
+The same launcher is also available as a module entrypoint:
+
+```bash
+python -m agentcore.mcp serve --target ./my_server.py:build_server
+```
+
+And the package can render ready-to-paste config for common MCP clients:
+
+```bash
+agentcore-mcp-config claude --name local-agentcore --target ./my_server.py:build_server
+agentcore-mcp-config codex --name local-agentcore --target ./my_server.py:build_server
+agentcore-mcp-config gemini --name local-agentcore --target ./my_server.py:build_server
+```
+
+See [`./docs/integrations/mcp.md`](./docs/integrations/mcp.md) for the current scope and examples.
+
+## OpenTelemetry
+
+AgentCore exposes OpenTelemetry as an opt-in Python observer over the runtime metadata and trace events it already records. That keeps the default execution path lean while still making it straightforward to export spans and metrics into an existing observability stack.
+
+```python
+from agentcore.observability import OpenTelemetryObserver
+
+
+observer = OpenTelemetryObserver()
+details = compiled.invoke_with_metadata(
+    {"count": 0},
+    telemetry=observer,
+)
+```
+
+The compact form `telemetry=True` is also accepted and constructs a default observer against the active global tracer and meter providers.
+
+Current metric names are:
+
+- `agentcore.run.executions`
+- `agentcore.run.duration`
+- `agentcore.trace.events`
+- `agentcore.node.executions`
+- `agentcore.node.duration`
+
+See [`./docs/integrations/opentelemetry.md`](./docs/integrations/opentelemetry.md) for setup notes, emitted attributes, and validation commands.
 
 ## Intelligence State Model
 

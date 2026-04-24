@@ -25,6 +25,30 @@ constexpr std::byte kBytesBlobTag{0x03};
 constexpr std::byte kSequenceBlobTag{0x04};
 constexpr std::byte kMessageBlobTag{0x05};
 
+[[nodiscard]] const char* node_kind_name(NodeKind kind) noexcept {
+    switch (kind) {
+        case NodeKind::Compute: return "compute";
+        case NodeKind::Control: return "control";
+        case NodeKind::Tool: return "tool";
+        case NodeKind::Model: return "model";
+        case NodeKind::Aggregate: return "aggregate";
+        case NodeKind::Human: return "human";
+        case NodeKind::Subgraph: return "subgraph";
+    }
+    return "unknown";
+}
+
+[[nodiscard]] const char* node_result_status_name(NodeResult::Status status) noexcept {
+    switch (status) {
+        case NodeResult::Success: return "success";
+        case NodeResult::SoftFail: return "soft_fail";
+        case NodeResult::HardFail: return "hard_fail";
+        case NodeResult::Waiting: return "waiting";
+        case NodeResult::Cancelled: return "cancelled";
+    }
+    return "unknown";
+}
+
 [[nodiscard]] PyObject* unicode_from_utf8(std::string_view value) {
     return PyUnicode_FromStringAndSize(value.data(), static_cast<Py_ssize_t>(value.size()));
 }
@@ -2836,8 +2860,41 @@ bool GraphHandle::build_trace_event_dict(
         PyList_SET_ITEM(namespaces, namespace_index++, frame_dict);
     }
 
-    if (!set_python_dict_item(dict, "node_name", unicode_from_utf8(name), error_message) ||
+    const uint64_t duration_ns = event.ts_end_ns >= event.ts_start_ns
+        ? (event.ts_end_ns - event.ts_start_ns)
+        : 0U;
+
+    if (!set_python_dict_item(dict, "sequence", PyLong_FromUnsignedLongLong(event.sequence), error_message) ||
+        !set_python_dict_item(dict, "run_id", PyLong_FromUnsignedLongLong(event.run_id), error_message) ||
+        !set_python_dict_item(dict, "graph_id", PyLong_FromUnsignedLongLong(event.graph_id), error_message) ||
+        !set_python_dict_item(dict, "node_id", PyLong_FromUnsignedLongLong(event.node_id), error_message) ||
+        !set_python_dict_item(dict, "branch_id", PyLong_FromUnsignedLong(event.branch_id), error_message) ||
+        !set_python_dict_item(
+            dict,
+            "checkpoint_id",
+            PyLong_FromUnsignedLongLong(event.checkpoint_id),
+            error_message
+        ) ||
+        !set_python_dict_item(dict, "node_name", unicode_from_utf8(name), error_message) ||
+        !set_python_dict_item(
+            dict,
+            "node_kind",
+            unicode_from_utf8(node_kind_name(node->kind)),
+            error_message
+        ) ||
         !set_python_dict_item(dict, "graph_name", unicode_from_utf8(graph_name), error_message) ||
+        !set_python_dict_item(
+            dict,
+            "result",
+            unicode_from_utf8(node_result_status_name(event.result)),
+            error_message
+        ) ||
+        !set_python_dict_item(dict, "ts_start_ns", PyLong_FromUnsignedLongLong(event.ts_start_ns), error_message) ||
+        !set_python_dict_item(dict, "ts_end_ns", PyLong_FromUnsignedLongLong(event.ts_end_ns), error_message) ||
+        !set_python_dict_item(dict, "duration_ns", PyLong_FromUnsignedLongLong(duration_ns), error_message) ||
+        !set_python_dict_item(dict, "confidence", PyFloat_FromDouble(event.confidence), error_message) ||
+        !set_python_dict_item(dict, "patch_count", PyLong_FromUnsignedLong(event.patch_count), error_message) ||
+        !set_python_dict_item(dict, "flags", PyLong_FromUnsignedLong(event.flags), error_message) ||
         !set_python_dict_item(
             dict,
             "session_id",

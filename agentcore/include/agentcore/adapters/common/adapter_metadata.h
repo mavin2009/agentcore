@@ -10,6 +10,7 @@ namespace agentcore {
 enum class AdapterTransportKind : uint8_t {
     Unknown = 0,
     InProcess,
+    Stdio,
     Http,
     Database,
     FileSystem
@@ -94,6 +95,8 @@ struct AdapterMetadata {
     switch (kind) {
         case AdapterTransportKind::InProcess:
             return "in_process";
+        case AdapterTransportKind::Stdio:
+            return "stdio";
         case AdapterTransportKind::Http:
             return "http";
         case AdapterTransportKind::Database:

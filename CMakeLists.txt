@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(agentcore VERSION 0.1.7 LANGUAGES CXX)
+project(agentcore VERSION 0.1.8 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -369,6 +369,42 @@ if(BUILD_TESTING)
         )
         set_tests_properties(
             agentcore_python_adapters_runtime_smoke
+            PROPERTIES
+                ENVIRONMENT "PYTHONPATH=${AGENTCORE_PYTHON_BUILD_ROOT}"
+        )
+
+        add_test(
+            NAME agentcore_python_mcp_runtime_smoke
+            COMMAND
+                ${Python3_EXECUTABLE}
+                "${CMAKE_CURRENT_SOURCE_DIR}/python/tests/mcp_runtime_smoke.py"
+        )
+        set_tests_properties(
+            agentcore_python_mcp_runtime_smoke
+            PROPERTIES
+                ENVIRONMENT "PYTHONPATH=${AGENTCORE_PYTHON_BUILD_ROOT}"
+        )
+
+        add_test(
+            NAME agentcore_python_mcp_launcher_smoke
+            COMMAND
+                ${Python3_EXECUTABLE}
+                "${CMAKE_CURRENT_SOURCE_DIR}/python/tests/mcp_launcher_smoke.py"
+        )
+        set_tests_properties(
+            agentcore_python_mcp_launcher_smoke
+            PROPERTIES
+                ENVIRONMENT "PYTHONPATH=${AGENTCORE_PYTHON_BUILD_ROOT}"
+        )
+
+        add_test(
+            NAME agentcore_python_opentelemetry_smoke
+            COMMAND
+                ${Python3_EXECUTABLE}
+                "${CMAKE_CURRENT_SOURCE_DIR}/python/tests/opentelemetry_smoke.py"
+        )
+        set_tests_properties(
+            agentcore_python_opentelemetry_smoke
             PROPERTIES
                 ENVIRONMENT "PYTHONPATH=${AGENTCORE_PYTHON_BUILD_ROOT}"
         )
