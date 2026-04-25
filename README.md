@@ -3,7 +3,6 @@
 <p align="left">
   <a href="https://pypi.org/project/agentcore-graph/"><img alt="PyPI version" src="https://img.shields.io/pypi/v/agentcore-graph"></a>
   <a href="https://pypi.org/project/agentcore-graph/"><img alt="Python versions" src="https://img.shields.io/pypi/pyversions/agentcore-graph"></a>
-  <a href="https://github.com/mavin2009/agentcore/actions/workflows/wheels.yml"><img alt="Wheel builds" src="https://github.com/mavin2009/agentcore/actions/workflows/wheels.yml/badge.svg"></a>
   <a href="./LICENSE"><img alt="License" src="https://img.shields.io/github/license/mavin2009/agentcore"></a>
   <img alt="C++20" src="https://img.shields.io/badge/C%2B%2B-20-blue">
 </p>

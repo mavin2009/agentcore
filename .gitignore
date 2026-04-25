@@ -47,6 +47,10 @@ env/
 .idea/
 .VSCodeCounter/
 
+# Local-only GitHub Actions helpers
+.github/workflows/publish-pypi.yml
+.github/workflows/wheels.yml
+
 # Editor temp files
 *.swp
 *.swo
