@@ -2,6 +2,8 @@
 
 AgentCore exposes OpenTelemetry as an opt-in Python observer over the runtime metadata and trace events it already records.
 
+Use this integration when you want graph runs to appear beside the rest of your service telemetry: request traces, queue workers, tool calls, model calls, logs, and deployment metrics. AgentCore does not require OpenTelemetry for normal execution; the observer is attached only when you pass `telemetry=...`.
+
 That shape is intentional:
 
 - plain `invoke(...)` stays on the lean native path unless telemetry is requested
@@ -17,6 +19,8 @@ python3 -m pip install "agentcore-graph[otel]"
 ```
 
 You can also install `opentelemetry-api` and `opentelemetry-sdk` directly if that fits your environment better.
+
+Your application remains responsible for configuring exporters, processors, and resource attributes. AgentCore uses the active global tracer and meter providers unless you pass explicit tracer or meter objects into `OpenTelemetryObserver`.
 
 ## Basic Use
 
@@ -57,6 +61,15 @@ final_state = compiled.invoke({"count": 0}, telemetry=True)
 ```
 
 That constructs a default `OpenTelemetryObserver()` behind the scenes.
+
+## Where To Attach It
+
+Common choices:
+
+- Use `telemetry=True` for a quick local check.
+- Create one `OpenTelemetryObserver()` near your application startup and pass it to graph calls.
+- Disable child node spans with `emit_node_spans=False` when you only need run-level observability.
+- Prefer `invoke_with_metadata(..., telemetry=observer)` when you also want proof, checkpoint, trace, or intelligence metadata returned to your application.
 
 ## What Gets Emitted
 

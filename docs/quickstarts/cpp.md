@@ -2,6 +2,10 @@
 
 This guide covers the native embedding path: define a `GraphDefinition`, register tools or models when needed, create an `ExecutionEngine`, and run the graph to completion or one step at a time.
 
+Use the C++ surface when you want AgentCore inside a native service, local runtime, benchmark harness, or application that already owns its memory and scheduling environment. If you are mostly authoring workflows from Python, start with the [Python quickstart](./python.md) instead.
+
+The shape is deliberately explicit: graph definitions are flat, nodes return `StatePatch` values, and the engine owns the commit point. That gives C++ callers the same replay, checkpoint, and trace behavior as the Python layer without requiring Python to be present.
+
 ## Build
 
 From the repository root:

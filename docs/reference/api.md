@@ -2,6 +2,18 @@
 
 This page is a compact reference to the public surfaces that are easiest to build against from this repository.
 
+Use this page after you have skimmed the [Python quickstart](../quickstarts/python.md) or [runtime model](../concepts/runtime-model.md). It is organized as a map of implemented surfaces rather than a tutorial, so it is best for answering "what is the exact method name or argument?" while you are writing code.
+
+Common lookups:
+
+- graph construction: [`StateGraph`](#stategraph)
+- graph execution: [`CompiledStateGraph`](#compiledstategraph)
+- telemetry: [`OpenTelemetryObserver`](#opentelemetryobserver)
+- prompts: [`agentcore.prompts`](#agentcoreprompts)
+- runtime helper methods inside node callbacks: [`RuntimeContext`](#runtimecontext)
+- MCP client/server support: [`agentcore.mcp`](#agentcoremcp)
+- native embedding: [C++ Surface](#c-surface)
+
 ## Python Surface
 
 The Python package surface is exported from [`../../python/agentcore/__init__.py`](../../python/agentcore/__init__.py) and implemented primarily in [`../../python/agentcore/graph/state.py`](../../python/agentcore/graph/state.py).

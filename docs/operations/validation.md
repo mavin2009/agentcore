@@ -2,6 +2,19 @@
 
 This page collects the commands that are most useful when you need to prove that a change still preserves runtime behavior.
 
+You do not need to run every command after every edit. Pick the lane that matches the risk of the change, then broaden only when the touched code crosses runtime, Python binding, packaging, or benchmark boundaries.
+
+## Pick A Validation Lane
+
+| Change type | Suggested first pass |
+| --- | --- |
+| README or docs only | `git diff --check` plus any example command you changed |
+| Python graph API or examples | local build plus Python smoke tests |
+| Native scheduler, state, checkpoint, subgraph, or replay behavior | `release-perf` build, `ctest`, native runtime tests, and native benchmarks |
+| MCP or OpenTelemetry integration | local Python smoke tests plus installed-wheel smoke if packaging changed |
+| Published package candidate | wheel smoke, `twine check`, and at least one clean install test |
+| Benchmark document update | rerun the benchmark command that produced the number and keep build type/profile visible |
+
 ## Recommended Full Validation Pass
 
 From the repository root:
@@ -114,9 +127,9 @@ That path proves the installed wheel, not the build tree, still supports:
 - persistent-session reuse and resume
 - streaming and metadata inspection
 
-## Cibuildwheel Linux Release Smoke
+## Local Manylinux Wheel Smoke
 
-When you need to validate the release-wheel path that CI uses, check the selected build matrix and then run at least one Linux wheel build locally. This requires Docker.
+When you need to validate the Linux wheel path before publishing, check the selected build matrix and then run at least one Linux wheel build locally. This requires Docker.
 
 ```bash
 python3 -m cibuildwheel --platform linux --print-build-identifiers .
@@ -129,7 +142,9 @@ Then validate the built wheel metadata and installability:
 python3 -m twine check wheelhouse/*.whl
 ```
 
-The release automation in `./.github/workflows/wheels.yml` currently targets Linux `x86_64`, CPython 3.9-3.12, with the `manylinux_2_28` container baseline so C++20 builds remain compatible with a wide range of modern Linux hosts.
+Current manual release wheels target Linux `x86_64`, CPython 3.9-3.12, with a `manylinux_2_28` container baseline so C++20 builds remain compatible with a wide range of modern Linux hosts.
+
+GitHub-hosted wheel workflows are intentionally not tracked in the repository right now. Local workflow files can be kept under `.github/workflows/` for later reuse, but `.gitignore` prevents them from being pushed while hosted action capacity is unavailable.
 
 ## Native Examples
 

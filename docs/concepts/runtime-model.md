@@ -2,6 +2,23 @@
 
 This page explains the execution model the codebase implements today. It is meant to help you reason about behavior before you drop into the headers or tests.
 
+## Mental Model
+
+Think of AgentCore as a deterministic commit engine for agent graphs.
+
+Your application describes graph structure and node behavior. During a run, each node observes state, returns a patch, and lets the runtime commit that patch in a known order. The same commit point drives routing, trace events, checkpoints, replay, subgraph-session state, and public metadata.
+
+That model is useful when a workflow has to answer practical production questions:
+
+- What state changed at this step?
+- Why did routing choose this edge?
+- Can this paused run resume after process restart?
+- Did this child subgraph reuse the right session-local memory?
+- Can I compare an uninterrupted run with a resumed run?
+- Can I stream useful events without inventing a second execution path?
+
+The runtime is intentionally not a prompt policy layer. Prompts, tools, model calls, retrieval, and planning strategies live at the edges. The engine stays focused on graph execution, state commits, scheduling, durability, and inspection.
+
 ## Core Separation
 
 AgentCore is organized around a narrow execution kernel with explicit boundaries:

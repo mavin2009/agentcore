@@ -2,6 +2,12 @@
 
 This guide is the shortest path from a LangGraph-style `StateGraph` to AgentCore.
 
+Use it when you already have graph-builder code and want to answer three practical questions:
+
+- How much code can stay structurally the same?
+- Which behavior should move to AgentCore-native APIs?
+- What should I test before trusting the port?
+
 There are two migration modes:
 
 1. Local side-by-side evaluation
@@ -49,6 +55,20 @@ Today that compatibility surface is best treated as an evaluation seam, not the 
 
 It currently targets core `StateGraph` builder flows such as `invoke()`, `stream()`, and `batch()`, not every LangGraph surface area.
 
+## Recommended Migration Order
+
+For a real application, migrate in layers:
+
+1. Run your existing graph against the local compatibility surface if you want a fast first signal.
+2. Switch imports to `agentcore.graph`.
+3. Keep node bodies unchanged at first unless they depend on framework-specific interrupt, checkpoint, or store behavior.
+4. Add explicit tests for final state, streamed events, and pause/resume behavior.
+5. Move message history to `MessagesState` or `add_messages`.
+6. Move reusable child-agent state to persistent subgraph sessions.
+7. Add OpenTelemetry or MCP only after the graph behavior is stable.
+
+That order keeps the migration honest: first preserve behavior, then adopt the native features that are difficult to bolt on after the fact.
+
 ## Native Import Change
 
 The explicit import-level migration is small:
@@ -67,6 +87,44 @@ You can usually also add an explicit worker count at graph construction time:
 ```python
 graph = StateGraph(dict, name="research", worker_count=4)
 ```
+
+## Minimal Before And After
+
+Before:
+
+```python
+from langgraph.graph import END, START, StateGraph
+
+
+def draft(state):
+    return {"answer": "draft"}
+
+
+graph = StateGraph(dict)
+graph.add_node("draft", draft)
+graph.add_edge(START, "draft")
+graph.add_edge("draft", END)
+app = graph.compile()
+```
+
+After:
+
+```python
+from agentcore.graph import END, START, StateGraph
+
+
+def draft(state, config):
+    return {"answer": "draft"}
+
+
+graph = StateGraph(dict, name="research", worker_count=4)
+graph.add_node("draft", draft)
+graph.add_edge(START, "draft")
+graph.add_edge("draft", END)
+app = graph.compile()
+```
+
+The graph shape is the same. The native AgentCore version adds an explicit name and worker count so the runtime metadata and scheduling behavior are easier to inspect.
 
 ## What Usually Stays The Same
 
@@ -188,7 +246,7 @@ If your state schema already uses `TypedDict` plus `Annotated[...]` reducers, Ag
 
 ```python
 import operator
-from typing_extensions import Annotated, TypedDict
+from typing import Annotated, TypedDict
 
 
 class ReviewState(TypedDict, total=False):

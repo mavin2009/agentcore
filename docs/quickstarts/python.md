@@ -1,10 +1,24 @@
 # Python Quickstart
 
-This guide uses the local native build produced by CMake. The Python API is a compact builder layered over the native runtime, so the graph definition happens in Python while execution, scheduling, patch application, streaming, and subgraph runtime stay in C++.
+This guide gets you from an empty Python file to a running AgentCore graph, then shows the features most agent workflows usually need next: reducers, message state, prompt templates, MCP tools, telemetry, structured intelligence state, subgraphs, and pause/resume.
 
-## Build The Python Package
+The Python API is a compact builder layered over the native runtime. You define the graph in Python, while execution, scheduling, patch application, streaming, and subgraph runtime stay in C++.
 
-From the repository root:
+## Install Or Build
+
+For normal use, install the published package:
+
+```bash
+python3 -m pip install agentcore-graph
+```
+
+The published distribution is named `agentcore-graph`; the import package is `agentcore`:
+
+```bash
+python3 -c "from agentcore.graph import StateGraph; print('ok')"
+```
+
+If you are developing inside this repository, build the local native package instead:
 
 ```bash
 cmake -S . -B build -DAGENTCORE_BUILD_PYTHON_BINDINGS=ON
@@ -17,7 +31,7 @@ The build emits a package under `./build/python/agentcore`. To use it directly f
 PYTHONPATH=./build/python python3 -c "from agentcore.graph import StateGraph; print('ok')"
 ```
 
-If you want a pip-installable package artifact instead of using the build tree directly, the published distribution name is `agentcore-graph` while the Python import package remains `agentcore`:
+If you want a local pip-installable artifact instead of using the build tree directly:
 
 ```bash
 CC=cc CXX=c++ python3 -m pip wheel . -w dist
@@ -35,9 +49,11 @@ agentcore-mcp-config --help
 
 That wheel includes the `agentcore` package and the compatibility namespace under `agentcore_langgraph_native`. It intentionally does not install a top-level `langgraph` package into the environment.
 
-For published releases, the repository also includes cibuildwheel-based automation in `./.github/workflows/` that builds Linux `manylinux_2_28` wheels for CPython 3.9-3.12 and runs the Python smoke coverage against those built wheels before release.
+The current published wheels target Linux `x86_64` for CPython 3.9 through 3.12. Release wheels are built and published manually for now; the local validation commands live in [Validation And Benchmarks](../operations/validation.md).
 
 ## Define A Minimal Graph
+
+This graph increments a counter until the route function returns `END`.
 
 ```python
 from agentcore.graph import END, START, StateGraph
@@ -59,6 +75,7 @@ graph.add_conditional_edges("step", route, {END: END, "step": "step"})
 
 compiled = graph.compile()
 final_state = compiled.invoke({"count": 0})
+print(final_state["count"])
 ```
 
 The important pieces are:
@@ -85,11 +102,13 @@ That cache lives in the native runtime, not in Python. The current implementatio
 
 ## Use Declared Schema Reducers
 
+Reducers matter when multiple branches write the same field before a join. AgentCore supports a small native reducer subset that covers common counters, booleans, list accumulation, and message history without calling back into Python at the join barrier.
+
 If your state schema is a declared `TypedDict` or similar annotation-bearing type, AgentCore can infer a small reducer subset directly from supported `Annotated[...]` metadata on join barriers.
 
 ```python
 import operator
-from typing_extensions import Annotated, TypedDict
+from typing import Annotated, TypedDict
 
 from agentcore.graph import START, StateGraph
 

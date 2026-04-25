@@ -2,6 +2,19 @@
 
 AgentCore now includes a fuller Model Context Protocol surface over `stdio`.
 
+Use this guide when you want AgentCore to talk to the wider MCP ecosystem without changing how graph execution works. AgentCore treats MCP as an interoperability layer: tools, prompts, and resources can cross a process boundary, while the graph runtime still owns state patches, scheduling, checkpoints, traces, and replay.
+
+## Pick The Right Path
+
+| Goal | Use | Why |
+| --- | --- | --- |
+| Call tools from an MCP server inside a graph | `compiled.tools.register_mcp_stdio(...)` | Remote tools become ordinary AgentCore tools and can be called with `runtime.invoke_tool(...)`. |
+| Read prompts, resources, completions, roots, logs, or subscriptions directly | `StdioMCPClient` | You get the protocol surface without needing to register everything into a graph. |
+| Expose AgentCore tools or graph-owned surfaces to Claude, Codex, Gemini, or another MCP client | `MCPServer` plus `agentcore-mcp-server` | Your installed package can serve a Python target over `stdio`. |
+| Generate client configuration | `agentcore-mcp-config` | It prints ready-to-paste snippets that use the current Python interpreter. |
+
+Most applications should start with tool mirroring. It is the smallest surface and keeps node code independent of the remote process details.
+
 The implemented scope is:
 
 - MCP client handshake over `stdio`
