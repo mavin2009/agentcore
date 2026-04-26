@@ -242,6 +242,90 @@ messages = review_prompt.render(diff="...").to_model_input(mode="messages")
 
 That returns a JSON-friendly message list such as `[{ "role": "system", "content": "..." }, ...]`.
 
+## Assemble Context For A Node
+
+For agent nodes that need a bounded prompt context, declare a `ContextSpec` when adding the node and call `runtime.context.view()` inside the callback.
+
+The context view can assemble records from message history, structured intelligence state, native knowledge-graph triples, selected state fields, and graph-shaped state carried by the workflow. It also records provenance, citation ids, budget stats, conflict metadata, and a stable digest in `invoke_with_metadata(...)`.
+
+```python
+from agentcore.graph import ContextSpec, END, START, StateGraph
+
+
+def prepare(state, config, runtime):
+    runtime.knowledge.upsert_triple(
+        "AgentCore",
+        "stores",
+        "native knowledge triples",
+        payload={"source": "quickstart"},
+    )
+    runtime.intelligence.upsert_claim(
+        "claim:native-runtime",
+        subject="agentcore",
+        relation="uses",
+        object="native runtime",
+        status="supported",
+        confidence=0.9,
+    )
+    runtime.intelligence.add_evidence(
+        "evidence:runtime",
+        kind="doc",
+        source="architecture",
+        claim_key="claim:native-runtime",
+        content={"note": "graph execution is native"},
+        confidence=0.85,
+    )
+    return {
+        "messages": [{"role": "user", "content": state["question"]}],
+    }
+
+
+def answer(state, config, runtime):
+    context = runtime.context.view()
+    prompt = context.to_prompt(system="Answer with cited context.")
+    return {
+        "prompt": prompt,
+        "context_digest": context.digest,
+        "context_items": len(context),
+    }
+
+
+graph = StateGraph(dict, name="context_demo")
+graph.add_node("prepare", prepare)
+graph.add_node(
+    "answer",
+    answer,
+    context=ContextSpec(
+        goal_key="question",
+        include=["messages.recent", "claims.supported", "evidence.relevant", "knowledge.neighborhood"],
+        budget_tokens=1200,
+        require_citations=True,
+    ),
+)
+graph.add_edge(START, "prepare")
+graph.add_edge("prepare", "answer")
+graph.add_edge("answer", END)
+
+details = graph.compile().invoke_with_metadata({"question": "What is AgentCore?"})
+print(details["state"]["context_digest"])
+print(details["context"]["combined_digest"])
+```
+
+Common selectors:
+
+- `messages.recent` and `messages.all`
+- `tasks.agenda`
+- `claims.supported`, `claims.confirmed`, and `claims.all`
+- `evidence.relevant` and `evidence.all`
+- `decisions.selected` and `decisions.all`
+- `memories.working`, `memories.episodic`, `memories.semantic`, `memories.procedural`, and `memories.recall`
+- `actions.candidates`
+- `intelligence.focus`
+- `state.<field_name>`
+- `knowledge.neighborhood` for native `runtime.knowledge` triples, with graph-shaped state under `knowledge_graph`, `knowledge`, or `triples` kept as a fallback
+
+`ContextView.to_prompt(...)` returns text. `ContextView.to_messages(...)` returns chat-style messages. `ContextView.to_model_input(mode="text" | "messages" | "dict")` is the compact adapter-facing form.
+
 ## Bridge MCP Servers
 
 AgentCore includes an MCP `stdio` bridge. The most direct graph-facing path is still remote tool mirroring, because imported MCP tools become ordinary AgentCore tools after registration.

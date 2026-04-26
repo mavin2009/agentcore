@@ -1,7 +1,7 @@
 # AgentCore
 
 <div align="center">
-  <img src="./assets/agentcore.png" alt="AgentCore logo" width="180" />
+  <img src="https://raw.githubusercontent.com/mavin2009/agentcore/main/assets/agentcore.png" alt="AgentCore logo" width="180" />
   <h3>Native agent graphs for fast, inspectable, long-running workflows.</h3>
   <p>
     AgentCore is a C++20 agent-graph runtime with a compact Python API for stateful workflows,
@@ -10,7 +10,7 @@
   <p>
     <a href="https://pypi.org/project/agentcore-graph/"><img alt="PyPI version" src="https://img.shields.io/pypi/v/agentcore-graph"></a>
     <a href="https://pypi.org/project/agentcore-graph/"><img alt="Python versions" src="https://img.shields.io/pypi/pyversions/agentcore-graph"></a>
-    <a href="./LICENSE"><img alt="License" src="https://img.shields.io/github/license/mavin2009/agentcore"></a>
+    <a href="https://github.com/mavin2009/agentcore/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/mavin2009/agentcore"></a>
     <img alt="C++20" src="https://img.shields.io/badge/C%2B%2B-20-blue">
   </p>
   <p>
@@ -55,7 +55,7 @@ AgentCore is an independent project. It is not affiliated with Amazon Web Servic
 </table>
 
 <p align="center">
-  <img src="./assets/arch.png" alt="AgentCore architecture" width="820" />
+  <img src="https://raw.githubusercontent.com/mavin2009/agentcore/main/assets/arch.png" alt="AgentCore architecture" width="820" />
 </p>
 
 ## Why This Exists
@@ -141,6 +141,7 @@ AgentCore currently includes:
 - checkpointing, trace events, proof digests, and replay-oriented metadata
 - persistent subgraph sessions with isolated child state and deterministic session revisions
 - structured intelligence state for tasks, claims, evidence, decisions, and memories
+- graph-native context assembly from messages, intelligence records, native knowledge-graph triples, and state fields
 - knowledge-graph-backed state and reactive execution hooks
 - deterministic memoization for supported pure nodes
 - prompt templates for text, chat, and MCP-rendered prompts
@@ -173,6 +174,35 @@ See the [Python quickstart](./docs/quickstarts/python.md#use-message-state) and 
 Persistent subgraph sessions let the same child graph run across many `session_id` values with isolated child state, checkpoints, task journal, knowledge graph, and stream metadata. Distinct sessions can run concurrently; concurrent reuse of the same session is rejected deterministically.
 
 See the [runtime model](./docs/concepts/runtime-model.md#persistent-session-lifecycle) and [Python quickstart](./docs/quickstarts/python.md#persistent-subgraph-sessions).
+
+### Context Assembly
+
+Nodes can declare a `ContextSpec` and then call `runtime.context.view()` to assemble a deterministic context view from message history, intelligence records, native knowledge-graph triples, selected state fields, and optional graph-shaped state carried by the workflow. The returned `ContextView` includes citations, provenance, budget stats, conflict metadata, prompt/message rendering helpers, and a stable digest that is surfaced through `invoke_with_metadata(...)`.
+
+```python
+from agentcore.graph import ContextSpec
+
+
+graph.add_node(
+    "answer",
+    answer,
+    context=ContextSpec(
+        goal_key="question",
+        include=["messages.recent", "claims.supported", "evidence.relevant"],
+        budget_tokens=2400,
+        require_citations=True,
+    ),
+)
+
+
+def answer(state, config, runtime):
+    context = runtime.context.view()
+    prompt = context.to_prompt(system="Answer using cited evidence.")
+    result = runtime.invoke_model("default", prompt, decode="text")
+    return {"answer": result, "context_digest": context.digest}
+```
+
+See the [Python quickstart](./docs/quickstarts/python.md#assemble-context-for-a-node) and [runtime model](./docs/concepts/runtime-model.md#context-assembly).
 
 ### Intelligence State
 

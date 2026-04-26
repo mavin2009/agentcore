@@ -64,8 +64,9 @@ For a real application, migrate in layers:
 3. Keep node bodies unchanged at first unless they depend on framework-specific interrupt, checkpoint, or store behavior.
 4. Add explicit tests for final state, streamed events, and pause/resume behavior.
 5. Move message history to `MessagesState` or `add_messages`.
-6. Move reusable child-agent state to persistent subgraph sessions.
-7. Add OpenTelemetry or MCP only after the graph behavior is stable.
+6. Move prompt context assembly into `ContextSpec` where nodes are manually stitching together messages, memories, evidence, and state.
+7. Move reusable child-agent state to persistent subgraph sessions.
+8. Add OpenTelemetry or MCP only after the graph behavior is stable.
 
 That order keeps the migration honest: first preserve behavior, then adopt the native features that are difficult to bolt on after the fact.
 
@@ -226,6 +227,34 @@ details = compiled.invoke_with_metadata({"count": 0}, telemetry=observer)
 ```
 
 For a quick first pass, `telemetry=True` is also accepted on `invoke(...)`, `invoke_with_metadata(...)`, `stream(...)`, pause, resume, and batch helpers.
+
+### 4b. Context Assembly
+
+If your graph nodes manually gather messages, memory records, evidence, and state fields before calling a model, move that logic behind a `ContextSpec`.
+
+```python
+from agentcore.graph import ContextSpec
+
+
+graph.add_node(
+    "answer",
+    answer,
+    context=ContextSpec(
+        goal_key="question",
+        include=["messages.recent", "claims.supported", "evidence.relevant"],
+        budget_tokens=2400,
+        require_citations=True,
+    ),
+)
+
+
+def answer(state, config, runtime):
+    context = runtime.context.view()
+    prompt = context.to_prompt(system="Answer using cited context.")
+    return {"answer_prompt": prompt, "context_digest": context.digest}
+```
+
+That keeps context selection observable. `ContextSpec` can also pull from native `runtime.knowledge` triples with `knowledge.neighborhood`, which is useful when a migrated graph has relationship-heavy memory that should not be serialized into ad hoc prompt strings. `invoke_with_metadata(...)` returns `details["context"]`, and trace events for nodes that assemble context include `context_views` and `context_digest`.
 
 ### 5. Builder Conveniences
 

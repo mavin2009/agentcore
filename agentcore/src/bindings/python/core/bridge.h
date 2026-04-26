@@ -218,7 +218,11 @@ PyObject* describe_registered_model(const ModelRegistry& registry, std::string_v
 PyObject* invoke_model_registry(ModelRegistry& registry, std::string_view name, const std::vector<std::byte>& prompt, const std::vector<std::byte>& schema, uint32_t max_tokens, std::string* error_message);
 PyObject* runtime_invoke_model(PyObject* capsule, std::string_view name, const std::vector<std::byte>& prompt, const std::vector<std::byte>& schema, uint32_t max_tokens, std::string* error_message);
 
+PyObject* runtime_identity(PyObject* capsule, std::string* error_message);
 PyObject* runtime_record_once(PyObject* capsule, std::string_view key, PyObject* request, PyObject* producer, std::string* error_message);
+bool runtime_stage_knowledge_entity(PyObject* capsule, PyObject* spec, std::string* error_message);
+bool runtime_stage_knowledge_triple(PyObject* capsule, PyObject* spec, std::string* error_message);
+PyObject* runtime_query_knowledge(PyObject* capsule, PyObject* spec, std::string* error_message);
 bool runtime_stage_task_write(PyObject* capsule, PyObject* spec, std::string* error_message);
 bool runtime_stage_claim_write(PyObject* capsule, PyObject* spec, std::string* error_message);
 bool runtime_stage_evidence_write(PyObject* capsule, PyObject* spec, std::string* error_message);

@@ -67,6 +67,8 @@ PYTHONPATH=./build/python python3 ./python/tests/adapters_runtime_smoke.py
 PYTHONPATH=./build/python python3 ./python/tests/mcp_runtime_smoke.py
 PYTHONPATH=./build/python python3 ./python/tests/mcp_launcher_smoke.py
 PYTHONPATH=./build/python python3 ./python/tests/opentelemetry_smoke.py
+PYTHONPATH=./build/python python3 ./python/tests/context_state_smoke.py
+PYTHONPATH=./build/python python3 ./python/tests/real_world_pipeline_test.py
 ```
 
 What they cover:
@@ -76,6 +78,8 @@ What they cover:
 - deterministic node cache invalidation when declared inputs change
 - async Python node callbacks
 - metadata and streaming surfaces
+- graph-native context assembly, native knowledge-graph context reads, context digests, provenance, conflict metadata, and stream decoration
+- an end-to-end incident-style pipeline with retrieval, native knowledge graph writes, persistent specialist subgraphs, context assembly, model invocation, stream metadata, and explicit parent/child knowledge-graph boundaries
 - Python runtime helper injection and recorded-effect replay
 - Python adapter registration, discovery, direct invocation, and runtime invocation
 - MCP stdio client handshake, tool discovery, tool calls, prompt retrieval, resource reads, completions, roots, sampling, elicitation, logging control, subscriptions, notifications, and registry mirroring
@@ -112,6 +116,8 @@ PYTHONPATH=/tmp/agentcore-wheel-test python3 ./python/tests/adapters_runtime_smo
 PYTHONPATH=/tmp/agentcore-wheel-test python3 ./python/tests/mcp_runtime_smoke.py
 PYTHONPATH=/tmp/agentcore-wheel-test python3 ./python/tests/mcp_launcher_smoke.py
 PYTHONPATH=/tmp/agentcore-wheel-test python3 ./python/tests/opentelemetry_smoke.py
+PYTHONPATH=/tmp/agentcore-wheel-test python3 ./python/tests/context_state_smoke.py
+PYTHONPATH=/tmp/agentcore-wheel-test python3 ./python/tests/real_world_pipeline_test.py
 ```
 
 That path proves the installed wheel, not the build tree, still supports:
@@ -122,6 +128,8 @@ That path proves the installed wheel, not the build tree, still supports:
 - custom Python-backed adapter handlers routed through the native registry seam
 - MCP stdio interoperability, prompt/resource/completion handling, optional client/server MCP features, and mirrored-tool invocation through the installed wheel
 - OpenTelemetry observer integration over the installed wheel
+- context assembly and context metadata over the installed wheel
+- real-world style retrieval, specialist, context, model, and stream pipeline behavior over the installed wheel
 - multi-agent and subgraph flows
 - higher-level pipeline and specialist-team builders
 - persistent-session reuse and resume

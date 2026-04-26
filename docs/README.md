@@ -10,7 +10,7 @@ If you are new to AgentCore, start with the path that matches what you are tryin
 | --- | --- | --- |
 | Build a graph from Python | [Python quickstart](./quickstarts/python.md) | Install/build, define nodes, route, stream, inspect metadata, and use common agent features |
 | Move an existing graph workflow | [Migration guide](./migration/langgraph-to-agentcore.md) | Import changes, callback differences, reducer support, message state, and current compatibility limits |
-| Understand why the runtime behaves this way | [Runtime model](./concepts/runtime-model.md) | State patches, scheduler behavior, checkpoints, subgraph sessions, intelligence records, and knowledge-graph state |
+| Understand why the runtime behaves this way | [Runtime model](./concepts/runtime-model.md) | State patches, scheduler behavior, checkpoints, subgraph sessions, context assembly, intelligence records, and knowledge-graph state |
 | Connect external tools and context | [MCP integration](./integrations/mcp.md) | Mirror MCP tools, consume prompts/resources, expose AgentCore as an MCP server, and generate client config |
 | Export traces and metrics | [OpenTelemetry integration](./integrations/opentelemetry.md) | Opt-in run/node spans, metrics, and how to keep telemetry out of the default hot path |
 | Embed the runtime from C++ | [C++ quickstart](./quickstarts/cpp.md) | Native build, `ExecutionEngine`, state patches, and executable examples |
@@ -24,8 +24,9 @@ For most Python users:
 1. Read the first two sections of the [Python quickstart](./quickstarts/python.md).
 2. Run the minimal counter graph.
 3. Skim [Message State](./quickstarts/python.md#use-message-state) if you are building a chat-style agent.
-4. Skim [Persistent Subgraph Sessions](./quickstarts/python.md#persistent-subgraph-sessions) if your workflow has reusable specialist or child-agent state.
-5. Use the [API reference](./reference/api.md) only when you need exact signatures.
+4. Skim [Assemble Context For A Node](./quickstarts/python.md#assemble-context-for-a-node) if your nodes need prompt-ready context from messages, claims, evidence, memories, and state.
+5. Skim [Persistent Subgraph Sessions](./quickstarts/python.md#persistent-subgraph-sessions) if your workflow has reusable specialist or child-agent state.
+6. Use the [API reference](./reference/api.md) only when you need exact signatures.
 
 For runtime or platform engineers:
 

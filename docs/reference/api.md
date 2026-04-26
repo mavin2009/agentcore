@@ -8,6 +8,7 @@ Common lookups:
 
 - graph construction: [`StateGraph`](#stategraph)
 - graph execution: [`CompiledStateGraph`](#compiledstategraph)
+- context assembly: [`ContextSpec`](#contextspec) and [`ContextView`](#contextview)
 - telemetry: [`OpenTelemetryObserver`](#opentelemetryobserver)
 - prompts: [`agentcore.prompts`](#agentcoreprompts)
 - runtime helper methods inside node callbacks: [`RuntimeContext`](#runtimecontext)
@@ -22,6 +23,8 @@ Exports:
 
 - `StateGraph`
 - `CompiledStateGraph`
+- `ContextSpec`
+- `ContextView`
 - `START`
 - `END`
 - `Command`
@@ -58,7 +61,7 @@ StateGraph(state_schema=None, *, name=None, worker_count=1)
 
 Builder methods:
 
-- `add_node(name_or_action, action=None, *, kind="compute", stop_after=False, allow_fan_out=False, create_join_scope=False, join_incoming_branches=False, deterministic=False, read_keys=None, cache_size=16, intelligence_subscriptions=None, merge=None)`
+- `add_node(name_or_action, action=None, *, kind="compute", stop_after=False, allow_fan_out=False, create_join_scope=False, join_incoming_branches=False, deterministic=False, read_keys=None, cache_size=16, intelligence_subscriptions=None, context=None, merge=None)`
 - `add_fanout(name, action=None, *, kind="control", create_join_scope=True)`
 - `add_join(name, action=None, *, merge=None, kind="aggregate")`
 - `add_subgraph(name, graph, *, inputs=None, outputs=None, namespace=None, propagate_knowledge_graph=False, session_mode="ephemeral", session_id_from=None)`
@@ -372,6 +375,64 @@ Command(update=None, goto=None, wait=False)
 
 Use `Command` when a node wants to return state updates together with explicit routing or a native wait result.
 
+### `ContextSpec`
+
+```python
+ContextSpec(
+    goal_key=None,
+    include=None,
+    budget_tokens=None,
+    budget_items=32,
+    require_citations=False,
+    freshness="staged",
+    message_key="messages",
+    limit_per_source=5,
+    task_key=None,
+    claim_key=None,
+    owner=None,
+    scope=None,
+    subject=None,
+    relation=None,
+    object=None,
+    source=None,
+)
+```
+
+`ContextSpec` declares how a node should assemble prompt-ready context. Pass it to `StateGraph.add_node(..., context=ContextSpec(...))`, then call `runtime.context.view()` inside the node.
+
+Supported selectors include:
+
+- `messages.recent` and `messages.all`
+- `tasks.agenda`
+- `claims.supported`, `claims.confirmed`, and `claims.all`
+- `evidence.relevant` and `evidence.all`
+- `decisions.selected` and `decisions.all`
+- `memories.working`, `memories.episodic`, `memories.semantic`, `memories.procedural`, and `memories.recall`
+- `actions.candidates`
+- `intelligence.focus`
+- `state.<field_name>`
+- `knowledge.neighborhood`, which reads native `runtime.knowledge` triples first and then falls back to graph-shaped state under `knowledge_graph`, `knowledge`, or `triples`
+
+### `ContextView`
+
+`runtime.context.view()` returns a `ContextView`.
+
+Current surface:
+
+- `.spec`
+- `.goal`
+- `.items`
+- `.provenance`
+- `.conflicts`
+- `.budget`
+- `.digest`
+- `.to_dict()`
+- `.to_prompt(system=None)`
+- `.to_messages(system=None)`
+- `.to_model_input(mode="text" | "messages" | "dict" | "protocol", system=None)`
+
+`invoke_with_metadata(...)`, pause/resume metadata calls, and `stream(...)` attach context metadata when a node creates a context view. The run details include `details["context"]`; matching trace events include `context_views` and `context_digest`; `details["proof"]["context_digest"]` carries the Python-level context-view digest.
+
 ### `RuntimeContext`
 
 `RuntimeContext` is passed to Python callbacks that declare a third positional argument.
@@ -380,7 +441,12 @@ Current surface:
 
 - `runtime.available`
 - `runtime.intelligence`
+- `runtime.knowledge`
+- `runtime.context`
 - `runtime.snapshot_intelligence()`
+- `runtime.upsert_knowledge_entity(label, *, payload=None)`
+- `runtime.upsert_knowledge_triple(subject, relation, object, *, payload=None)`
+- `runtime.query_knowledge(subject=None, relation=None, object=None, direction="match", limit=None)`
 - `runtime.upsert_task(key, *, title=None, owner=None, details=None, result=None, status=None, priority=None, confidence=None)`
 - `runtime.upsert_claim(key, *, subject=None, relation=None, object=None, statement=None, status=None, confidence=None)`
 - `runtime.add_evidence(key, *, kind=None, source=None, content=None, task_key=None, claim_key=None, confidence=None)`
@@ -415,6 +481,15 @@ Current surface:
 - `runtime.intelligence.add_evidence(...)`
 - `runtime.intelligence.record_decision(...)`
 - `runtime.intelligence.remember(...)`
+
+`runtime.knowledge` is the grouped surface for native knowledge-graph operations available inside callbacks. Current methods:
+
+- `runtime.knowledge.upsert_entity(label, *, payload=None)`
+- `runtime.knowledge.upsert_triple(subject, relation, object, *, payload=None)`
+- `runtime.knowledge.query(subject=None, relation=None, object=None, direction="match", limit=None)`
+- `runtime.knowledge.neighborhood(entity, *, relation=None, limit=None)`
+
+`query(...)` returns `{"triples": [...], "counts": {"entities": n, "triples": n}, "staged": bool}`. `direction="match"` applies exact filters, `direction="incoming"` treats `subject` as the target entity when no `object` is supplied, and `direction="neighborhood"`/`"both"` returns outgoing plus incoming triples around `subject`.
 
 Routing helpers:
 

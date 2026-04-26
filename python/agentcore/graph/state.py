@@ -8,6 +8,15 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Iterable, Sequence, TypedDict, get_args, get_origin, get_type_hints
 
+from ..context import (
+    ContextAccessor,
+    ContextSpec,
+    ContextView,
+    _attach_context_metadata,
+    _begin_context_collection,
+    _decorate_stream_events,
+    _end_context_collection,
+)
 from ..adapters.registry import (
     ModelRegistryView,
     ToolRegistryView,
@@ -181,6 +190,7 @@ class _NodeSpec:
     cache_size: int = 16
     merge: dict[str, str] = field(default_factory=dict)
     intelligence_subscriptions: tuple[dict[str, Any], ...] = ()
+    context: ContextSpec | None = None
     subgraph: _SubgraphSpec | None = None
 
 
@@ -1044,10 +1054,94 @@ class IntelligenceView:
         return spec
 
 
+class KnowledgeView:
+    def __init__(self, runtime_context: "RuntimeContext"):
+        self._runtime_context = runtime_context
+
+    def _require_runtime(self) -> Any:
+        self._runtime_context._require_runtime()
+        return self._runtime_context._native_runtime
+
+    def upsert_entity(self, label: str, *, payload: Any | None = None) -> None:
+        runtime = self._require_runtime()
+        label_text = str(label)
+        if not label_text:
+            raise ValueError("knowledge entity label must be non-empty")
+        spec: dict[str, Any] = {"label": label_text}
+        if payload is not None:
+            spec["payload"] = payload
+        _native._runtime_upsert_knowledge_entity(runtime, spec)
+
+    def upsert_triple(
+        self,
+        subject: str,
+        relation: str,
+        object: str,
+        *,
+        payload: Any | None = None,
+    ) -> None:
+        runtime = self._require_runtime()
+        subject_text = str(subject)
+        relation_text = str(relation)
+        object_text = str(object)
+        if not subject_text or not relation_text or not object_text:
+            raise ValueError("knowledge triples require non-empty subject, relation, and object")
+        spec: dict[str, Any] = {
+            "subject": subject_text,
+            "relation": relation_text,
+            "object": object_text,
+        }
+        if payload is not None:
+            spec["payload"] = payload
+        _native._runtime_upsert_knowledge_triple(runtime, spec)
+
+    def query(
+        self,
+        *,
+        subject: str | None = None,
+        relation: str | None = None,
+        object: str | None = None,
+        direction: str = "match",
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        runtime = self._require_runtime()
+        spec: dict[str, Any] = {"direction": str(direction)}
+        if subject is not None:
+            spec["subject"] = str(subject)
+        if relation is not None:
+            spec["relation"] = str(relation)
+        if object is not None:
+            spec["object"] = str(object)
+        if limit is not None:
+            if int(limit) < 0:
+                raise ValueError("limit must be >= 0")
+            spec["limit"] = int(limit)
+        result = _native._runtime_query_knowledge(runtime, spec)
+        if not isinstance(result, dict):
+            raise TypeError("native runtime returned an invalid knowledge query result")
+        return result
+
+    def neighborhood(
+        self,
+        entity: str,
+        *,
+        relation: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        return self.query(
+            subject=str(entity),
+            relation=relation,
+            direction="neighborhood",
+            limit=limit,
+        )
+
+
 class RuntimeContext:
     def __init__(self, native_runtime: Any | None):
         self._native_runtime = native_runtime
         self._intelligence = IntelligenceView(self)
+        self._knowledge = KnowledgeView(self)
+        self._context = ContextAccessor(self)
 
     @property
     def available(self) -> bool:
@@ -1080,8 +1174,68 @@ class RuntimeContext:
     def intelligence(self) -> "IntelligenceView":
         return self._intelligence
 
+    @property
+    def knowledge(self) -> "KnowledgeView":
+        return self._knowledge
+
+    @property
+    def context(self) -> ContextAccessor:
+        return self._context
+
+    def _bind_context(
+        self,
+        *,
+        spec: ContextSpec | None,
+        state: Mapping[str, Any],
+        config: Mapping[str, Any],
+        node_name: str | None,
+    ) -> None:
+        self._context.bind(
+            spec=spec,
+            state=state,
+            config=config,
+            node_name=node_name,
+        )
+
+    def _runtime_identity(self) -> dict[str, Any]:
+        self._require_runtime()
+        result = _native._runtime_identity(self._native_runtime)
+        if not isinstance(result, dict):
+            raise TypeError("native runtime returned an invalid runtime identity")
+        return result
+
     def snapshot_intelligence(self) -> dict[str, Any]:
         return self.intelligence.snapshot()
+
+    def upsert_knowledge_entity(self, label: str, *, payload: Any | None = None) -> None:
+        self.knowledge.upsert_entity(label, payload=payload)
+
+    def upsert_knowledge_triple(
+        self,
+        subject: str,
+        relation: str,
+        object: str,
+        *,
+        payload: Any | None = None,
+    ) -> None:
+        self.knowledge.upsert_triple(subject, relation, object, payload=payload)
+
+    def query_knowledge(
+        self,
+        *,
+        subject: str | None = None,
+        relation: str | None = None,
+        object: str | None = None,
+        direction: str = "match",
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        return self.knowledge.query(
+            subject=subject,
+            relation=relation,
+            object=object,
+            direction=direction,
+            limit=limit,
+        )
 
     def upsert_task(
         self,
@@ -1552,6 +1706,7 @@ def _validate_direct_subgraph_node_options(
     read_keys: Sequence[str] | None,
     cache_size: int,
     intelligence_subscriptions: Sequence[IntelligenceSubscription | Mapping[str, Any]] | None,
+    context: ContextSpec | Mapping[str, Any] | None,
     merge: dict[str, Any] | None,
 ) -> None:
     unsupported: list[str] = []
@@ -1573,6 +1728,8 @@ def _validate_direct_subgraph_node_options(
         unsupported.append("cache_size")
     if intelligence_subscriptions:
         unsupported.append("intelligence_subscriptions")
+    if context is not None:
+        unsupported.append("context")
     if merge:
         unsupported.append("merge")
     if unsupported:
@@ -1623,6 +1780,7 @@ class StateGraph:
         read_keys: Sequence[str] | None = None,
         cache_size: int = 16,
         intelligence_subscriptions: Sequence[IntelligenceSubscription | Mapping[str, Any]] | None = None,
+        context: ContextSpec | Mapping[str, Any] | None = None,
         merge: dict[str, Any] | None = None,
     ) -> "StateGraph":
         if action is None and isinstance(name, (StateGraph, CompiledStateGraph)):
@@ -1644,6 +1802,7 @@ class StateGraph:
                 read_keys=read_keys,
                 cache_size=cache_size,
                 intelligence_subscriptions=intelligence_subscriptions,
+                context=context,
                 merge=merge,
             )
             bindings = _infer_shared_subgraph_bindings(self._state_schema, action)
@@ -1668,6 +1827,7 @@ class StateGraph:
             _normalize_intelligence_subscription(subscription)
             for subscription in (intelligence_subscriptions or ())
         )
+        normalized_context = ContextSpec.from_value(context)
 
         is_join_node = bool(join_incoming_branches or name in self._pending_join_targets)
         normalized_merge = _normalize_merge_rules(merge)
@@ -1688,6 +1848,7 @@ class StateGraph:
             read_keys=normalized_read_keys,
             cache_size=normalized_cache_size,
             intelligence_subscriptions=normalized_intelligence_subscriptions,
+            context=normalized_context,
             merge=effective_merge,
         )
         if self._entry_point is None:
@@ -2034,6 +2195,12 @@ class StateGraph:
         def wrapped(state: Any, config: Any = None) -> Any:
             normalized_config, runtime = _extract_runtime_and_config(config)
             state_view = _StateView(state)
+            runtime._bind_context(
+                spec=node_spec.context,
+                state=state_view,
+                config=normalized_config,
+                node_name=node_name,
+            )
             updates: dict[str, Any] = {}
             explicit_goto: str | None = None
 
@@ -2055,6 +2222,12 @@ class StateGraph:
                 return updates
 
             merged_state = state_view if not updates else _OverlayMapping(state_view, updates)
+            runtime._bind_context(
+                spec=node_spec.context,
+                state=merged_state,
+                config=normalized_config,
+                node_name=node_name,
+            )
             route_result = route_invoker(
                 merged_state,
                 normalized_config,
@@ -2116,13 +2289,22 @@ class CompiledStateGraph:
         observer = _coerce_telemetry_observer(telemetry)
         if observer is None:
             return _native._invoke(self._native_graph, initial_state, normalized_config)
+
+        def run_with_details():
+            _begin_context_collection()
+            try:
+                details = _native._invoke_with_details(
+                    self._native_graph,
+                    initial_state,
+                    normalized_config,
+                    include_subgraphs=True,
+                )
+            finally:
+                _end_context_collection()
+            return _attach_context_metadata(details)
+
         details = observer.capture_details(
-            lambda: _native._invoke_with_details(
-                self._native_graph,
-                initial_state,
-                normalized_config,
-                include_subgraphs=True,
-            ),
+            run_with_details,
             graph_name=self._name,
             operation="invoke",
             config=normalized_config,
@@ -2142,19 +2324,33 @@ class CompiledStateGraph:
         normalized_config = _normalize_config(config)
         observer = _coerce_telemetry_observer(telemetry)
         if observer is None:
-            return _native._invoke_with_details(
-                self._native_graph,
-                initial_state,
-                normalized_config,
-                include_subgraphs=include_subgraphs,
-            )
+            _begin_context_collection()
+            try:
+                details = _native._invoke_with_details(
+                    self._native_graph,
+                    initial_state,
+                    normalized_config,
+                    include_subgraphs=include_subgraphs,
+                )
+            finally:
+                _end_context_collection()
+            return _attach_context_metadata(details)
+
+        def run_with_details():
+            _begin_context_collection()
+            try:
+                details = _native._invoke_with_details(
+                    self._native_graph,
+                    initial_state,
+                    normalized_config,
+                    include_subgraphs=include_subgraphs,
+                )
+            finally:
+                _end_context_collection()
+            return _attach_context_metadata(details)
+
         return observer.capture_details(
-            lambda: _native._invoke_with_details(
-                self._native_graph,
-                initial_state,
-                normalized_config,
-                include_subgraphs=include_subgraphs,
-            ),
+            run_with_details,
             graph_name=self._name,
             operation="invoke_with_metadata",
             config=normalized_config,
@@ -2173,19 +2369,33 @@ class CompiledStateGraph:
         normalized_config = _normalize_config(config)
         observer = _coerce_telemetry_observer(telemetry)
         if observer is None:
-            return _native._invoke_until_pause_with_details(
-                self._native_graph,
-                initial_state,
-                normalized_config,
-                include_subgraphs=include_subgraphs,
-            )
+            _begin_context_collection()
+            try:
+                details = _native._invoke_until_pause_with_details(
+                    self._native_graph,
+                    initial_state,
+                    normalized_config,
+                    include_subgraphs=include_subgraphs,
+                )
+            finally:
+                _end_context_collection()
+            return _attach_context_metadata(details)
+
+        def run_until_pause_with_details():
+            _begin_context_collection()
+            try:
+                details = _native._invoke_until_pause_with_details(
+                    self._native_graph,
+                    initial_state,
+                    normalized_config,
+                    include_subgraphs=include_subgraphs,
+                )
+            finally:
+                _end_context_collection()
+            return _attach_context_metadata(details)
+
         return observer.capture_details(
-            lambda: _native._invoke_until_pause_with_details(
-                self._native_graph,
-                initial_state,
-                normalized_config,
-                include_subgraphs=include_subgraphs,
-            ),
+            run_until_pause_with_details,
             graph_name=self._name,
             operation="invoke_until_pause_with_metadata",
             config=normalized_config,
@@ -2201,17 +2411,31 @@ class CompiledStateGraph:
     ) -> dict[str, Any]:
         observer = _coerce_telemetry_observer(telemetry)
         if observer is None:
-            return _native._resume_with_details(
-                self._native_graph,
-                int(checkpoint_id),
-                include_subgraphs=include_subgraphs,
-            )
+            _begin_context_collection()
+            try:
+                details = _native._resume_with_details(
+                    self._native_graph,
+                    int(checkpoint_id),
+                    include_subgraphs=include_subgraphs,
+                )
+            finally:
+                _end_context_collection()
+            return _attach_context_metadata(details)
+
+        def resume_with_details():
+            _begin_context_collection()
+            try:
+                details = _native._resume_with_details(
+                    self._native_graph,
+                    int(checkpoint_id),
+                    include_subgraphs=include_subgraphs,
+                )
+            finally:
+                _end_context_collection()
+            return _attach_context_metadata(details)
+
         return observer.capture_details(
-            lambda: _native._resume_with_details(
-                self._native_graph,
-                int(checkpoint_id),
-                include_subgraphs=include_subgraphs,
-            ),
+            resume_with_details,
             graph_name=self._name,
             operation="resume_with_metadata",
             config={"checkpoint_id": int(checkpoint_id)},
@@ -2232,18 +2456,24 @@ class CompiledStateGraph:
         initial_state = {} if input_state is None else dict(input_state)
         normalized_config = _normalize_config(config)
         observer = _coerce_telemetry_observer(telemetry)
-        event_sequence = _native._stream(
-            self._native_graph,
-            initial_state,
-            normalized_config,
-            include_subgraphs=include_subgraphs,
-        )
+        _begin_context_collection()
+        try:
+            event_sequence = _native._stream(
+                self._native_graph,
+                initial_state,
+                normalized_config,
+                include_subgraphs=include_subgraphs,
+            )
+            events = list(event_sequence)
+        finally:
+            _end_context_collection()
+        events = _decorate_stream_events(events)
         if observer is None:
-            for event in event_sequence:
+            for event in events:
                 yield event
             return
         for event in observer.capture_stream(
-            lambda: list(event_sequence),
+            lambda: list(events),
             graph_name=self._name,
             operation="stream",
             config=normalized_config,

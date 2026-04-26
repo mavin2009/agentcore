@@ -1544,6 +1544,98 @@ PyObject* py_runtime_record_once(PyObject*, PyObject* args, PyObject* kwargs) {
     return result;
 }
 
+PyObject* py_runtime_identity(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* runtime = nullptr;
+    static const char* keywords[] = {"runtime", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "O",
+            const_cast<char**>(keywords),
+            &runtime
+        )) {
+        return nullptr;
+    }
+
+    std::string error_message;
+    PyObject* result = runtime_identity(runtime, &error_message);
+    if (result == nullptr) {
+        PyErr_SetString(PyExc_RuntimeError, error_message.c_str());
+        return nullptr;
+    }
+    return result;
+}
+
+PyObject* py_runtime_upsert_knowledge_entity(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* runtime = nullptr;
+    PyObject* spec = Py_None;
+    static const char* keywords[] = {"runtime", "spec", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "OO",
+            const_cast<char**>(keywords),
+            &runtime,
+            &spec
+        )) {
+        return nullptr;
+    }
+
+    std::string error_message;
+    if (!runtime_stage_knowledge_entity(runtime, spec, &error_message)) {
+        PyErr_SetString(PyExc_ValueError, error_message.c_str());
+        return nullptr;
+    }
+    Py_RETURN_NONE;
+}
+
+PyObject* py_runtime_upsert_knowledge_triple(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* runtime = nullptr;
+    PyObject* spec = Py_None;
+    static const char* keywords[] = {"runtime", "spec", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "OO",
+            const_cast<char**>(keywords),
+            &runtime,
+            &spec
+        )) {
+        return nullptr;
+    }
+
+    std::string error_message;
+    if (!runtime_stage_knowledge_triple(runtime, spec, &error_message)) {
+        PyErr_SetString(PyExc_ValueError, error_message.c_str());
+        return nullptr;
+    }
+    Py_RETURN_NONE;
+}
+
+PyObject* py_runtime_query_knowledge(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* runtime = nullptr;
+    PyObject* spec = Py_None;
+    static const char* keywords[] = {"runtime", "spec", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "OO",
+            const_cast<char**>(keywords),
+            &runtime,
+            &spec
+        )) {
+        return nullptr;
+    }
+
+    std::string error_message;
+    PyObject* result = runtime_query_knowledge(runtime, spec, &error_message);
+    if (result == nullptr) {
+        PyErr_SetString(PyExc_ValueError, error_message.c_str());
+        return nullptr;
+    }
+    return result;
+}
+
 PyObject* py_runtime_upsert_task(PyObject*, PyObject* args, PyObject* kwargs) {
     PyObject* runtime = nullptr;
     PyObject* spec = Py_None;
@@ -2707,6 +2799,30 @@ PyMethodDef kModuleMethods[] = {
         reinterpret_cast<PyCFunction>(py_runtime_record_once),
         METH_VARARGS | METH_KEYWORDS,
         "Record a once-only synchronous effect for the active Python node callback."
+    },
+    {
+        "_runtime_identity",
+        reinterpret_cast<PyCFunction>(py_runtime_identity),
+        METH_VARARGS | METH_KEYWORDS,
+        "Return run/node identity metadata for the active Python node callback."
+    },
+    {
+        "_runtime_upsert_knowledge_entity",
+        reinterpret_cast<PyCFunction>(py_runtime_upsert_knowledge_entity),
+        METH_VARARGS | METH_KEYWORDS,
+        "Stage a native knowledge-graph entity write for the active Python node callback."
+    },
+    {
+        "_runtime_upsert_knowledge_triple",
+        reinterpret_cast<PyCFunction>(py_runtime_upsert_knowledge_triple),
+        METH_VARARGS | METH_KEYWORDS,
+        "Stage a native knowledge-graph triple write for the active Python node callback."
+    },
+    {
+        "_runtime_query_knowledge",
+        reinterpret_cast<PyCFunction>(py_runtime_query_knowledge),
+        METH_VARARGS | METH_KEYWORDS,
+        "Query native knowledge-graph triples for the active Python node callback."
     },
     {
         "_runtime_upsert_task",

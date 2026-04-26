@@ -94,6 +94,32 @@ The state layer intentionally separates:
 
 This keeps the hot execution path focused on compact control state while still allowing prompts, model outputs, tool payloads, and serialized artifacts to move through the runtime.
 
+## Context Assembly
+
+AgentCore now exposes a graph-native context assembly layer on the Python runtime surface.
+
+The core idea is that a node can declare a `ContextSpec` at graph-build time and then call `runtime.context.view()` during execution. That view is assembled from the runtime state already available to the node:
+
+- message history from the configured message state field
+- task, claim, evidence, decision, and memory records through the native intelligence query surface
+- triples from the native `KnowledgeGraphStore` through `runtime.knowledge`
+- selected state fields through `state.<field>` selectors
+- graph-shaped state carried under `knowledge_graph`, `knowledge`, or `triples` as a compatibility fallback
+
+The context view is not a separate memory store. It is a deterministic read model over committed state plus staged intelligence and knowledge-graph writes visible to the active callback. The returned `ContextView` includes:
+
+- ordered context items
+- citation ids
+- provenance records
+- approximate budget accounting
+- conflict metadata for supported or confirmed claims that disagree on the same subject/relation
+- a stable digest
+- rendering helpers for text prompts, chat messages, and dict/protocol payloads
+
+When context views are created during `invoke_with_metadata(...)`, pause/resume metadata calls, or `stream(...)`, AgentCore attaches a `details["context"]` summary. Matching trace events also receive `context_views` and `context_digest` fields. The native proof digest remains the runtime state/trace proof; the Python metadata layer adds `proof["context_digest"]` so context selection can be compared across runs without hiding that it is a context-view digest.
+
+The current context assembly layer intentionally keeps ranking explicit. It relies on existing native intelligence ranking operations such as `agenda(...)`, `supporting_claims(...)`, `recall(...)`, `focus(...)`, and `action_candidates(...)` rather than introducing a second heuristic ranking engine in Python.
+
 ## Intelligence State
 
 AgentCore now includes a first-class intelligence state model inside the native state subsystem rather than treating agent reasoning artifacts as a convention layered on top of generic fields.
@@ -286,6 +312,7 @@ Knowledge-graph storage is part of the runtime state model. Nodes can:
 
 - write entities and triples through `StatePatch::knowledge_graph`
 - query graph state through `ExecutionContext::knowledge_graph`
+- write and query triples from Python through `runtime.knowledge`
 - rely on indexed lookup and matching during execution
 
 This is what allows graph-aware workflows to participate in the same trace, checkpoint, and replay model as ordinary field updates.

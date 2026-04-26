@@ -598,6 +598,7 @@ struct RuntimeViewProxy {
     const BlobStore* blobs{nullptr};
     const StringInterner* strings{nullptr};
     const IntelligenceStore* intelligence{nullptr};
+    KnowledgeGraphPatch pending_knowledge_graph_patch;
     IntelligencePatch pending_intelligence_patch;
     std::atomic<bool> active;
 };
@@ -618,6 +619,7 @@ struct OwnedStateSnapshot {
 };
 
 void RuntimeViewProxy_dealloc(RuntimeViewProxy* self) {
+    self->pending_knowledge_graph_patch.~KnowledgeGraphPatch();
     self->pending_intelligence_patch.~IntelligencePatch();
     self->active.~atomic();
     Py_TYPE(self)->tp_free(reinterpret_cast<PyObject*>(self));
@@ -676,6 +678,7 @@ PyObject* create_runtime_view_proxy(ExecutionContext& context) {
         self->blobs = &context.blobs;
         self->strings = &context.strings;
         self->intelligence = &context.intelligence;
+        new (&self->pending_knowledge_graph_patch) KnowledgeGraphPatch();
         new (&self->pending_intelligence_patch) IntelligencePatch();
         new (&self->active) std::atomic<bool>(true);
     }
@@ -702,6 +705,49 @@ RuntimeViewProxy* runtime_view_from_object(PyObject* object, std::string* error_
 ExecutionContext* runtime_context_from_capsule(PyObject* capsule, std::string* error_message) {
     RuntimeViewProxy* view = runtime_view_from_object(capsule, error_message);
     return view == nullptr ? nullptr : view->runtime;
+}
+
+PyObject* runtime_identity_impl(PyObject* capsule, std::string* error_message) {
+    ExecutionContext* ctx = runtime_context_from_capsule(capsule, error_message);
+    if (ctx == nullptr) {
+        return nullptr;
+    }
+
+    PyObject* dict = PyDict_New();
+    if (dict == nullptr) {
+        if (error_message != nullptr) {
+            *error_message = fetch_python_error();
+        }
+        return nullptr;
+    }
+
+    auto set_item = [dict, error_message](const char* key, PyObject* value) {
+        if (value == nullptr) {
+            if (error_message != nullptr) {
+                *error_message = fetch_python_error();
+            }
+            return false;
+        }
+        const int status = PyDict_SetItemString(dict, key, value);
+        Py_DECREF(value);
+        if (status != 0) {
+            if (error_message != nullptr) {
+                *error_message = fetch_python_error();
+            }
+            return false;
+        }
+        return true;
+    };
+
+    if (!set_item("run_id", PyLong_FromUnsignedLongLong(ctx->run_id)) ||
+        !set_item("graph_id", PyLong_FromUnsignedLongLong(ctx->graph_id)) ||
+        !set_item("node_id", PyLong_FromUnsignedLong(ctx->node_id)) ||
+        !set_item("branch_id", PyLong_FromUnsignedLong(ctx->branch_id))) {
+        Py_DECREF(dict);
+        return nullptr;
+    }
+
+    return dict;
 }
 
 bool require_spec_dict(PyObject* spec, std::string* error_message) {
@@ -1726,6 +1772,10 @@ private:
 }
 
 } // namespace
+
+PyObject* runtime_identity(PyObject* capsule, std::string* error_message) {
+    return runtime_identity_impl(capsule, error_message);
+}
 
 std::string GraphHandle::fetch_python_error() {
     return fetch_python_error();
@@ -3653,6 +3703,7 @@ NodeResult python_node_executor(ExecutionContext& ctx) {
     }
     PyObject* result = PyObject_CallObject(binding->callback, args);
 
+    const KnowledgeGraphPatch pending_knowledge_graph_patch = runtime_view->pending_knowledge_graph_patch;
     const IntelligencePatch pending_intelligence_patch = runtime_view->pending_intelligence_patch;
     runtime_view->active.store(false, std::memory_order_release);
 
@@ -3716,6 +3767,19 @@ NodeResult python_node_executor(ExecutionContext& ctx) {
             PyGILState_Release(gil);
             return NodeResult{NodeResult::HardFail};
         }
+    }
+
+    if (!pending_knowledge_graph_patch.empty()) {
+        node_result.patch.knowledge_graph.entities.insert(
+            node_result.patch.knowledge_graph.entities.end(),
+            pending_knowledge_graph_patch.entities.begin(),
+            pending_knowledge_graph_patch.entities.end()
+        );
+        node_result.patch.knowledge_graph.triples.insert(
+            node_result.patch.knowledge_graph.triples.end(),
+            pending_knowledge_graph_patch.triples.begin(),
+            pending_knowledge_graph_patch.triples.end()
+        );
     }
 
     if (!pending_intelligence_patch.empty()) {
@@ -4321,6 +4385,258 @@ PyObject* runtime_invoke_model(
         }
         return nullptr;
     }
+}
+
+bool runtime_stage_knowledge_entity(PyObject* capsule, PyObject* spec, std::string* error_message) {
+    RuntimeViewProxy* view = runtime_view_from_object(capsule, error_message);
+    if (view == nullptr || !require_spec_dict(spec, error_message)) {
+        return false;
+    }
+
+    KnowledgeEntityWrite write;
+    uint32_t ignored_mask = 0U;
+    if (!parse_required_spec_string_id(spec, "label", view->runtime->strings, &write.label, error_message) ||
+        !parse_optional_spec_blob(
+            spec,
+            "payload",
+            view->runtime->blobs,
+            &write.payload,
+            0U,
+            &ignored_mask,
+            error_message
+        )) {
+        return false;
+    }
+
+    view->pending_knowledge_graph_patch.entities.push_back(write);
+    return true;
+}
+
+bool runtime_stage_knowledge_triple(PyObject* capsule, PyObject* spec, std::string* error_message) {
+    RuntimeViewProxy* view = runtime_view_from_object(capsule, error_message);
+    if (view == nullptr || !require_spec_dict(spec, error_message)) {
+        return false;
+    }
+
+    KnowledgeTripleWrite write;
+    uint32_t ignored_mask = 0U;
+    if (!parse_required_spec_string_id(spec, "subject", view->runtime->strings, &write.subject_label, error_message) ||
+        !parse_required_spec_string_id(spec, "relation", view->runtime->strings, &write.relation, error_message) ||
+        !parse_required_spec_string_id(spec, "object", view->runtime->strings, &write.object_label, error_message) ||
+        !parse_optional_spec_blob(
+            spec,
+            "payload",
+            view->runtime->blobs,
+            &write.payload,
+            0U,
+            &ignored_mask,
+            error_message
+        )) {
+        return false;
+    }
+
+    view->pending_knowledge_graph_patch.triples.push_back(write);
+    return true;
+}
+
+PyObject* runtime_query_knowledge(PyObject* capsule, PyObject* spec, std::string* error_message) {
+    RuntimeViewProxy* view = runtime_view_from_object(capsule, error_message);
+    if (view == nullptr || !require_spec_dict(spec, error_message)) {
+        return nullptr;
+    }
+
+    GraphHandle* handle = GraphHandleRegistry::instance().find(view->runtime->graph_id);
+    if (handle == nullptr) {
+        if (error_message != nullptr) {
+            *error_message = "Graph handle not found";
+        }
+        return nullptr;
+    }
+
+    uint32_t ignored_mask = 0U;
+    InternedStringId subject_id = 0U;
+    InternedStringId relation_id = 0U;
+    InternedStringId object_id = 0U;
+    uint32_t limit = std::numeric_limits<uint32_t>::max();
+    std::string direction = "match";
+
+    if (!parse_optional_spec_string_id(
+            spec,
+            "subject",
+            view->runtime->strings,
+            &subject_id,
+            0U,
+            &ignored_mask,
+            error_message
+        ) ||
+        !parse_optional_spec_string_id(
+            spec,
+            "relation",
+            view->runtime->strings,
+            &relation_id,
+            0U,
+            &ignored_mask,
+            error_message
+        ) ||
+        !parse_optional_spec_string_id(
+            spec,
+            "object",
+            view->runtime->strings,
+            &object_id,
+            0U,
+            &ignored_mask,
+            error_message
+        ) ||
+        !parse_optional_query_limit(spec, "limit", &limit, error_message) ||
+        !parse_optional_spec_string(spec, "direction", &direction, error_message)) {
+        return nullptr;
+    }
+
+    if (direction != "match" &&
+        direction != "outgoing" &&
+        direction != "incoming" &&
+        direction != "both" &&
+        direction != "neighborhood") {
+        if (error_message != nullptr) {
+            *error_message = "knowledge query direction must be 'match', 'outgoing', 'incoming', 'both', or 'neighborhood'";
+        }
+        return nullptr;
+    }
+
+    const std::optional<InternedStringId> subject =
+        subject_id == 0U ? std::nullopt : std::optional<InternedStringId>{subject_id};
+    const std::optional<InternedStringId> relation =
+        relation_id == 0U ? std::nullopt : std::optional<InternedStringId>{relation_id};
+    const std::optional<InternedStringId> object =
+        object_id == 0U ? std::nullopt : std::optional<InternedStringId>{object_id};
+
+    KnowledgeGraphStore graph = view->runtime->knowledge_graph;
+    if (!view->pending_knowledge_graph_patch.empty()) {
+        graph.apply(view->pending_knowledge_graph_patch);
+    }
+
+    std::vector<const KnowledgeTriple*> triples;
+    triples.reserve(std::min<std::size_t>(graph.triple_count(), limit));
+    std::unordered_set<KnowledgeTripleId> seen;
+    seen.reserve(std::min<std::size_t>(graph.triple_count(), limit));
+
+    const auto append_matches = [&](std::vector<const KnowledgeTriple*> matches) {
+        for (const KnowledgeTriple* triple : matches) {
+            if (triple == nullptr || seen.find(triple->id) != seen.end()) {
+                continue;
+            }
+            seen.insert(triple->id);
+            triples.push_back(triple);
+            if (triples.size() >= limit) {
+                return;
+            }
+        }
+    };
+
+    if (limit > 0U) {
+        const bool centered_on_subject = subject.has_value() && !object.has_value();
+        if (direction == "incoming" && centered_on_subject) {
+            append_matches(graph.match(std::nullopt, relation, subject));
+        } else if ((direction == "both" || direction == "neighborhood") && centered_on_subject) {
+            append_matches(graph.match(subject, relation, std::nullopt));
+            if (triples.size() < limit) {
+                append_matches(graph.match(std::nullopt, relation, subject));
+            }
+        } else {
+            append_matches(graph.match(subject, relation, object));
+        }
+    }
+
+    PyObject* result = PyDict_New();
+    PyObject* list = PyList_New(0);
+    PyObject* counts = PyDict_New();
+    if (result == nullptr || list == nullptr || counts == nullptr) {
+        Py_XDECREF(result);
+        Py_XDECREF(list);
+        Py_XDECREF(counts);
+        if (error_message != nullptr) {
+            *error_message = fetch_python_error();
+        }
+        return nullptr;
+    }
+
+    for (const KnowledgeTriple* triple : triples) {
+        const KnowledgeEntity* subject_entity = graph.find_entity(triple->subject);
+        const KnowledgeEntity* object_entity = graph.find_entity(triple->object);
+        if (subject_entity == nullptr || object_entity == nullptr) {
+            continue;
+        }
+
+        PyObject* item = PyDict_New();
+        if (item == nullptr ||
+            !set_python_dict_item(item, "id", PyLong_FromUnsignedLong(triple->id), error_message) ||
+            !set_python_dict_item(
+                item,
+                "subject",
+                unicode_from_utf8(view->runtime->strings.resolve(subject_entity->label)),
+                error_message
+            ) ||
+            !set_python_dict_item(
+                item,
+                "relation",
+                unicode_from_utf8(view->runtime->strings.resolve(triple->relation)),
+                error_message
+            ) ||
+            !set_python_dict_item(
+                item,
+                "object",
+                unicode_from_utf8(view->runtime->strings.resolve(object_entity->label)),
+                error_message
+            ) ||
+            !set_python_dict_item(
+                item,
+                "payload",
+                handle->convert_value_to_python(
+                    Value{triple->payload},
+                    view->runtime->blobs,
+                    view->runtime->strings,
+                    error_message
+                ),
+                error_message
+            ) ||
+            !set_python_dict_item(item, "source", unicode_from_utf8("native"), error_message)) {
+            Py_XDECREF(item);
+            Py_DECREF(list);
+            Py_DECREF(counts);
+            Py_DECREF(result);
+            return nullptr;
+        }
+
+        if (PyList_Append(list, item) != 0) {
+            Py_DECREF(item);
+            Py_DECREF(list);
+            Py_DECREF(counts);
+            Py_DECREF(result);
+            if (error_message != nullptr) {
+                *error_message = fetch_python_error();
+            }
+            return nullptr;
+        }
+        Py_DECREF(item);
+    }
+
+    if (!set_python_dict_item(counts, "entities", PyLong_FromSize_t(graph.entity_count()), error_message) ||
+        !set_python_dict_item(counts, "triples", PyLong_FromSize_t(graph.triple_count()), error_message) ||
+        !set_python_dict_item(result, "triples", list, error_message) ||
+        !set_python_dict_item(result, "counts", counts, error_message) ||
+        !set_python_dict_item(
+            result,
+            "staged",
+            PyBool_FromLong(!view->pending_knowledge_graph_patch.empty()),
+            error_message
+        )) {
+        Py_DECREF(result);
+        return nullptr;
+    }
+    list = nullptr;
+    counts = nullptr;
+
+    return result;
 }
 
 bool runtime_stage_task_write(PyObject* capsule, PyObject* spec, std::string* error_message) {
