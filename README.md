@@ -5,7 +5,8 @@
   <h3>Native agent graphs for fast, inspectable, long-running workflows.</h3>
   <p>
     AgentCore is a C++20 agent-graph runtime with a compact Python API for stateful workflows,
-    persistent subgraphs, structured memory, replay, MCP interoperability, and OpenTelemetry.
+    persistent subgraphs, structured memory, graph-store hydration, replay, MCP interoperability,
+    and OpenTelemetry.
   </p>
   <p>
     <a href="https://pypi.org/project/agentcore-graph/"><img alt="PyPI version" src="https://img.shields.io/pypi/v/agentcore-graph"></a>
@@ -46,7 +47,7 @@ AgentCore is an independent project. It is not affiliated with Amazon Web Servic
   </tr>
   <tr>
     <td><strong>Integrate with tools</strong></td>
-    <td>See <a href="./docs/integrations/mcp.md">MCP</a>, <a href="./docs/integrations/opentelemetry.md">OpenTelemetry</a>, and the <a href="./docs/reference/api.md">API reference</a>.</td>
+    <td>See <a href="./docs/integrations/mcp.md">MCP</a>, <a href="./docs/integrations/graph-stores.md">graph stores</a>, <a href="./docs/integrations/opentelemetry.md">OpenTelemetry</a>, and the <a href="./docs/reference/api.md">API reference</a>.</td>
   </tr>
   <tr>
     <td><strong>Validate performance</strong></td>
@@ -86,6 +87,12 @@ For OpenTelemetry dependencies:
 
 ```bash
 python3 -m pip install "agentcore-graph[otel]"
+```
+
+For optional Neo4j graph-store support:
+
+```bash
+python3 -m pip install "agentcore-graph[neo4j]"
 ```
 
 The package also installs MCP helper commands:
@@ -143,6 +150,7 @@ AgentCore currently includes:
 - structured intelligence state for tasks, claims, evidence, decisions, and memories
 - graph-native context assembly from messages, intelligence records, native knowledge-graph triples, and state fields
 - knowledge-graph-backed state and reactive execution hooks
+- external graph-store hydration with an in-memory reference backend and optional Neo4j adapter
 - deterministic memoization for supported pure nodes
 - prompt templates for text, chat, and MCP-rendered prompts
 - tool and model registries with built-in HTTP JSON, SQLite-style, local model, OpenAI-compatible, xAI Grok, and Gemini adapters
@@ -238,6 +246,42 @@ def analyze(state, config, runtime):
 
 See the [runtime model](./docs/concepts/runtime-model.md#intelligence-state) and [Python guide](./docs/quickstarts/python.md#use-the-intelligence-state-model).
 
+### External Graph Stores
+
+Native knowledge-graph state is useful during execution because it participates in patches, checkpoints, context assembly, and replay. When the source of truth lives elsewhere, AgentCore lets a node explicitly hydrate runtime knowledge from a registered graph store, then optionally sync selected runtime triples back out.
+
+```python
+from agentcore.graph import END, START, StateGraph
+
+
+def retrieve(state, config, runtime):
+    loaded = runtime.knowledge.load_neighborhood(
+        "Incident",
+        store="ops_graph",
+        depth=2,
+        limit=20,
+    )
+    return {"loaded_triples": len(loaded["triples"])}
+
+
+graph = StateGraph(dict, name="ops_graph_demo")
+graph.add_node("retrieve", retrieve)
+graph.add_edge(START, "retrieve")
+graph.add_edge("retrieve", END)
+
+compiled = graph.compile()
+compiled.graph_stores.register_memory(
+    "ops_graph",
+    triples=[("Incident", "affects", "checkout API")],
+)
+```
+
+The first shipped backends are `InMemoryGraphStore` and `Neo4jGraphStore`. The connector contract is intentionally entity/triple/neighborhood based so other graph databases can implement the same surface without changing the runtime.
+
+The Neo4j adapter has an optional live Docker validation path in addition to the default dependency-free graph-store smoke test. That path exercises batch writes, neighborhood reads, filtered queries, runtime hydration, context assembly, and sync-back persistence against a real Neo4j process.
+
+See the [graph-store integration guide](./docs/integrations/graph-stores.md), [Python guide](./docs/quickstarts/python.md#hydrate-knowledge-from-an-external-graph-store), and [runtime model](./docs/concepts/runtime-model.md#external-graph-stores).
+
 ### MCP Interoperability
 
 AgentCore can consume MCP servers and expose AgentCore-owned tools, prompts, resources, and graph surfaces through MCP.
@@ -331,6 +375,7 @@ The main docs index is [docs/README.md](./docs/README.md).
 | Runtime semantics | [docs/concepts/runtime-model.md](./docs/concepts/runtime-model.md) |
 | Python and C++ API surface | [docs/reference/api.md](./docs/reference/api.md) |
 | MCP integration | [docs/integrations/mcp.md](./docs/integrations/mcp.md) |
+| Graph stores | [docs/integrations/graph-stores.md](./docs/integrations/graph-stores.md) |
 | OpenTelemetry | [docs/integrations/opentelemetry.md](./docs/integrations/opentelemetry.md) |
 | Migration notes | [docs/migration/langgraph-to-agentcore.md](./docs/migration/langgraph-to-agentcore.md) |
 | Validation and benchmarks | [docs/operations/validation.md](./docs/operations/validation.md) |

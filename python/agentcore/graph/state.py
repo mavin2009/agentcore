@@ -24,6 +24,7 @@ from ..adapters.registry import (
     _raise_adapter_error,
     encode_adapter_payload,
 )
+from ..graphstores import GraphNeighborhood, GraphStoreRegistryView
 from ..prompts.templates import _coerce_prompt_value_for_model_input
 from .. import _agentcore_native as _native
 
@@ -1135,6 +1136,109 @@ class KnowledgeView:
             limit=limit,
         )
 
+    def load_query(
+        self,
+        *,
+        store: str,
+        subject: str | None = None,
+        relation: str | None = None,
+        object: str | None = None,
+        direction: str = "match",
+        depth: int = 1,
+        limit: int | None = None,
+        properties: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        graph_store = self._runtime_context.graph_stores.get(store)
+        result = graph_store.query(
+            subject=subject,
+            relation=relation,
+            object=object,
+            direction=direction,
+            depth=depth,
+            limit=limit,
+            properties=properties,
+        )
+        neighborhood = _coerce_graph_neighborhood(result)
+        self._hydrate_from_neighborhood(neighborhood)
+        return neighborhood.to_dict()
+
+    def load_neighborhood(
+        self,
+        entity: str | None = None,
+        *,
+        store: str,
+        subject: str | None = None,
+        relation: str | None = None,
+        depth: int = 1,
+        limit: int | None = None,
+        properties: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        target = subject if subject is not None else entity
+        if target is None:
+            raise ValueError("load_neighborhood requires entity or subject")
+        graph_store = self._runtime_context.graph_stores.get(store)
+        result = graph_store.neighborhood(
+            str(target),
+            relation=relation,
+            depth=depth,
+            limit=limit,
+            properties=properties,
+        )
+        neighborhood = _coerce_graph_neighborhood(result)
+        self._hydrate_from_neighborhood(neighborhood)
+        return neighborhood.to_dict()
+
+    def sync_to_store(
+        self,
+        store: str,
+        *,
+        subject: str | None = None,
+        relation: str | None = None,
+        object: str | None = None,
+        direction: str = "match",
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        graph_store = self._runtime_context.graph_stores.get(store)
+        result = self.query(
+            subject=subject,
+            relation=relation,
+            object=object,
+            direction=direction,
+            limit=limit,
+        )
+        triples = list(result.get("triples", []))
+        written = graph_store.upsert_triples(triples)
+        return {
+            "store": str(store),
+            "triples": int(written),
+            "source": "native",
+        }
+
+    def _hydrate_from_neighborhood(self, neighborhood: GraphNeighborhood) -> None:
+        for entity in neighborhood.entities:
+            self.upsert_entity(entity.label, payload=entity.payload)
+        for triple in neighborhood.triples:
+            self.upsert_triple(
+                triple.subject,
+                triple.relation,
+                triple.object,
+                payload=triple.payload,
+            )
+
+
+def _coerce_graph_neighborhood(value: Any) -> GraphNeighborhood:
+    if isinstance(value, GraphNeighborhood):
+        return value
+    if isinstance(value, Mapping):
+        return GraphNeighborhood(
+            entities=tuple(value.get("entities", ())),
+            triples=tuple(value.get("triples", ())),
+            store=value.get("store"),
+            subject=value.get("subject"),
+            metadata=dict(value.get("metadata", {})) if hasattr(value.get("metadata", {}), "items") else {},
+        )
+    raise TypeError("graph store query methods must return GraphNeighborhood or mapping values")
+
 
 class RuntimeContext:
     def __init__(self, native_runtime: Any | None):
@@ -1142,6 +1246,7 @@ class RuntimeContext:
         self._intelligence = IntelligenceView(self)
         self._knowledge = KnowledgeView(self)
         self._context = ContextAccessor(self)
+        self._graph_stores: GraphStoreRegistryView | None = None
 
     @property
     def available(self) -> bool:
@@ -1181,6 +1286,15 @@ class RuntimeContext:
     @property
     def context(self) -> ContextAccessor:
         return self._context
+
+    @property
+    def graph_stores(self) -> GraphStoreRegistryView:
+        if self._graph_stores is None:
+            raise RuntimeError("graph stores are not available for this runtime context")
+        return self._graph_stores
+
+    def _bind_graph_stores(self, graph_stores: GraphStoreRegistryView) -> None:
+        self._graph_stores = graph_stores
 
     def _bind_context(
         self,
@@ -2016,6 +2130,7 @@ class StateGraph:
             name_override=_normalize_compile_name(name),
             subgraph_cache={},
             compile_stack=set(),
+            graph_store_registry=None,
         )
 
     def _compile_internal(
@@ -2025,6 +2140,7 @@ class StateGraph:
         name_override: str | None = None,
         subgraph_cache: dict[int, "CompiledStateGraph"],
         compile_stack: set[int],
+        graph_store_registry: GraphStoreRegistryView | None,
     ) -> "CompiledStateGraph":
         graph_identity = id(self)
         if graph_identity in compile_stack:
@@ -2036,6 +2152,7 @@ class StateGraph:
                 name=self._name if name_override is None else name_override,
                 worker_count=worker_count,
             )
+            graph_store_registry = graph_store_registry or GraphStoreRegistryView()
             owned_subgraphs: list[CompiledStateGraph] = []
             owned_subgraph_ids: set[int] = set()
 
@@ -2051,6 +2168,7 @@ class StateGraph:
                         node_spec.subgraph.graph,
                         subgraph_cache=subgraph_cache,
                         compile_stack=compile_stack,
+                        graph_store_registry=graph_store_registry,
                     )
                     if id(compiled_subgraph) not in owned_subgraph_ids:
                         owned_subgraphs.append(compiled_subgraph)
@@ -2069,7 +2187,11 @@ class StateGraph:
                     )
                     continue
 
-                callback = self._build_callback(node_name) if self._needs_python_callback(node_name) else None
+                callback = (
+                    self._build_callback(node_name, graph_store_registry)
+                    if self._needs_python_callback(node_name)
+                    else None
+                )
                 _native._add_node(
                     native_graph,
                     node_name,
@@ -2098,6 +2220,7 @@ class StateGraph:
                 self._name if name_override is None else name_override,
                 state_schema=self._state_schema,
                 owned_subgraphs=owned_subgraphs,
+                graph_stores=graph_store_registry,
             )
         finally:
             compile_stack.remove(graph_identity)
@@ -2108,6 +2231,7 @@ class StateGraph:
         *,
         subgraph_cache: dict[int, "CompiledStateGraph"],
         compile_stack: set[int],
+        graph_store_registry: GraphStoreRegistryView,
     ) -> "CompiledStateGraph":
         if isinstance(graph, CompiledStateGraph):
             return graph
@@ -2122,6 +2246,7 @@ class StateGraph:
             name_override=None,
             subgraph_cache=subgraph_cache,
             compile_stack=compile_stack,
+            graph_store_registry=graph_store_registry,
         )
         subgraph_cache[cache_key] = compiled
         return compiled
@@ -2181,7 +2306,7 @@ class StateGraph:
         self.add_node(inferred_name, entry)
         return inferred_name
 
-    def _build_callback(self, node_name: str):
+    def _build_callback(self, node_name: str, graph_store_registry: GraphStoreRegistryView):
         node_spec = self._nodes[node_name]
         node_action = node_spec.action
         routing_spec = self._conditional_edges.get(node_name)
@@ -2194,6 +2319,7 @@ class StateGraph:
 
         def wrapped(state: Any, config: Any = None) -> Any:
             normalized_config, runtime = _extract_runtime_and_config(config)
+            runtime._bind_graph_stores(graph_store_registry)
             state_view = _StateView(state)
             runtime._bind_context(
                 spec=node_spec.context,
@@ -2257,6 +2383,7 @@ class CompiledStateGraph:
         *,
         state_schema: Any | None = None,
         owned_subgraphs: Sequence["CompiledStateGraph"] | None = None,
+        graph_stores: GraphStoreRegistryView | None = None,
     ):
         self._native_graph = native_graph
         self._name = name
@@ -2264,6 +2391,7 @@ class CompiledStateGraph:
         self._owned_subgraphs = list(owned_subgraphs or [])
         self._tool_registry_view = ToolRegistryView(native_graph)
         self._model_registry_view = ModelRegistryView(native_graph)
+        self._graph_store_registry_view = graph_stores or GraphStoreRegistryView()
 
     @property
     def name(self) -> str:
@@ -2276,6 +2404,10 @@ class CompiledStateGraph:
     @property
     def models(self) -> ModelRegistryView:
         return self._model_registry_view
+
+    @property
+    def graph_stores(self) -> GraphStoreRegistryView:
+        return self._graph_store_registry_view
 
     def invoke(
         self,

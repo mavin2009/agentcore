@@ -17,6 +17,19 @@ from .graph import (
     StateGraph,
     add_messages,
 )
+from .graphstores import (
+    GraphEntity,
+    GraphNeighborhood,
+    GraphQuery,
+    GraphStore,
+    GraphStoreCapabilities,
+    GraphStoreError,
+    GraphStoreRegistryView,
+    GraphStoreUnavailableError,
+    GraphTriple,
+    InMemoryGraphStore,
+    Neo4jGraphStore,
+)
 from . import mcp as mcp
 from . import observability as observability
 from .observability import OpenTelemetryObserver
@@ -38,6 +51,16 @@ __all__ = [
     "ContextSpec",
     "ContextView",
     "END",
+    "GraphEntity",
+    "GraphNeighborhood",
+    "GraphQuery",
+    "GraphStore",
+    "GraphStoreCapabilities",
+    "GraphStoreError",
+    "GraphStoreRegistryView",
+    "GraphStoreUnavailableError",
+    "GraphTriple",
+    "InMemoryGraphStore",
     "IntelligenceRouter",
     "IntelligenceRule",
     "IntelligenceSubscription",
@@ -46,6 +69,7 @@ __all__ = [
     "MessageTemplate",
     "MessagesState",
     "ModelRegistryView",
+    "Neo4jGraphStore",
     "OpenTelemetryObserver",
     "PipelineGraph",
     "PipelineStep",

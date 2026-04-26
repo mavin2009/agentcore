@@ -1,6 +1,6 @@
 # Python Quickstart
 
-This guide gets you from an empty Python file to a running AgentCore graph, then shows the features most agent workflows usually need next: reducers, message state, prompt templates, MCP tools, telemetry, structured intelligence state, subgraphs, and pause/resume.
+This guide gets you from an empty Python file to a running AgentCore graph, then shows the features most agent workflows usually need next: reducers, message state, prompt templates, MCP tools, telemetry, structured intelligence state, external graph-store hydration, subgraphs, and pause/resume.
 
 The Python API is a compact builder layered over the native runtime. You define the graph in Python, while execution, scheduling, patch application, streaming, and subgraph runtime stay in C++.
 
@@ -325,6 +325,93 @@ Common selectors:
 - `knowledge.neighborhood` for native `runtime.knowledge` triples, with graph-shaped state under `knowledge_graph`, `knowledge`, or `triples` kept as a fallback
 
 `ContextView.to_prompt(...)` returns text. `ContextView.to_messages(...)` returns chat-style messages. `ContextView.to_model_input(mode="text" | "messages" | "dict")` is the compact adapter-facing form.
+
+## Hydrate Knowledge From An External Graph Store
+
+AgentCore has native knowledge-graph state for execution-time triples, but many teams already keep graph data in a database. The graph-store layer is the explicit bridge: register a store on the compiled graph, hydrate the triples a node needs into `runtime.knowledge`, and then context assembly, checkpoints, subgraphs, and replay see those triples as normal runtime state.
+
+The reference backend is in-memory and deterministic, which makes it useful for tests and examples:
+
+```python
+from agentcore.graph import ContextSpec, END, START, StateGraph
+
+
+def load_ops_graph(state, config, runtime):
+    loaded = runtime.knowledge.load_neighborhood(
+        "Incident",
+        store="ops_graph",
+        depth=2,
+        limit=20,
+    )
+    return {"loaded_triples": len(loaded["triples"])}
+
+
+def answer(state, config, runtime):
+    prompt = runtime.context.view().to_prompt(system="Use cited operational graph facts.")
+    return {"prompt": prompt}
+
+
+graph = StateGraph(dict, name="graph_store_demo")
+graph.add_node("load", load_ops_graph)
+graph.add_node(
+    "answer",
+    answer,
+    context=ContextSpec(
+        goal_key="question",
+        include=["knowledge.neighborhood", "state.loaded_triples"],
+        subject="Incident",
+        require_citations=True,
+    ),
+)
+graph.add_edge(START, "load")
+graph.add_edge("load", "answer")
+graph.add_edge("answer", END)
+
+compiled = graph.compile()
+compiled.graph_stores.register_memory(
+    "ops_graph",
+    triples=[
+        ("Incident", "affects", "checkout API"),
+        ("checkout API", "depends_on", "payment service"),
+    ],
+)
+
+result = compiled.invoke({"question": "What is affected?"})
+```
+
+For Neo4j, install the optional dependency and register the adapter:
+
+```bash
+python3 -m pip install "agentcore-graph[neo4j]"
+```
+
+```python
+compiled.graph_stores.register_neo4j(
+    "ops_graph",
+    uri="bolt://localhost:7687",
+    auth=("neo4j", "password"),
+)
+```
+
+`Neo4jGraphStore.from_env(...)` also understands `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`, and `NEO4J_DATABASE` through `compiled.graph_stores.register_neo4j("ops_graph", from_env=True)`.
+
+The Neo4j adapter stores entities with a generic `AgentCoreEntity` label and stores arbitrary relation names as a relationship property on `AGENTCORE_RELATION`. That is a deliberate safety and portability choice: user relation names are data, not interpolated Cypher relationship types.
+
+If a node creates new runtime triples that should be reflected in the external store, sync them explicitly:
+
+```python
+def write_back(state, config, runtime):
+    runtime.knowledge.upsert_triple("Incident", "mitigated_by", "rollback")
+    synced = runtime.knowledge.sync_to_store(
+        "ops_graph",
+        subject="Incident",
+        direction="outgoing",
+        limit=20,
+    )
+    return {"synced_triples": synced["triples"]}
+```
+
+This explicit load/sync boundary is important. External graph databases are integration state; runtime knowledge becomes deterministic AgentCore state only after a node hydrates it through `runtime.knowledge`.
 
 ## Bridge MCP Servers
 

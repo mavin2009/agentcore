@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(agentcore VERSION 0.1.10 LANGUAGES CXX)
+project(agentcore VERSION 0.1.11 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -429,6 +429,18 @@ if(BUILD_TESTING)
         )
         set_tests_properties(
             agentcore_python_real_world_pipeline
+            PROPERTIES
+                ENVIRONMENT "PYTHONPATH=${AGENTCORE_PYTHON_BUILD_ROOT}"
+        )
+
+        add_test(
+            NAME agentcore_python_graph_store_pipeline
+            COMMAND
+                ${Python3_EXECUTABLE}
+                "${CMAKE_CURRENT_SOURCE_DIR}/python/tests/graph_store_pipeline_test.py"
+        )
+        set_tests_properties(
+            agentcore_python_graph_store_pipeline
             PROPERTIES
                 ENVIRONMENT "PYTHONPATH=${AGENTCORE_PYTHON_BUILD_ROOT}"
         )

@@ -319,6 +319,28 @@ This is what allows graph-aware workflows to participate in the same trace, chec
 
 The reference example for this path is [`../../agentcore/examples/knowledge_graph_workflow.cpp`](../../agentcore/examples/knowledge_graph_workflow.cpp).
 
+## External Graph Stores
+
+External graph databases sit outside the deterministic runtime state model until a node explicitly loads data from them. The Python graph-store layer provides that bridge without making the execution engine depend on a specific database or query language.
+
+The boundary is:
+
+- `compiled.graph_stores` owns named store adapters for a compiled graph
+- `runtime.graph_stores` exposes that same registry inside node callbacks
+- `runtime.knowledge.load_query(...)` and `runtime.knowledge.load_neighborhood(...)` read a store and stage the returned entities/triples into native runtime knowledge
+- `runtime.knowledge.sync_to_store(...)` writes selected native runtime triples back to the named store
+
+Once hydrated, those triples are ordinary runtime knowledge writes. They participate in the same patch commit, checkpoint, context assembly, subgraph propagation, stream metadata, and replay behavior as triples written directly by a node.
+
+The first backends are:
+
+- `InMemoryGraphStore`, a deterministic reference adapter used by tests and examples
+- `Neo4jGraphStore`, an optional adapter backed by the official Neo4j Python driver
+
+The connector contract uses entities, triples, and neighborhoods instead of Cypher-specific concepts. Neo4j stores domain relation names as a property on a generic `AGENTCORE_RELATION` relationship rather than interpolating them into relationship types. That keeps relation names safe to parameterize and leaves room for other graph databases to implement the same AgentCore contract.
+
+This explicit boundary is also a replay boundary. If a workflow needs replay to be independent of live external data, hydrate through a node whose input/versioning policy is controlled by the application, or record the external result through the same state and checkpoint path used for other runtime knowledge.
+
 ## Traces, Checkpoints, And Proofs
 
 The runtime records three related but distinct artifacts:

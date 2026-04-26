@@ -219,6 +219,7 @@ Registry properties:
 
 - `compiled.tools`
 - `compiled.models`
+- `compiled.graph_stores`
 
 ### `agentcore.patterns`
 
@@ -442,6 +443,7 @@ Current surface:
 - `runtime.available`
 - `runtime.intelligence`
 - `runtime.knowledge`
+- `runtime.graph_stores`
 - `runtime.context`
 - `runtime.snapshot_intelligence()`
 - `runtime.upsert_knowledge_entity(label, *, payload=None)`
@@ -488,8 +490,15 @@ Current surface:
 - `runtime.knowledge.upsert_triple(subject, relation, object, *, payload=None)`
 - `runtime.knowledge.query(subject=None, relation=None, object=None, direction="match", limit=None)`
 - `runtime.knowledge.neighborhood(entity, *, relation=None, limit=None)`
+- `runtime.knowledge.load_query(store, subject=None, relation=None, object=None, direction="match", depth=1, limit=None, properties=None)`
+- `runtime.knowledge.load_neighborhood(entity=None, *, store, subject=None, relation=None, depth=1, limit=None, properties=None)`
+- `runtime.knowledge.sync_to_store(store, *, subject=None, relation=None, object=None, direction="match", limit=None)`
 
 `query(...)` returns `{"triples": [...], "counts": {"entities": n, "triples": n}, "staged": bool}`. `direction="match"` applies exact filters, `direction="incoming"` treats `subject` as the target entity when no `object` is supplied, and `direction="neighborhood"`/`"both"` returns outgoing plus incoming triples around `subject`.
+
+`load_query(...)` and `load_neighborhood(...)` read from a registered external graph store, stage the returned entities/triples into native runtime knowledge, and return a dictionary with `entities`, `triples`, optional `store`, optional `subject`, and optional `metadata`. `sync_to_store(...)` queries native runtime knowledge and writes the selected triples into the named external store.
+
+`runtime.graph_stores` is the same graph-owned registry exposed as `compiled.graph_stores`, bound into the callback for convenient access to metadata or custom store methods.
 
 Routing helpers:
 
@@ -536,9 +545,9 @@ Each list entry carries a stable numeric `id`, a string `key`, and the currently
 
 The `producer` callable is invoked only when no previously committed recorded effect exists for the same key and request payload inside the active run.
 
-### `ToolRegistryView` And `ModelRegistryView`
+### `ToolRegistryView`, `ModelRegistryView`, And `GraphStoreRegistryView`
 
-`CompiledStateGraph` exposes graph-owned native registries through `.tools` and `.models`.
+`CompiledStateGraph` exposes graph-owned native registries through `.tools`, `.models`, and `.graph_stores`.
 
 `ToolRegistryView` methods:
 
@@ -584,6 +593,28 @@ Model invocation details also include:
 Custom Python-backed registry handlers are still registered into the native graph-owned registries rather than a Python-only side table. That keeps direct invocation, runtime invocation through `RuntimeContext`, adapter discovery, and subgraph inheritance on the same native registry path.
 
 `register_mcp_stdio(...)` mirrors tools from an external MCP server over `stdio` into the graph-owned tool registry. Imported tools are normal AgentCore tools after registration, so graph nodes still call them through `runtime.invoke_tool(...)`.
+
+`GraphStoreRegistryView` methods:
+
+- `list()`
+- `get(name)`
+- `register(name, store)`
+- `register_memory(name="memory", *, entities=None, triples=None)`
+- `register_neo4j(name="neo4j", *, uri=None, auth=None, database=None, driver=None, from_env=False)`
+- `remove(name, *, close=False)`
+- `close_all()`
+
+Graph-store value types live under `agentcore.graphstores`:
+
+- `GraphEntity(label, payload=None, properties=None)`
+- `GraphTriple(subject, relation, object, payload=None, properties=None)`
+- `GraphNeighborhood(entities=(), triples=(), store=None, subject=None, metadata=None)`
+- `GraphQuery(subject=None, relation=None, object=None, direction="match", depth=1, limit=None, properties=None)`
+- `GraphStore`
+- `InMemoryGraphStore`
+- `Neo4jGraphStore`
+
+`InMemoryGraphStore` is deterministic and useful for tests. `Neo4jGraphStore` requires the optional `neo4j` Python driver, available through `pip install "agentcore-graph[neo4j]"`. The Neo4j adapter uses a generic `AgentCoreEntity` node label and generic `AGENTCORE_RELATION` relationship type, storing the domain relation name as data. That keeps arbitrary relation names parameterized instead of interpolated into Cypher.
 
 ### `agentcore.mcp`
 

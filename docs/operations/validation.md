@@ -69,6 +69,32 @@ PYTHONPATH=./build/python python3 ./python/tests/mcp_launcher_smoke.py
 PYTHONPATH=./build/python python3 ./python/tests/opentelemetry_smoke.py
 PYTHONPATH=./build/python python3 ./python/tests/context_state_smoke.py
 PYTHONPATH=./build/python python3 ./python/tests/real_world_pipeline_test.py
+PYTHONPATH=./build/python python3 ./python/tests/graph_store_pipeline_test.py
+```
+
+For a real Neo4j adapter validation pass, run Neo4j in Docker and execute the optional integration test. This is the recommended release-candidate check for graph-store changes because it exercises the actual driver and Bolt protocol:
+
+```bash
+python3 -m pip install "agentcore-graph[neo4j]"
+
+name="agentcore-neo4j-test"
+password="agentcore-test-password"
+cleanup() { docker rm -f "$name" >/dev/null 2>&1 || true; }
+trap cleanup EXIT
+
+docker rm -f "$name" >/dev/null 2>&1 || true
+docker run -d --rm --name "$name" \
+  -p 127.0.0.1::7687 \
+  -e NEO4J_AUTH="neo4j/$password" \
+  neo4j:5-community
+port="$(docker port "$name" 7687/tcp | sed -E 's/.*:([0-9]+)$/\1/')"
+
+AGENTCORE_REQUIRE_NEO4J=1 \
+AGENTCORE_NEO4J_URI="bolt://127.0.0.1:$port" \
+AGENTCORE_NEO4J_USER=neo4j \
+AGENTCORE_NEO4J_PASSWORD="$password" \
+PYTHONPATH=./build/python \
+python3 ./python/tests/neo4j_graph_store_integration_test.py
 ```
 
 What they cover:
@@ -80,6 +106,8 @@ What they cover:
 - metadata and streaming surfaces
 - graph-native context assembly, native knowledge-graph context reads, context digests, provenance, conflict metadata, and stream decoration
 - an end-to-end incident-style pipeline with retrieval, native knowledge graph writes, persistent specialist subgraphs, context assembly, model invocation, stream metadata, and explicit parent/child knowledge-graph boundaries
+- external graph-store hydration into native knowledge, context use of hydrated triples, explicit sync back to the store, and Neo4j adapter relation-parameterization safety
+- optional live Neo4j validation for batch writes, neighborhood traversal, filtered query, runtime hydration, context assembly, and sync-back persistence
 - Python runtime helper injection and recorded-effect replay
 - Python adapter registration, discovery, direct invocation, and runtime invocation
 - MCP stdio client handshake, tool discovery, tool calls, prompt retrieval, resource reads, completions, roots, sampling, elicitation, logging control, subscriptions, notifications, and registry mirroring
@@ -118,6 +146,7 @@ PYTHONPATH=/tmp/agentcore-wheel-test python3 ./python/tests/mcp_launcher_smoke.p
 PYTHONPATH=/tmp/agentcore-wheel-test python3 ./python/tests/opentelemetry_smoke.py
 PYTHONPATH=/tmp/agentcore-wheel-test python3 ./python/tests/context_state_smoke.py
 PYTHONPATH=/tmp/agentcore-wheel-test python3 ./python/tests/real_world_pipeline_test.py
+PYTHONPATH=/tmp/agentcore-wheel-test python3 ./python/tests/graph_store_pipeline_test.py
 ```
 
 That path proves the installed wheel, not the build tree, still supports:
@@ -130,6 +159,7 @@ That path proves the installed wheel, not the build tree, still supports:
 - OpenTelemetry observer integration over the installed wheel
 - context assembly and context metadata over the installed wheel
 - real-world style retrieval, specialist, context, model, and stream pipeline behavior over the installed wheel
+- external graph-store hydration and sync over the installed wheel
 - multi-agent and subgraph flows
 - higher-level pipeline and specialist-team builders
 - persistent-session reuse and resume
