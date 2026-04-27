@@ -26,7 +26,7 @@
 
 AgentCore is designed for graph-shaped agent systems where latency, durability, and state visibility matter at the same time. The runtime keeps graph execution native, makes state mutation explicit through patches, and records checkpoints and traces from the same execution path used by normal runs.
 
-The Python surface is intentionally familiar: define a `StateGraph`, add nodes and edges, compile it, and invoke it. The difference is underneath. Graph metadata, state commits, scheduling, checkpointing, message merging, persistent subgraph sessions, and supported intelligence queries run through the native runtime instead of being rebuilt in Python at each step.
+The Python surface is intentionally familiar: define a `StateGraph`, add nodes and edges, compile it, and invoke it. The difference is underneath. Graph metadata, state commits, scheduling, checkpointing, message merging, persistent subgraph sessions, knowledge-graph reads, and supported intelligence/context queries run through the native runtime instead of being rebuilt in Python at each step.
 
 AgentCore is an independent project. It is not affiliated with Amazon Web Services, AWS AgentCore, or any related AWS-branded product or service.
 
@@ -148,7 +148,7 @@ AgentCore currently includes:
 - checkpointing, trace events, proof digests, and replay-oriented metadata
 - persistent subgraph sessions with isolated child state and deterministic session revisions
 - structured intelligence state for tasks, claims, evidence, decisions, and memories
-- graph-native context assembly from messages, intelligence records, native knowledge-graph triples, and state fields
+- graph-native context assembly from messages, intelligence records, native knowledge-graph triples, and state fields, with a native context-graph ranking path for intelligence and knowledge selectors
 - knowledge-graph-backed state and reactive execution hooks
 - external graph-store hydration with an in-memory reference backend and optional Neo4j adapter
 - deterministic memoization for supported pure nodes
@@ -185,7 +185,9 @@ See the [runtime model](./docs/concepts/runtime-model.md#persistent-session-life
 
 ### Context Assembly
 
-Nodes can declare a `ContextSpec` and then call `runtime.context.view()` to assemble a deterministic context view from message history, intelligence records, native knowledge-graph triples, selected state fields, and optional graph-shaped state carried by the workflow. The returned `ContextView` includes citations, provenance, budget stats, conflict metadata, prompt/message rendering helpers, and a stable digest that is surfaced through `invoke_with_metadata(...)`.
+Nodes can declare a `ContextSpec` and then call `runtime.context.view()` to assemble a deterministic context view from message history, intelligence records, native knowledge-graph triples, selected state fields, and optional graph-shaped state carried by the workflow. For intelligence and knowledge selectors, AgentCore compiles the request into a native context-graph query plan, ranks connected task/claim/evidence/decision/memory/triple records with deterministic activation scoring, and returns a kind-balanced top-k. The Python context graph remains as a compatibility fallback and as the final merge layer when a view also includes message or arbitrary state selectors.
+
+The returned `ContextView` includes citations, provenance, budget stats, conflict metadata, prompt/message rendering helpers, and a stable digest that is surfaced through `invoke_with_metadata(...)`.
 
 ```python
 from agentcore.graph import ContextSpec
@@ -319,9 +321,11 @@ See the [OpenTelemetry guide](./docs/integrations/opentelemetry.md).
 
 ## Performance
 
-AgentCore's performance work is focused on native graph execution, branch/join overhead, persistent subgraph sessions, resume behavior, and structured state operations. Current benchmark snapshots and exact reproduction commands live in [the comparison document](./docs/comparisons/langgraph-head-to-head.md).
+AgentCore's performance work is focused on native graph execution, branch/join overhead, persistent subgraph sessions, resume behavior, context retrieval, and structured state operations. Current benchmark snapshots and exact reproduction commands live in [the comparison document](./docs/comparisons/langgraph-head-to-head.md) and [the validation guide](./docs/operations/validation.md).
 
 The latest snapshot in this repository was generated on April 22, 2026. On that machine and workload set, AgentCore's compatibility surface was about `2.22x` to `3.01x` faster on the same-code builder path, while native persistent-session workloads were about `2.50x` to `13.11x` faster with lower measured memory use. Treat those as workload-specific measurements, not universal claims.
+
+The native context graph path is tracked separately because it is not a direct head-to-head framework benchmark. In the current Release validation run, the native C++ context graph benchmark selected 24 records from a 1,024-record intelligence/knowledge workload with `context_graph_cold_rank_ns=454200` and cached warm selection at `context_graph_warm_rank_avg_ns=52`. Through the Python API benchmark, `runtime.context.view()` measured `567840 ns` warm average on the native-backed path, while the retained Python graph-ranker path measured `9231312 ns` on the same benchmark selector set.
 
 For local validation, start with:
 

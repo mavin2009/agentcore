@@ -145,7 +145,10 @@ private:
 
     using TripleIndex = std::unordered_map<uint32_t, std::vector<KnowledgeTripleId>>;
 
+    struct ReasoningIndex;
+
     void ensure_unique();
+    [[nodiscard]] const ReasoningIndex& reasoning_index() const;
     [[nodiscard]] KnowledgeEntityId resolve_or_create_entity(InternedStringId label);
     [[nodiscard]] std::vector<const KnowledgeTriple*> select_candidate_set(
         std::optional<KnowledgeEntityId> subject,

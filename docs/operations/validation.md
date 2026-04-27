@@ -104,7 +104,7 @@ What they cover:
 - deterministic node cache invalidation when declared inputs change
 - async Python node callbacks
 - metadata and streaming surfaces
-- graph-native context assembly, native knowledge-graph context reads, context digests, provenance, conflict metadata, and stream decoration
+- graph-native context assembly, native context-graph ranking for intelligence/knowledge selectors, native knowledge-graph context reads, context digests, provenance, conflict metadata, Python fallback behavior, and stream decoration
 - an end-to-end incident-style pipeline with retrieval, native knowledge graph writes, persistent specialist subgraphs, context assembly, model invocation, stream metadata, and explicit parent/child knowledge-graph boundaries
 - external graph-store hydration into native knowledge, context use of hydrated triples, explicit sync back to the store, and Neo4j adapter relation-parameterization safety
 - optional live Neo4j validation for batch writes, neighborhood traversal, filtered query, runtime hydration, context assembly, and sync-back persistence
@@ -241,11 +241,13 @@ For native numbers, do not compare unspecified build types against `Release`. Th
 The current benchmark surfaces include:
 
 - native scheduler, routing, checkpoint, subgraph, and knowledge-frontier benchmarks
+- native context-graph cold/warm ranking over intelligence records plus knowledge triples, including selected claim/evidence/knowledge invariants
 - native intelligence-query/index regression counters for task lookup, claim-semantic lookup, ranked supporting-claims retrieval, ranked action-candidate retrieval, ranked task agenda, ranked memory recall, bounded focus-set retrieval, first-hop and multi-hop related-record expansion, route selection, and top-match invariants for focused task/claim/memory ranking
 - native persistent-session fan-out and resume determinism benchmarks
 - native deterministic-node memoization hit/invalidation benchmark with executor-invocation counters
 - native recorded-effect hit/miss cost for the task-journal seam
 - Python graph invocation cost
+- Python context assembly with native-backed `runtime.context.view()` timing and retained Python graph-ranker comparison timing
 - Python deterministic-node memoization hit/invalidation benchmark through the graph API binding layer
 - Python recorded-effect replay and miss cost through the binding layer
 - Python persistent-session fan-out, streamed session metadata, and pause/resume state validation
@@ -274,6 +276,27 @@ The deterministic memoization benchmark is the structural regression gate for th
 - executor invocations collapsing from the configured visit count to a single real node execution on stable declared inputs
 - executor invocations remaining at the visit count when a declared read key changes between visits
 - trace-event counts remaining fixed across baseline, stable-input, and invalidating variants so the benchmark measures skipped compute rather than altered control flow
+
+The context-graph benchmark is the structural regression gate for native context retrieval. It checks:
+
+- the native ranker selects from tasks, claims, evidence, decisions, memories, and knowledge triples without changing the public `ContextView` shape
+- motif-aware scoring prefers supported claim/evidence/decision/memory/knowledge structures without making model calls or mutating state
+- the expected claim, evidence, and knowledge records appear in the selected top-k
+- native cold build/rank and cached warm selection counters are emitted by `agentcore_runtime_benchmark`
+- the Python benchmark emits both native-backed context view timing and the retained Python graph-ranker timing
+
+Recent Release validation counters from this repository included:
+
+```text
+context_graph_records=1024
+context_graph_iterations=1024
+context_graph_cold_rank_ns=454200
+context_graph_warm_rank_avg_ns=52
+python_context_graph_warm_view_avg_ns=567840
+python_context_graph_python_rank_avg_ns=9231312
+```
+
+Treat those as same-machine regression numbers, not portable guarantees.
 
 ## Suggested Workflow For Runtime Changes
 

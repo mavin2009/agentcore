@@ -1,7 +1,9 @@
 #include "agentcore/execution/engine.h"
 #include "agentcore/execution/proof.h"
 #include "agentcore/graph/graph_ir.h"
+#include "agentcore/state/context/context_graph.h"
 #include "agentcore/state/intelligence/ops.h"
+#include "agentcore/state/knowledge_graph.h"
 
 #include <algorithm>
 #include <atomic>
@@ -109,8 +111,12 @@ constexpr std::size_t kSubgraphBenchmarkRuns = 64U;
 constexpr std::size_t kRecordedEffectBenchmarkIterations = 4096U;
 constexpr std::size_t kMemoizationBenchmarkVisitLimit = 64U;
 constexpr std::size_t kMemoizationBenchmarkMixRounds = 262144U;
+constexpr std::size_t kKnowledgeReasoningBenchmarkTriples = 8192U;
+constexpr std::size_t kKnowledgeReasoningBenchmarkIterations = 4096U;
 constexpr std::size_t kIntelligenceBenchmarkRecords = 4096U;
 constexpr std::size_t kIntelligenceBenchmarkIterations = 4096U;
+constexpr std::size_t kContextGraphBenchmarkRecords = 1024U;
+constexpr std::size_t kContextGraphBenchmarkIterations = 1024U;
 
 std::atomic<uint64_t> g_memoization_baseline_invocations{0U};
 std::atomic<uint64_t> g_memoization_hit_invocations{0U};
@@ -1619,6 +1625,20 @@ struct MemoizationBenchmarkRun {
     int64_t final_visits{0};
 };
 
+struct KnowledgeReasoningBenchmarkRun {
+    uint64_t triples{0};
+    uint64_t iterations{0};
+    uint64_t exact_lookup_ns{0};
+    uint64_t constrained_lookup_ns{0};
+    uint64_t neighbor_scan_ns{0};
+    uint64_t exact_matches{0};
+    uint64_t constrained_matches{0};
+    uint64_t neighbor_total{0};
+    bool exact_matched{false};
+    bool constrained_matched{false};
+    bool neighbor_matched{false};
+};
+
 struct IntelligenceQueryBenchmarkRun {
     uint64_t records{0};
     uint64_t iterations{0};
@@ -1651,6 +1671,17 @@ struct IntelligenceQueryBenchmarkRun {
     bool focus_task_top_matched{false};
     bool focus_memory_top_matched{false};
     bool related_hops2_expanded{false};
+};
+
+struct ContextGraphBenchmarkRun {
+    uint64_t records{0};
+    uint64_t iterations{0};
+    uint64_t cold_rank_ns{0};
+    uint64_t warm_rank_ns{0};
+    uint64_t selected_records{0};
+    bool claim_matched{false};
+    bool evidence_matched{false};
+    bool knowledge_matched{false};
 };
 
 BenchmarkRun run_parallel_benchmark_once(const GraphDefinition& graph, std::size_t worker_count) {
@@ -2004,6 +2035,260 @@ MemoizationBenchmarkRun run_memoization_benchmark_once(
         read_int_field(state, kMemoizationBenchmarkInput),
         read_int_field(state, kMemoizationBenchmarkOutput),
         read_int_field(state, kMemoizationBenchmarkVisits)
+    };
+}
+
+KnowledgeReasoningBenchmarkRun run_knowledge_reasoning_benchmark_once() {
+    KnowledgeGraphStore graph;
+    StringInterner strings;
+    BlobStore blobs;
+
+    const InternedStringId hot_subject = strings.intern("kg:hot-subject");
+    const InternedStringId hot_relation = strings.intern("kg:rel:hot");
+    InternedStringId exact_subject = 0U;
+    InternedStringId exact_relation = 0U;
+    InternedStringId exact_object = 0U;
+
+    for (std::size_t index = 0; index < kKnowledgeReasoningBenchmarkTriples; ++index) {
+        const bool hot_edge = index < (kKnowledgeReasoningBenchmarkTriples / 4U);
+        const InternedStringId subject = hot_edge
+            ? hot_subject
+            : strings.intern("kg:subject:" + std::to_string(index % 512U));
+        const InternedStringId relation = hot_edge
+            ? hot_relation
+            : strings.intern("kg:rel:" + std::to_string(index % 64U));
+        const InternedStringId object = strings.intern("kg:object:" + std::to_string(index));
+        graph.upsert_triple(
+            subject,
+            relation,
+            object,
+            blobs.append_string("payload:" + std::to_string(index))
+        );
+        if (index == kKnowledgeReasoningBenchmarkTriples - 7U) {
+            exact_subject = subject;
+            exact_relation = relation;
+            exact_object = object;
+        }
+    }
+
+    const auto exact_started_at = std::chrono::steady_clock::now();
+    uint64_t exact_matches = 0U;
+    for (std::size_t iteration = 0; iteration < kKnowledgeReasoningBenchmarkIterations; ++iteration) {
+        exact_matches += graph.match(exact_subject, exact_relation, exact_object).size();
+    }
+    const auto exact_ended_at = std::chrono::steady_clock::now();
+
+    const auto constrained_started_at = std::chrono::steady_clock::now();
+    uint64_t constrained_matches = 0U;
+    for (std::size_t iteration = 0; iteration < kKnowledgeReasoningBenchmarkIterations; ++iteration) {
+        constrained_matches += graph.match(std::nullopt, exact_relation, exact_object).size();
+    }
+    const auto constrained_ended_at = std::chrono::steady_clock::now();
+
+    const auto neighbor_started_at = std::chrono::steady_clock::now();
+    uint64_t neighbor_total = 0U;
+    for (std::size_t iteration = 0; iteration < kKnowledgeReasoningBenchmarkIterations; ++iteration) {
+        neighbor_total += graph.neighbors(hot_subject, hot_relation).size();
+    }
+    const auto neighbor_ended_at = std::chrono::steady_clock::now();
+
+    return KnowledgeReasoningBenchmarkRun{
+        static_cast<uint64_t>(kKnowledgeReasoningBenchmarkTriples),
+        static_cast<uint64_t>(kKnowledgeReasoningBenchmarkIterations),
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                exact_ended_at - exact_started_at
+            ).count()
+        ),
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                constrained_ended_at - constrained_started_at
+            ).count()
+        ),
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                neighbor_ended_at - neighbor_started_at
+            ).count()
+        ),
+        exact_matches,
+        constrained_matches,
+        neighbor_total,
+        exact_matches == kKnowledgeReasoningBenchmarkIterations,
+        constrained_matches == kKnowledgeReasoningBenchmarkIterations,
+        neighbor_total == (
+            (kKnowledgeReasoningBenchmarkTriples / 4U) *
+            kKnowledgeReasoningBenchmarkIterations
+        )
+    };
+}
+
+ContextGraphBenchmarkRun run_context_graph_benchmark_once() {
+    IntelligenceStore intelligence;
+    KnowledgeGraphStore knowledge_graph;
+    StringInterner strings;
+
+    const InternedStringId subject = strings.intern("Incident");
+    const InternedStringId relation = strings.intern("affects");
+    const InternedStringId object = strings.intern("checkout API");
+    const InternedStringId owner = strings.intern("ops");
+    const InternedStringId source = strings.intern("observability");
+    const InternedStringId scope = strings.intern("incident");
+    const InternedStringId owned_by = strings.intern("owned_by");
+    const InternedStringId expected_task_key = strings.intern("task:context:17");
+    const InternedStringId expected_claim_key = strings.intern("claim:context:17");
+    const InternedStringId expected_evidence_key = strings.intern("evidence:context:17");
+
+    for (std::size_t index = 0U; index < kContextGraphBenchmarkRecords; ++index) {
+        const std::string suffix = std::to_string(index);
+        const InternedStringId task_key = strings.intern("task:context:" + suffix);
+        const InternedStringId claim_key = strings.intern("claim:context:" + suffix);
+        const InternedStringId evidence_key = strings.intern("evidence:context:" + suffix);
+        const InternedStringId decision_key = strings.intern("decision:context:" + suffix);
+        const InternedStringId memory_key = strings.intern("memory:context:" + suffix);
+        const bool hot_record = index == 17U;
+        const float confidence = hot_record ? 0.99F : 0.45F + static_cast<float>(index % 10U) * 0.04F;
+        const InternedStringId record_object =
+            hot_record ? object : strings.intern("service:" + std::to_string(index % 64U));
+
+        intelligence.upsert_task(IntelligenceTaskWrite{
+            task_key,
+            strings.intern("Context graph task " + suffix),
+            (index % 2U == 0U || hot_record) ? owner : strings.intern("support"),
+            {},
+            {},
+            index % 3U == 0U ? IntelligenceTaskStatus::Completed : IntelligenceTaskStatus::InProgress,
+            hot_record ? 50 : static_cast<int32_t>(index % 8U),
+            confidence,
+            intelligence_fields::kTaskTitle |
+                intelligence_fields::kTaskOwner |
+                intelligence_fields::kTaskStatus |
+                intelligence_fields::kTaskPriority |
+                intelligence_fields::kTaskConfidence
+        });
+        intelligence.upsert_claim(IntelligenceClaimWrite{
+            claim_key,
+            subject,
+            (index % 2U == 0U || hot_record) ? relation : strings.intern("mentions"),
+            record_object,
+            {},
+            hot_record ? IntelligenceClaimStatus::Confirmed : IntelligenceClaimStatus::Supported,
+            confidence,
+            intelligence_fields::kClaimSubject |
+                intelligence_fields::kClaimRelation |
+                intelligence_fields::kClaimObject |
+                intelligence_fields::kClaimStatus |
+                intelligence_fields::kClaimConfidence
+        });
+        intelligence.upsert_evidence(IntelligenceEvidenceWrite{
+            evidence_key,
+            strings.intern("log"),
+            source,
+            {},
+            task_key,
+            claim_key,
+            confidence,
+            intelligence_fields::kEvidenceKind |
+                intelligence_fields::kEvidenceSource |
+                intelligence_fields::kEvidenceTaskKey |
+                intelligence_fields::kEvidenceClaimKey |
+                intelligence_fields::kEvidenceConfidence
+        });
+        intelligence.upsert_decision(IntelligenceDecisionWrite{
+            decision_key,
+            task_key,
+            claim_key,
+            {},
+            hot_record ? IntelligenceDecisionStatus::Selected : IntelligenceDecisionStatus::Pending,
+            confidence,
+            intelligence_fields::kDecisionTaskKey |
+                intelligence_fields::kDecisionClaimKey |
+                intelligence_fields::kDecisionStatus |
+                intelligence_fields::kDecisionConfidence
+        });
+        intelligence.upsert_memory(IntelligenceMemoryWrite{
+            memory_key,
+            IntelligenceMemoryLayer::Working,
+            scope,
+            {},
+            task_key,
+            claim_key,
+            confidence,
+            intelligence_fields::kMemoryLayer |
+                intelligence_fields::kMemoryScope |
+                intelligence_fields::kMemoryTaskKey |
+                intelligence_fields::kMemoryClaimKey |
+                intelligence_fields::kMemoryImportance
+        });
+        knowledge_graph.upsert_triple(subject, relation, record_object);
+        knowledge_graph.upsert_triple(
+            record_object,
+            owned_by,
+            hot_record ? strings.intern("payments team") : strings.intern("team:" + std::to_string(index % 16U))
+        );
+    }
+
+    ContextQueryPlan plan;
+    static_cast<void>(context_query_plan_add_selector(plan, "tasks.agenda"));
+    static_cast<void>(context_query_plan_add_selector(plan, "claims.confirmed"));
+    static_cast<void>(context_query_plan_add_selector(plan, "evidence.relevant"));
+    static_cast<void>(context_query_plan_add_selector(plan, "decisions.selected"));
+    static_cast<void>(context_query_plan_add_selector(plan, "memories.working"));
+    static_cast<void>(context_query_plan_add_selector(plan, "knowledge.neighborhood"));
+    plan.task_key = expected_task_key;
+    plan.claim_key = expected_claim_key;
+    plan.subject_label = subject;
+    plan.relation = relation;
+    plan.object_label = object;
+    plan.owner = owner;
+    plan.source = source;
+    plan.scope = scope;
+    plan.limit = 24U;
+    plan.limit_per_source = 5U;
+
+    const auto cold_started_at = std::chrono::steady_clock::now();
+    const ContextGraphIndex context_index(intelligence, knowledge_graph, plan);
+    const ContextGraphResult cold_result = context_index.rank();
+    const auto cold_ended_at = std::chrono::steady_clock::now();
+
+    ContextGraphResult warm_result;
+    const auto warm_started_at = std::chrono::steady_clock::now();
+    for (std::size_t iteration = 0U; iteration < kContextGraphBenchmarkIterations; ++iteration) {
+        warm_result = context_index.rank();
+    }
+    const auto warm_ended_at = std::chrono::steady_clock::now();
+
+    bool claim_matched = false;
+    bool evidence_matched = false;
+    bool knowledge_matched = false;
+    for (const ContextGraphRecordRef& ref : warm_result.records) {
+        if (ref.kind == ContextRecordKind::Claim) {
+            const IntelligenceClaim* claim = intelligence.find_claim(ref.id);
+            claim_matched = claim_matched || (claim != nullptr && claim->key == expected_claim_key);
+        }
+        if (ref.kind == ContextRecordKind::Evidence) {
+            const IntelligenceEvidence* evidence = intelligence.find_evidence(ref.id);
+            evidence_matched = evidence_matched || (evidence != nullptr && evidence->key == expected_evidence_key);
+        }
+        knowledge_matched = knowledge_matched || ref.kind == ContextRecordKind::Knowledge;
+    }
+
+    return ContextGraphBenchmarkRun{
+        static_cast<uint64_t>(kContextGraphBenchmarkRecords),
+        static_cast<uint64_t>(kContextGraphBenchmarkIterations),
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                cold_ended_at - cold_started_at
+            ).count()
+        ),
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                warm_ended_at - warm_started_at
+            ).count()
+        ),
+        static_cast<uint64_t>(cold_result.records.size()),
+        claim_matched,
+        evidence_matched,
+        knowledge_matched
     };
 }
 
@@ -3305,6 +3590,13 @@ int main() {
         ? 0.0
         : static_cast<double>(memoization_invalidation.elapsed_ns) /
             static_cast<double>(memoization_hit.elapsed_ns);
+    const KnowledgeReasoningBenchmarkRun knowledge_reasoning_benchmark =
+        run_knowledge_reasoning_benchmark_once();
+    assert(knowledge_reasoning_benchmark.triples == kKnowledgeReasoningBenchmarkTriples);
+    assert(knowledge_reasoning_benchmark.iterations == kKnowledgeReasoningBenchmarkIterations);
+    assert(knowledge_reasoning_benchmark.exact_matched);
+    assert(knowledge_reasoning_benchmark.constrained_matched);
+    assert(knowledge_reasoning_benchmark.neighbor_matched);
     const IntelligenceQueryBenchmarkRun intelligence_query_benchmark =
         run_intelligence_query_benchmark_once();
     assert(intelligence_query_benchmark.records == kIntelligenceBenchmarkRecords);
@@ -3340,6 +3632,13 @@ int main() {
     assert(intelligence_query_benchmark.focus_total_records == 40U * kIntelligenceBenchmarkIterations);
     assert(intelligence_query_benchmark.related_total_records == 5U * kIntelligenceBenchmarkIterations);
     assert(intelligence_query_benchmark.related_hops2_total_records == 5U * kIntelligenceBenchmarkIterations);
+    const ContextGraphBenchmarkRun context_graph_benchmark = run_context_graph_benchmark_once();
+    assert(context_graph_benchmark.records == kContextGraphBenchmarkRecords);
+    assert(context_graph_benchmark.iterations == kContextGraphBenchmarkIterations);
+    assert(context_graph_benchmark.selected_records > 0U);
+    assert(context_graph_benchmark.claim_matched);
+    assert(context_graph_benchmark.evidence_matched);
+    assert(context_graph_benchmark.knowledge_matched);
 
     const SubgraphBenchmarkRun subgraph_benchmark =
         run_subgraph_benchmark_once(subgraph_parent_graph, subgraph_child_graph);
@@ -3434,6 +3733,20 @@ int main() {
                     memoization_baseline.final_output == memoization_hit.final_output
                  ) << '\n'
               << "memoization_invalidation_final_input=" << memoization_invalidation.final_input << '\n'
+              << "knowledge_reasoning_triples=" << knowledge_reasoning_benchmark.triples << '\n'
+              << "knowledge_reasoning_iterations=" << knowledge_reasoning_benchmark.iterations << '\n'
+              << "knowledge_reasoning_exact_lookup_ns="
+              << knowledge_reasoning_benchmark.exact_lookup_ns << '\n'
+              << "knowledge_reasoning_constrained_lookup_ns="
+              << knowledge_reasoning_benchmark.constrained_lookup_ns << '\n'
+              << "knowledge_reasoning_neighbor_scan_ns="
+              << knowledge_reasoning_benchmark.neighbor_scan_ns << '\n'
+              << "knowledge_reasoning_exact_matches="
+              << knowledge_reasoning_benchmark.exact_matches << '\n'
+              << "knowledge_reasoning_constrained_matches="
+              << knowledge_reasoning_benchmark.constrained_matches << '\n'
+              << "knowledge_reasoning_neighbor_total="
+              << knowledge_reasoning_benchmark.neighbor_total << '\n'
               << "intelligence_benchmark_records=" << intelligence_query_benchmark.records << '\n'
               << "intelligence_benchmark_iterations=" << intelligence_query_benchmark.iterations << '\n'
               << "intelligence_task_query_ns=" << intelligence_query_benchmark.task_query_ns << '\n'
@@ -3474,6 +3787,16 @@ int main() {
               << "intelligence_focus_task_top_matched=" << static_cast<int>(intelligence_query_benchmark.focus_task_top_matched) << '\n'
               << "intelligence_focus_memory_top_matched=" << static_cast<int>(intelligence_query_benchmark.focus_memory_top_matched) << '\n'
               << "intelligence_related_hops2_expanded=" << static_cast<int>(intelligence_query_benchmark.related_hops2_expanded) << '\n'
+              << "context_graph_records=" << context_graph_benchmark.records << '\n'
+              << "context_graph_iterations=" << context_graph_benchmark.iterations << '\n'
+              << "context_graph_cold_rank_ns=" << context_graph_benchmark.cold_rank_ns << '\n'
+              << "context_graph_warm_rank_ns=" << context_graph_benchmark.warm_rank_ns << '\n'
+              << "context_graph_warm_rank_avg_ns="
+              << (context_graph_benchmark.warm_rank_ns / context_graph_benchmark.iterations) << '\n'
+              << "context_graph_selected_records=" << context_graph_benchmark.selected_records << '\n'
+              << "context_graph_claim_matched=" << static_cast<int>(context_graph_benchmark.claim_matched) << '\n'
+              << "context_graph_evidence_matched=" << static_cast<int>(context_graph_benchmark.evidence_matched) << '\n'
+              << "context_graph_knowledge_matched=" << static_cast<int>(context_graph_benchmark.knowledge_matched) << '\n'
               << "subgraph_benchmark_runs=" << kSubgraphBenchmarkRuns << '\n'
               << "subgraph_benchmark_ns=" << subgraph_benchmark.elapsed_ns << '\n'
               << "subgraph_stream_read_ns=" << subgraph_benchmark.stream_read_ns << '\n'

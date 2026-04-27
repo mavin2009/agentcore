@@ -92,4 +92,5 @@ PYTHONPATH=./build/python python3 ./python/benchmarks/langgraph_head_to_head.py 
 - The "same-code builder path" uses AgentCore's generated LangGraph-compatible surface rather than the native `agentcore.graph` API.
 - The "native runtime features" section uses AgentCore's native API because persistent child sessions, explicit output bindings, proof-aware pause/resume, and session-tagged stream metadata are first-class there.
 - The fan-out benchmark on the LangGraph side uses child graphs plus `thread_id`-backed persistence inside branch nodes to emulate persistent specialist sessions.
+- Native context-graph ranking is measured in `agentcore_runtime_benchmark` and `state_graph_api_benchmark.py`, not in this head-to-head page. That feature depends on AgentCore's structured intelligence and native knowledge state, so it is better treated as an AgentCore-native regression benchmark than as a same-code compatibility comparison.
 - Results will vary by Python version, CPU, and workload shape. This page should be read as a reproducible benchmark snapshot, not as a universal claim.

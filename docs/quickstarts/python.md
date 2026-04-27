@@ -326,6 +326,10 @@ Common selectors:
 
 `ContextView.to_prompt(...)` returns text. `ContextView.to_messages(...)` returns chat-style messages. `ContextView.to_model_input(mode="text" | "messages" | "dict")` is the compact adapter-facing form.
 
+For intelligence and native knowledge selectors, `runtime.context.view()` uses the native context-graph ranker before returning the Python `ContextView`. That ranker connects tasks, claims, evidence, decisions, memories, and knowledge triples through their task keys, claim keys, and subject/relation/object labels, then applies deterministic activation scoring, motif-aware support boosts, and kind-balanced top-k pruning. If a view includes messages or arbitrary `state.<field>` selectors, those items are merged in on the Python side so the public `ContextView` shape stays the same.
+
+The practical effect is that you can keep using the small `ContextSpec` surface while still getting graph-shaped context selection for structured runtime memory.
+
 ## Hydrate Knowledge From An External Graph Store
 
 AgentCore has native knowledge-graph state for execution-time triples, but many teams already keep graph data in a database. The graph-store layer is the explicit bridge: register a store on the compiled graph, hydrate the triples a node needs into `runtime.knowledge`, and then context assembly, checkpoints, subgraphs, and replay see those triples as normal runtime state.

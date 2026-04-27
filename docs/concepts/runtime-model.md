@@ -118,7 +118,17 @@ The context view is not a separate memory store. It is a deterministic read mode
 
 When context views are created during `invoke_with_metadata(...)`, pause/resume metadata calls, or `stream(...)`, AgentCore attaches a `details["context"]` summary. Matching trace events also receive `context_views` and `context_digest` fields. The native proof digest remains the runtime state/trace proof; the Python metadata layer adds `proof["context_digest"]` so context selection can be compared across runs without hiding that it is a context-view digest.
 
-The current context assembly layer intentionally keeps ranking explicit. It relies on existing native intelligence ranking operations such as `agenda(...)`, `supporting_claims(...)`, `recall(...)`, `focus(...)`, and `action_candidates(...)` rather than introducing a second heuristic ranking engine in Python.
+For selectors backed by intelligence records and native knowledge triples, context assembly now has a native ranking path:
+
+1. `ContextSpec` is compiled into an internal `ContextQueryPlan`.
+2. The runtime builds typed adjacency over `IntelligenceStore` records and `KnowledgeGraphStore` triples.
+3. Deterministic integer activation scores propagate across direct task links, claim links, and semantic subject/relation/object links.
+4. Motif-aware boosts prefer supported structures such as claim + evidence, claim + selected decision, linked memory, and exact claim-to-knowledge-triple matches.
+5. The ranked set is pruned with a kind-balanced top-k so one dense record type does not crowd out the rest of the context.
+
+The active Python runtime view keeps a compact cache for the compiled native context graph result. Repeated `runtime.context.view()` calls inside the same callback reuse that cache until staged intelligence or knowledge writes change the cache fingerprint. This keeps read-your-own-writes semantics intact while avoiding repeated native graph ranking and native-to-Python record conversion for unchanged context requests.
+
+This is still a read model, not a hidden planner. It does not call a model, mutate state, or create implicit memory. Message selectors and `state.<field>` selectors remain Python-level compatibility inputs; when they are mixed with intelligence/knowledge selectors, AgentCore uses the native ranker for the structured candidates and then merges them with those Python-collected items. The pure Python `ContextGraphIndex` remains as a fallback for compatibility and older/native-extension-missing environments.
 
 ## Intelligence State
 

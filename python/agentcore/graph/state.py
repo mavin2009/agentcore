@@ -1318,6 +1318,13 @@ class RuntimeContext:
             raise TypeError("native runtime returned an invalid runtime identity")
         return result
 
+    def _rank_context_graph(self, spec: Mapping[str, Any]) -> dict[str, Any]:
+        self._require_runtime()
+        result = _native._runtime_rank_context_graph(self._native_runtime, dict(spec.items()))
+        if not isinstance(result, dict):
+            raise TypeError("native runtime returned an invalid context graph ranking")
+        return result
+
     def snapshot_intelligence(self) -> dict[str, Any]:
         return self.intelligence.snapshot()
 

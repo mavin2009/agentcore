@@ -1636,6 +1636,30 @@ PyObject* py_runtime_query_knowledge(PyObject*, PyObject* args, PyObject* kwargs
     return result;
 }
 
+PyObject* py_runtime_rank_context_graph(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* runtime = nullptr;
+    PyObject* spec = Py_None;
+    static const char* keywords[] = {"runtime", "spec", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "OO",
+            const_cast<char**>(keywords),
+            &runtime,
+            &spec
+        )) {
+        return nullptr;
+    }
+
+    std::string error_message;
+    PyObject* result = runtime_rank_context_graph(runtime, spec, &error_message);
+    if (result == nullptr) {
+        PyErr_SetString(PyExc_ValueError, error_message.c_str());
+        return nullptr;
+    }
+    return result;
+}
+
 PyObject* py_runtime_upsert_task(PyObject*, PyObject* args, PyObject* kwargs) {
     PyObject* runtime = nullptr;
     PyObject* spec = Py_None;
@@ -2823,6 +2847,12 @@ PyMethodDef kModuleMethods[] = {
         reinterpret_cast<PyCFunction>(py_runtime_query_knowledge),
         METH_VARARGS | METH_KEYWORDS,
         "Query native knowledge-graph triples for the active Python node callback."
+    },
+    {
+        "_runtime_rank_context_graph",
+        reinterpret_cast<PyCFunction>(py_runtime_rank_context_graph),
+        METH_VARARGS | METH_KEYWORDS,
+        "Rank intelligence and knowledge context records for the active Python node callback."
     },
     {
         "_runtime_upsert_task",

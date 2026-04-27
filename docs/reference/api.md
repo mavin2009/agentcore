@@ -401,6 +401,8 @@ ContextSpec(
 
 `ContextSpec` declares how a node should assemble prompt-ready context. Pass it to `StateGraph.add_node(..., context=ContextSpec(...))`, then call `runtime.context.view()` inside the node.
 
+The public API stays intentionally small. For intelligence and native knowledge selectors, the runtime uses an internal native context-graph query plan and returns the same `ContextView` shape; there is no separate user-facing context-index object to configure. Python fallback logic is kept for compatibility and for selector types that are inherently Python-state based.
+
 Supported selectors include:
 
 - `messages.recent` and `messages.all`
@@ -433,6 +435,8 @@ Current surface:
 - `.to_model_input(mode="text" | "messages" | "dict" | "protocol", system=None)`
 
 `invoke_with_metadata(...)`, pause/resume metadata calls, and `stream(...)` attach context metadata when a node creates a context view. The run details include `details["context"]`; matching trace events include `context_views` and `context_digest`; `details["proof"]["context_digest"]` carries the Python-level context-view digest.
+
+Context item ordering is deterministic for a given state, `ContextSpec`, and runtime version. Intelligence and knowledge candidates are ranked natively, then message/state items are merged without changing the returned object model.
 
 ### `RuntimeContext`
 

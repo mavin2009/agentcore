@@ -8,6 +8,12 @@ def seed_context_records(state, config, runtime):
         "native knowledge graph",
         payload={"source": "native-kg"},
     )
+    runtime.knowledge.upsert_triple(
+        "native knowledge graph",
+        "supports",
+        "context retrieval",
+        payload={"depth": 2},
+    )
     staged_knowledge = runtime.knowledge.query(subject="AgentCore", limit=2)
     assert staged_knowledge["staged"] is True
     assert any(
@@ -90,6 +96,68 @@ def answer_with_context(state, config, runtime):
         triple["object"] == "native knowledge graph"
         for triple in native_knowledge["triples"]
     )
+    reasoned_neighborhood = runtime.knowledge.neighborhood("AgentCore", limit=4)
+    assert any(
+        triple["object"] == "context retrieval"
+        for triple in reasoned_neighborhood["triples"]
+    )
+    cached_reasoned_neighborhood = runtime.knowledge.neighborhood("AgentCore", limit=4)
+    assert cached_reasoned_neighborhood == reasoned_neighborhood
+
+    runtime.knowledge.upsert_entity("Transient overlay entity", payload={"kind": "scratch"})
+    runtime.knowledge.upsert_triple(
+        "AgentCore",
+        "has_feature",
+        "native knowledge graph",
+        payload={"source": "staged-overlay"},
+    )
+    runtime.knowledge.upsert_triple(
+        "AgentCore",
+        "has_feature",
+        "overlay query",
+        payload={"revision": 1},
+    )
+    runtime.knowledge.upsert_triple(
+        "AgentCore",
+        "has_feature",
+        "overlay query",
+        payload={"revision": 2},
+    )
+    overlay_knowledge = runtime.knowledge.query(
+        subject="AgentCore",
+        relation="has_feature",
+        limit=10,
+    )
+    assert overlay_knowledge["staged"] is True
+    assert overlay_knowledge["counts"]["entities"] >= native_knowledge["counts"]["entities"] + 2
+    assert overlay_knowledge["counts"]["triples"] == native_knowledge["counts"]["triples"] + 1
+    overlay_triples = [
+        triple for triple in overlay_knowledge["triples"]
+        if triple["object"] == "overlay query"
+    ]
+    assert len(overlay_triples) == 1
+    assert overlay_triples[0]["payload"]["revision"] == 2
+    updated_triples = [
+        triple for triple in overlay_knowledge["triples"]
+        if triple["object"] == "native knowledge graph"
+    ]
+    assert len(updated_triples) == 1
+    assert updated_triples[0]["payload"]["source"] == "staged-overlay"
+    incoming_overlay = runtime.knowledge.query(
+        subject="overlay query",
+        direction="incoming",
+        limit=4,
+    )
+    assert incoming_overlay["triples"][0]["subject"] == "AgentCore"
+    native_context_rank = runtime._rank_context_graph(context_spec.to_dict())
+    assert native_context_rank["native"] is True
+    native_context_records = native_context_rank["records"]
+    assert any(
+        entry["kind"] == "claim" and entry["record"]["key"] == "claim:fast"
+        for entry in native_context_records
+    )
+    assert any(entry["kind"] == "knowledge" for entry in native_context_records)
+
     view = runtime.context.view()
     prompt = view.to_prompt(system="Answer with citations.")
     messages = view.to_messages(system="System message")
@@ -102,6 +170,10 @@ def answer_with_context(state, config, runtime):
     assert any(item["kind"] == "message" for item in view.items)
     assert any(item["kind"] == "claim" for item in view.items)
     assert any(item["kind"] == "knowledge" for item in view.items)
+    item_keys = [str(item.get("key")) for item in view.items]
+    assert "claim:fast" in item_keys
+    assert "evidence:bench" in item_keys
+    assert item_keys.index("claim:fast") < item_keys.index("claim:python-only")
     assert "native knowledge graph" in prompt
     return {
         "answer": prompt,

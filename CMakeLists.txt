@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(agentcore VERSION 0.1.11 LANGUAGES CXX)
+project(agentcore VERSION 0.1.12 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -64,6 +64,7 @@ set(AGENTCORE_RUNTIME_SOURCES
 )
 
 set(AGENTCORE_STATE_SOURCES
+    agentcore/src/state/context/context_graph.cpp
     agentcore/src/state/intelligence/model.cpp
     agentcore/src/state/intelligence/ops.cpp
     agentcore/src/state/journal/task_journal.cpp

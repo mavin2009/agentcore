@@ -1,4 +1,5 @@
 #include "agentcore/state/state_store.h"
+#include "agentcore/state/context/context_graph.h"
 #include "agentcore/state/intelligence/ops.h"
 
 #include <cassert>
@@ -236,6 +237,63 @@ int main() {
     assert(semantic_focus.memories.size() == 1U);
     assert(semantic_focus.memories.front().key == memory_key);
 
+    ContextQueryPlan context_plan;
+    assert(context_query_plan_add_selector(context_plan, "tasks.agenda"));
+    assert(context_query_plan_add_selector(context_plan, "claims.supported"));
+    assert(context_query_plan_add_selector(context_plan, "evidence.relevant"));
+    assert(context_query_plan_add_selector(context_plan, "decisions.selected"));
+    assert(context_query_plan_add_selector(context_plan, "memories.recall"));
+    assert(context_query_plan_add_selector(context_plan, "knowledge.neighborhood"));
+    context_plan.task_key = task_key;
+    context_plan.claim_key = claim_key;
+    context_plan.subject_label = runtime;
+    context_plan.relation = relation;
+    context_plan.object_label = reference_runtime;
+    context_plan.scope = memory_scope;
+    context_plan.limit = 12U;
+    const ContextGraphResult context_rank =
+        rank_context_graph(store.intelligence(), store.knowledge_graph(), context_plan);
+    const ContextGraphIndex context_index(store.intelligence(), store.knowledge_graph(), context_plan);
+    const ContextGraphResult indexed_context_rank = context_index.rank();
+    const ContextGraphResult repeated_indexed_context_rank = context_index.rank();
+    assert(indexed_context_rank.records.size() == context_rank.records.size());
+    assert(repeated_indexed_context_rank.records.size() == indexed_context_rank.records.size());
+    for (std::size_t index = 0U; index < indexed_context_rank.records.size(); ++index) {
+        assert(indexed_context_rank.records[index].kind == context_rank.records[index].kind);
+        assert(indexed_context_rank.records[index].id == context_rank.records[index].id);
+        assert(indexed_context_rank.records[index].score == context_rank.records[index].score);
+        assert(repeated_indexed_context_rank.records[index].kind == indexed_context_rank.records[index].kind);
+        assert(repeated_indexed_context_rank.records[index].id == indexed_context_rank.records[index].id);
+        assert(repeated_indexed_context_rank.records[index].score == indexed_context_rank.records[index].score);
+    }
+    assert(context_rank.records.size() >= 6U);
+    bool saw_context_task = false;
+    bool saw_context_claim = false;
+    bool saw_context_evidence = false;
+    bool saw_context_decision = false;
+    bool saw_context_memory = false;
+    bool saw_context_knowledge = false;
+    for (const ContextGraphRecordRef& ref : context_rank.records) {
+        assert(ref.score > 0);
+        saw_context_task = saw_context_task ||
+            (ref.kind == ContextRecordKind::Task && ref.id == task->id);
+        saw_context_claim = saw_context_claim ||
+            (ref.kind == ContextRecordKind::Claim && ref.id == semantic_claim_result.claims.front().id);
+        saw_context_evidence = saw_context_evidence ||
+            (ref.kind == ContextRecordKind::Evidence && ref.id == semantic_focus.evidence.front().id);
+        saw_context_decision = saw_context_decision ||
+            (ref.kind == ContextRecordKind::Decision && ref.id == semantic_focus.decisions.front().id);
+        saw_context_memory = saw_context_memory ||
+            (ref.kind == ContextRecordKind::Memory && ref.id == semantic_focus.memories.front().id);
+        saw_context_knowledge = saw_context_knowledge || ref.kind == ContextRecordKind::Knowledge;
+    }
+    assert(saw_context_task);
+    assert(saw_context_claim);
+    assert(saw_context_evidence);
+    assert(saw_context_decision);
+    assert(saw_context_memory);
+    assert(saw_context_knowledge);
+
     std::vector<IntelligenceRouteRule> route_rules;
     route_rules.push_back(IntelligenceRouteRule{
         supported_claim_query,
@@ -290,6 +348,54 @@ int main() {
         restored.knowledge_graph().match(runtime, relation, reference_runtime);
     assert(matches.size() == 1U);
     assert(restored.blobs().read_string(matches.front()->payload) == "deterministic");
+
+    KnowledgeGraphStore analytics_graph;
+    const InternedStringId hub_label = strings.intern("analytics:hub");
+    const InternedStringId sparse_relation = strings.intern("analytics:sparse");
+    const InternedStringId dense_relation = strings.intern("analytics:dense");
+    const InternedStringId exact_target = strings.intern("analytics:leaf:31");
+    for (uint32_t index = 0U; index < 32U; ++index) {
+        analytics_graph.upsert_triple(
+            hub_label,
+            dense_relation,
+            strings.intern(std::string("analytics:leaf:") + std::to_string(index)),
+            blobs.append_string(std::string("dense-") + std::to_string(index))
+        );
+    }
+    analytics_graph.upsert_triple(
+        strings.intern("analytics:other"),
+        sparse_relation,
+        exact_target,
+        blobs.append_string("sparse")
+    );
+    const std::vector<const KnowledgeTriple*> exact_match =
+        analytics_graph.match(hub_label, dense_relation, exact_target);
+    assert(exact_match.size() == 1U);
+    assert(blobs.read_string(exact_match.front()->payload) == "dense-31");
+    const KnowledgeEntity* exact_target_entity = analytics_graph.find_entity_by_label(exact_target);
+    assert(exact_target_entity != nullptr);
+    const std::vector<KnowledgeEntityId> hub_neighbors = analytics_graph.neighbors(hub_label);
+    assert(hub_neighbors.size() == 32U);
+    assert(hub_neighbors.back() == exact_target_entity->id);
+    const std::vector<const KnowledgeTriple*> object_constrained_match =
+        analytics_graph.match(std::nullopt, sparse_relation, exact_target);
+    assert(object_constrained_match.size() == 1U);
+    assert(blobs.read_string(object_constrained_match.front()->payload) == "sparse");
+    const std::vector<const KnowledgeTriple*> missing_constrained_match =
+        analytics_graph.match(hub_label, sparse_relation, exact_target);
+    assert(missing_constrained_match.empty());
+    const InternedStringId late_leaf = strings.intern("analytics:leaf:32");
+    analytics_graph.upsert_triple(
+        hub_label,
+        dense_relation,
+        late_leaf,
+        blobs.append_string("dense-32")
+    );
+    const std::vector<KnowledgeEntityId> updated_hub_neighbors = analytics_graph.neighbors(hub_label);
+    assert(updated_hub_neighbors.size() == 33U);
+    const KnowledgeEntity* late_leaf_entity = analytics_graph.find_entity_by_label(late_leaf);
+    assert(late_leaf_entity != nullptr);
+    assert(updated_hub_neighbors.back() == late_leaf_entity->id);
 
     StatePatch duplicate_patch;
     duplicate_patch.knowledge_graph.entities.push_back(KnowledgeEntityWrite{

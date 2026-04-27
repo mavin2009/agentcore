@@ -10,7 +10,7 @@ If you are new to AgentCore, start with the path that matches what you are tryin
 | --- | --- | --- |
 | Build a graph from Python | [Python quickstart](./quickstarts/python.md) | Install/build, define nodes, route, stream, inspect metadata, and use common agent features |
 | Move an existing graph workflow | [Migration guide](./migration/langgraph-to-agentcore.md) | Import changes, callback differences, reducer support, message state, and current compatibility limits |
-| Understand why the runtime behaves this way | [Runtime model](./concepts/runtime-model.md) | State patches, scheduler behavior, checkpoints, subgraph sessions, context assembly, intelligence records, knowledge-graph state, and external graph-store boundaries |
+| Understand why the runtime behaves this way | [Runtime model](./concepts/runtime-model.md) | State patches, scheduler behavior, checkpoints, subgraph sessions, native context-graph ranking, intelligence records, knowledge-graph state, and external graph-store boundaries |
 | Connect external tools and context | [MCP integration](./integrations/mcp.md) | Mirror MCP tools, consume prompts/resources, expose AgentCore as an MCP server, and generate client config |
 | Connect external graph data | [Graph store integration](./integrations/graph-stores.md) | Hydrate native knowledge from in-memory or Neo4j stores and implement other graph-store backends |
 | Export traces and metrics | [OpenTelemetry integration](./integrations/opentelemetry.md) | Opt-in run/node spans, metrics, and how to keep telemetry out of the default hot path |
@@ -25,7 +25,7 @@ For most Python users:
 1. Read the first two sections of the [Python quickstart](./quickstarts/python.md).
 2. Run the minimal counter graph.
 3. Skim [Message State](./quickstarts/python.md#use-message-state) if you are building a chat-style agent.
-4. Skim [Assemble Context For A Node](./quickstarts/python.md#assemble-context-for-a-node) if your nodes need prompt-ready context from messages, claims, evidence, memories, and state.
+4. Skim [Assemble Context For A Node](./quickstarts/python.md#assemble-context-for-a-node) if your nodes need prompt-ready context from messages, claims, evidence, memories, knowledge triples, and state.
 5. Skim [Hydrate Knowledge From An External Graph Store](./quickstarts/python.md#hydrate-knowledge-from-an-external-graph-store) if your graph facts live in Neo4j or another graph database.
 6. Skim [Persistent Subgraph Sessions](./quickstarts/python.md#persistent-subgraph-sessions) if your workflow has reusable specialist or child-agent state.
 7. Use the [API reference](./reference/api.md) only when you need exact signatures.

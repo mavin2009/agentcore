@@ -223,6 +223,7 @@ PyObject* runtime_record_once(PyObject* capsule, std::string_view key, PyObject*
 bool runtime_stage_knowledge_entity(PyObject* capsule, PyObject* spec, std::string* error_message);
 bool runtime_stage_knowledge_triple(PyObject* capsule, PyObject* spec, std::string* error_message);
 PyObject* runtime_query_knowledge(PyObject* capsule, PyObject* spec, std::string* error_message);
+PyObject* runtime_rank_context_graph(PyObject* capsule, PyObject* spec, std::string* error_message);
 bool runtime_stage_task_write(PyObject* capsule, PyObject* spec, std::string* error_message);
 bool runtime_stage_claim_write(PyObject* capsule, PyObject* spec, std::string* error_message);
 bool runtime_stage_evidence_write(PyObject* capsule, PyObject* spec, std::string* error_message);

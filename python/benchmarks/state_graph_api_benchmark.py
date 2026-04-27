@@ -1,7 +1,9 @@
 import asyncio
 import time
 
-from agentcore.graph import Command, END, START, RuntimeContext, StateGraph
+from agentcore._context_graph import ContextGraphIndex
+from agentcore.context import _collect_selector
+from agentcore.graph import Command, ContextSpec, END, START, RuntimeContext, StateGraph
 
 
 def counter(state, config):
@@ -22,6 +24,8 @@ config = {"configurable": {"target_count": 64}, "tags": ["benchmark"]}
 
 PATCH_MARSHALLING_ITERATIONS = 200
 PAYLOAD_BENCHMARK_ITERATIONS = 100
+CONTEXT_GRAPH_BENCHMARK_ITERATIONS = 40
+CONTEXT_GRAPH_RECORDS = 48
 MEMO_BENCHMARK_ITERATIONS = 64
 MEMO_BENCHMARK_VISITS = 64
 MEMO_BENCHMARK_ROUNDS = 768
@@ -134,6 +138,139 @@ payload_graph.add_conditional_edges(
     {END: END, "payload_counter": "payload_counter"},
 )
 payload_compiled = payload_graph.compile()
+
+
+context_graph_timings = {"cold_ns": 0, "warm_ns": 0, "python_rank_ns": 0, "pipeline_ns": 0}
+
+
+context_graph_spec = ContextSpec(
+    goal_key="question",
+    include=[
+        "tasks.agenda",
+        "claims.all",
+        "evidence.relevant",
+        "decisions.selected",
+        "memories.working",
+        "knowledge.neighborhood",
+    ],
+    budget_items=24,
+    budget_tokens=2400,
+    require_citations=True,
+    subject="Incident",
+    owner="ops",
+    scope="incident",
+    task_key="task:incident:8",
+    claim_key="claim:incident:8",
+)
+
+
+def context_graph_seed(state, config, runtime: RuntimeContext):
+    for index in range(CONTEXT_GRAPH_RECORDS):
+        task_key = f"task:incident:{index}"
+        claim_key = f"claim:incident:{index}"
+        status = "open" if index % 3 else "completed"
+        confidence = 0.92 if index == 8 else 0.45 + ((index % 11) / 20)
+        runtime.intelligence.upsert_task(
+            task_key,
+            title=f"Investigate incident path {index}",
+            owner="ops" if index % 2 == 0 else "support",
+            status=status,
+            priority=10 - (index % 10),
+            confidence=confidence,
+        )
+        runtime.intelligence.upsert_claim(
+            claim_key,
+            subject="Incident",
+            relation="affects" if index % 2 == 0 else "mentions",
+            object="checkout API" if index == 8 else f"service-{index % 8}",
+            status="supported" if index != 5 else "rejected",
+            confidence=confidence,
+            statement={"path": index, "kind": "context-graph-benchmark"},
+        )
+        runtime.intelligence.add_evidence(
+            f"evidence:incident:{index}",
+            kind="log",
+            source="observability",
+            task_key=task_key,
+            claim_key=claim_key,
+            content={"signal": f"trace-{index}", "service": f"service-{index % 8}"},
+            confidence=confidence,
+        )
+        runtime.intelligence.record_decision(
+            f"decision:incident:{index}",
+            task_key=task_key,
+            claim_key=claim_key,
+            status="selected" if index == 8 else "pending",
+            summary={"route": "rollback" if index == 8 else "investigate"},
+            confidence=confidence,
+        )
+        runtime.intelligence.remember(
+            f"memory:incident:{index}",
+            layer="working",
+            scope="incident",
+            task_key=task_key,
+            claim_key=claim_key,
+            content={"lesson": f"path-{index}", "team": "ops"},
+            importance=confidence,
+        )
+        runtime.knowledge.upsert_triple(
+            "Incident",
+            "affects",
+            "checkout API" if index == 8 else f"service-{index % 8}",
+            payload={"path": index},
+        )
+        runtime.knowledge.upsert_triple(
+            "checkout API" if index == 8 else f"service-{index % 8}",
+            "owned_by",
+            "payments team" if index == 8 else f"team-{index % 5}",
+            payload={"path": index},
+        )
+    return {"seeded_context_records": CONTEXT_GRAPH_RECORDS}
+
+
+def context_graph_viewer(state, config, runtime: RuntimeContext):
+    started = time.perf_counter_ns()
+    cold_view = runtime.context.view()
+    cold_ns = time.perf_counter_ns() - started
+    started = time.perf_counter_ns()
+    warm_view = runtime.context.view()
+    warm_ns = time.perf_counter_ns() - started
+    if cold_view.digest != warm_view.digest:
+        raise AssertionError("context graph warm view changed the selected context")
+    requested_items = int(context_graph_spec.budget_items or 32)
+    expanded_limit = max(int(context_graph_spec.limit_per_source), requested_items, 8) * 3
+    ranked_limit = max(requested_items, int(context_graph_spec.limit_per_source) * len(context_graph_spec.include))
+    expanded_spec = context_graph_spec.replace(limit_per_source=expanded_limit)
+    started = time.perf_counter_ns()
+    candidates = []
+    for selector in context_graph_spec.include or ():
+        candidates.extend(_collect_selector(runtime, state, expanded_spec, str(selector)))
+    python_ranked = ContextGraphIndex(
+        candidates,
+        spec=context_graph_spec.to_dict(),
+        goal=state.get("question"),
+    ).rank(limit=ranked_limit)
+    python_rank_ns = time.perf_counter_ns() - started
+    if not python_ranked:
+        raise AssertionError("python context graph fallback selected no context")
+    keys = [item["key"] for item in cold_view.items]
+    context_graph_timings["cold_ns"] += cold_ns
+    context_graph_timings["warm_ns"] += warm_ns
+    context_graph_timings["python_rank_ns"] += python_rank_ns
+    return {
+        "context_graph_digest": cold_view.digest,
+        "context_graph_items": len(cold_view.items),
+        "context_graph_keys": keys,
+    }
+
+
+context_graph = StateGraph(dict, name="python_context_graph_benchmark", worker_count=2)
+context_graph.add_node("seed", context_graph_seed)
+context_graph.add_node("view", context_graph_viewer, context=context_graph_spec)
+context_graph.add_edge(START, "seed")
+context_graph.add_edge("seed", "view")
+context_graph.add_edge("view", END)
+context_graph_compiled = context_graph.compile()
 
 
 def memo_mix(value: int) -> int:
@@ -408,6 +545,15 @@ for _ in range(PAYLOAD_BENCHMARK_ITERATIONS):
     payload_result = payload_compiled.invoke(dict(payload_input), config=config)
 payload_end_ns = time.perf_counter_ns()
 
+context_graph_start_ns = time.perf_counter_ns()
+context_graph_result = None
+for _ in range(CONTEXT_GRAPH_BENCHMARK_ITERATIONS):
+    context_graph_result = context_graph_compiled.invoke(
+        {"question": "Which incident path affects checkout API and who owns it?"},
+        config={"tags": ["benchmark", "context-graph"]},
+    )
+context_graph_end_ns = time.perf_counter_ns()
+
 memo_benchmark_input = {"memo_input": 7, "memo_visits": 0}
 memo_baseline_start_ns = time.perf_counter_ns()
 for _ in range(MEMO_BENCHMARK_ITERATIONS):
@@ -509,6 +655,11 @@ assert patch_result["namespace"] == "patch-benchmark"
 assert payload_result["count"] == 64
 assert payload_result["payload_sum"] == 2016
 assert payload_result["payload_span"] == 63
+assert context_graph_result is not None
+assert context_graph_result["context_graph_items"] > 0
+assert context_graph_result["context_graph_digest"]
+assert "claim:incident:8" in context_graph_result["context_graph_keys"], context_graph_result["context_graph_keys"]
+assert "evidence:incident:8" in context_graph_result["context_graph_keys"], context_graph_result["context_graph_keys"]
 assert memo_baseline_result["memo_visits"] == MEMO_BENCHMARK_VISITS
 assert memo_hit_result["memo_visits"] == MEMO_BENCHMARK_VISITS
 assert memo_baseline_result["memo_output"] == memo_hit_result["memo_output"]
@@ -587,6 +738,7 @@ record_once_hit_elapsed_ns = record_once_hit_end_ns - record_once_hit_start_ns
 record_once_miss_elapsed_ns = record_once_miss_end_ns - record_once_miss_start_ns
 patch_elapsed_ns = patch_end_ns - patch_start_ns
 payload_elapsed_ns = payload_end_ns - payload_start_ns
+context_graph_elapsed_ns = context_graph_end_ns - context_graph_start_ns
 memo_baseline_elapsed_ns = memo_baseline_end_ns - memo_baseline_start_ns
 memo_hit_elapsed_ns = memo_hit_end_ns - memo_hit_start_ns
 memo_invalidated_elapsed_ns = memo_invalidated_end_ns - memo_invalidated_start_ns
@@ -626,6 +778,24 @@ print(
     "python_state_graph_payload_materialization_result="
     f"{payload_result['payload_sum']}:{payload_result['payload_span']}"
 )
+print(f"python_context_graph_iterations={CONTEXT_GRAPH_BENCHMARK_ITERATIONS}")
+print(f"python_context_graph_records={CONTEXT_GRAPH_RECORDS}")
+print(f"python_context_graph_total_ns={context_graph_elapsed_ns}")
+print(f"python_context_graph_avg_ns={context_graph_elapsed_ns // CONTEXT_GRAPH_BENCHMARK_ITERATIONS}")
+print(
+    "python_context_graph_cold_view_avg_ns="
+    f"{context_graph_timings['cold_ns'] // CONTEXT_GRAPH_BENCHMARK_ITERATIONS}"
+)
+print(
+    "python_context_graph_warm_view_avg_ns="
+    f"{context_graph_timings['warm_ns'] // CONTEXT_GRAPH_BENCHMARK_ITERATIONS}"
+)
+print(
+    "python_context_graph_python_rank_avg_ns="
+    f"{context_graph_timings['python_rank_ns'] // CONTEXT_GRAPH_BENCHMARK_ITERATIONS}"
+)
+print(f"python_context_graph_items={context_graph_result['context_graph_items']}")
+print(f"python_context_graph_digest={context_graph_result['context_graph_digest']}")
 print(f"python_deterministic_memo_iterations={MEMO_BENCHMARK_ITERATIONS}")
 print(f"python_deterministic_memo_visits={MEMO_BENCHMARK_VISITS}")
 print(f"python_deterministic_memo_rounds={MEMO_BENCHMARK_ROUNDS}")

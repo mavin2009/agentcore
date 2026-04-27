@@ -1,16 +1,21 @@
 #include "bridge.h"
+#include "agentcore/state/context/context_graph.h"
 #include "agentcore/state/intelligence/ops.h"
 #include "agentcore/runtime/model_api.h"
 #include "agentcore/runtime/tool_api.h"
 #include "agentcore/state/state_store.h"
 #include "agentcore/execution/proof.h"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstring>
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace agentcore::python_binding {
@@ -591,6 +596,73 @@ PyObject* load_object_from_json_buffer(const std::byte* bytes, std::size_t size,
     return res;
 }
 
+struct RuntimeKnowledgePathCacheKey {
+    InternedStringId subject{0};
+    InternedStringId relation{0};
+    uint32_t limit{0};
+    std::size_t entity_count{0};
+    std::size_t triple_count{0};
+    std::size_t pending_entity_count{0};
+    std::size_t pending_triple_count{0};
+
+    bool operator==(const RuntimeKnowledgePathCacheKey& other) const noexcept {
+        return subject == other.subject &&
+               relation == other.relation &&
+               limit == other.limit &&
+               entity_count == other.entity_count &&
+               triple_count == other.triple_count &&
+               pending_entity_count == other.pending_entity_count &&
+               pending_triple_count == other.pending_triple_count;
+    }
+};
+
+struct RuntimeKnowledgePathCacheKeyHash {
+    std::size_t operator()(const RuntimeKnowledgePathCacheKey& key) const noexcept {
+        std::size_t hash = static_cast<std::size_t>(key.subject);
+        hash = (hash * 1315423911U) ^ static_cast<std::size_t>(key.relation);
+        hash = (hash * 2654435761U) ^ static_cast<std::size_t>(key.limit);
+        hash = (hash * 11400714819323198485ULL) ^ key.entity_count;
+        hash = (hash * 1099511628211ULL) ^ key.triple_count;
+        hash = (hash * 1469598103934665603ULL) ^ key.pending_entity_count;
+        hash = (hash * 780291637U) ^ key.pending_triple_count;
+        return hash;
+    }
+};
+
+struct RuntimeKnowledgePathCacheTriple {
+    KnowledgeTripleId id{0};
+    InternedStringId subject{0};
+    InternedStringId relation{0};
+    InternedStringId object{0};
+    BlobRef payload{};
+};
+
+struct RuntimeKnowledgePathCache {
+    std::unordered_map<
+        RuntimeKnowledgePathCacheKey,
+        std::vector<RuntimeKnowledgePathCacheTriple>,
+        RuntimeKnowledgePathCacheKeyHash
+    > entries;
+};
+
+struct RuntimeContextGraphCache {
+    uint64_t key{0};
+    bool valid{false};
+    IntelligenceStore intelligence;
+    KnowledgeGraphStore knowledge_graph;
+    std::unique_ptr<ContextGraphIndex> index;
+    PyObject* result{nullptr};
+
+    ~RuntimeContextGraphCache() {
+        Py_XDECREF(result);
+    }
+
+    void clear_result() noexcept {
+        Py_XDECREF(result);
+        result = nullptr;
+    }
+};
+
 struct RuntimeViewProxy {
     PyObject_HEAD
     ExecutionContext* runtime{nullptr};
@@ -600,6 +672,8 @@ struct RuntimeViewProxy {
     const IntelligenceStore* intelligence{nullptr};
     KnowledgeGraphPatch pending_knowledge_graph_patch;
     IntelligencePatch pending_intelligence_patch;
+    RuntimeKnowledgePathCache knowledge_path_cache;
+    RuntimeContextGraphCache context_graph_cache;
     std::atomic<bool> active;
 };
 
@@ -621,6 +695,8 @@ struct OwnedStateSnapshot {
 void RuntimeViewProxy_dealloc(RuntimeViewProxy* self) {
     self->pending_knowledge_graph_patch.~KnowledgeGraphPatch();
     self->pending_intelligence_patch.~IntelligencePatch();
+    self->knowledge_path_cache.~RuntimeKnowledgePathCache();
+    self->context_graph_cache.~RuntimeContextGraphCache();
     self->active.~atomic();
     Py_TYPE(self)->tp_free(reinterpret_cast<PyObject*>(self));
 }
@@ -680,6 +756,8 @@ PyObject* create_runtime_view_proxy(ExecutionContext& context) {
         self->intelligence = &context.intelligence;
         new (&self->pending_knowledge_graph_patch) KnowledgeGraphPatch();
         new (&self->pending_intelligence_patch) IntelligencePatch();
+        new (&self->knowledge_path_cache) RuntimeKnowledgePathCache();
+        new (&self->context_graph_cache) RuntimeContextGraphCache();
         new (&self->active) std::atomic<bool>(true);
     }
     return reinterpret_cast<PyObject*>(self);
@@ -4439,6 +4517,631 @@ bool runtime_stage_knowledge_triple(PyObject* capsule, PyObject* spec, std::stri
     return true;
 }
 
+namespace {
+
+struct KnowledgeOverlayKey {
+    InternedStringId subject{0};
+    InternedStringId relation{0};
+    InternedStringId object{0};
+
+    bool operator==(const KnowledgeOverlayKey& other) const noexcept {
+        return subject == other.subject &&
+               relation == other.relation &&
+               object == other.object;
+    }
+};
+
+struct KnowledgeOverlayKeyHash {
+    std::size_t operator()(const KnowledgeOverlayKey& key) const noexcept {
+        std::size_t hash = static_cast<std::size_t>(key.subject);
+        hash = (hash * 1315423911U) ^ static_cast<std::size_t>(key.relation);
+        hash = (hash * 2654435761U) ^ static_cast<std::size_t>(key.object);
+        return hash;
+    }
+};
+
+struct KnowledgeOverlayPendingTriple {
+    KnowledgeOverlayKey key;
+    KnowledgeTripleId id{0};
+    BlobRef payload{};
+    bool exists_in_base{false};
+};
+
+struct KnowledgeOverlayTripleResult {
+    KnowledgeTripleId id{0};
+    InternedStringId subject{0};
+    InternedStringId relation{0};
+    InternedStringId object{0};
+    BlobRef payload{};
+};
+
+struct ScoredKnowledgePathTriple {
+    RuntimeKnowledgePathCacheTriple triple;
+    int64_t score{0};
+    uint8_t depth{0};
+    uint64_t order{0};
+};
+
+using KnowledgeOverlayPendingIndex =
+    std::unordered_map<KnowledgeOverlayKey, std::size_t, KnowledgeOverlayKeyHash>;
+using KnowledgeOverlaySeenSet =
+    std::unordered_set<KnowledgeOverlayKey, KnowledgeOverlayKeyHash>;
+
+[[nodiscard]] KnowledgeOverlayKey knowledge_overlay_key_from_triple(
+    const KnowledgeGraphStore& graph,
+    const KnowledgeTriple& triple
+) {
+    const KnowledgeEntity* subject = graph.find_entity(triple.subject);
+    const KnowledgeEntity* object = graph.find_entity(triple.object);
+    return KnowledgeOverlayKey{
+        subject == nullptr ? 0U : subject->label,
+        triple.relation,
+        object == nullptr ? 0U : object->label
+    };
+}
+
+[[nodiscard]] bool knowledge_overlay_key_matches(
+    const KnowledgeOverlayKey& key,
+    std::optional<InternedStringId> subject,
+    std::optional<InternedStringId> relation,
+    std::optional<InternedStringId> object
+) noexcept {
+    if (subject.has_value() && key.subject != *subject) {
+        return false;
+    }
+    if (relation.has_value() && key.relation != *relation) {
+        return false;
+    }
+    if (object.has_value() && key.object != *object) {
+        return false;
+    }
+    return true;
+}
+
+[[nodiscard]] std::vector<KnowledgeOverlayPendingTriple> build_knowledge_overlay_pending_triples(
+    const KnowledgeGraphStore& base,
+    const KnowledgeGraphPatch& patch,
+    KnowledgeOverlayPendingIndex* index
+) {
+    std::vector<KnowledgeOverlayPendingTriple> pending;
+    pending.reserve(patch.triples.size());
+    if (index == nullptr) {
+        return pending;
+    }
+    index->clear();
+    index->reserve(patch.triples.size());
+
+    KnowledgeTripleId next_staged_id = static_cast<KnowledgeTripleId>(base.triple_count() + 1U);
+    for (const KnowledgeTripleWrite& write : patch.triples) {
+        const KnowledgeOverlayKey key{write.subject_label, write.relation, write.object_label};
+        const auto existing_pending = index->find(key);
+        if (existing_pending != index->end()) {
+            KnowledgeOverlayPendingTriple& staged = pending[existing_pending->second];
+            if (!write.payload.empty()) {
+                staged.payload = write.payload;
+            }
+            continue;
+        }
+
+        const KnowledgeTriple* base_triple =
+            base.find_triple_by_labels(write.subject_label, write.relation, write.object_label);
+        const bool exists_in_base = base_triple != nullptr;
+        const KnowledgeTripleId id = exists_in_base ? base_triple->id : next_staged_id++;
+        const std::size_t offset = pending.size();
+        pending.push_back(KnowledgeOverlayPendingTriple{key, id, write.payload, exists_in_base});
+        index->emplace(key, offset);
+    }
+    return pending;
+}
+
+[[nodiscard]] std::size_t knowledge_overlay_entity_count(
+    const KnowledgeGraphStore& base,
+    const KnowledgeGraphPatch& patch
+) {
+    std::unordered_set<InternedStringId> pending_labels;
+    pending_labels.reserve(patch.entities.size() + (patch.triples.size() * 2U));
+
+    const auto add_label = [&](InternedStringId label) {
+        if (label != 0U && base.find_entity_by_label(label) == nullptr) {
+            pending_labels.insert(label);
+        }
+    };
+
+    for (const KnowledgeEntityWrite& entity : patch.entities) {
+        add_label(entity.label);
+    }
+    for (const KnowledgeTripleWrite& triple : patch.triples) {
+        add_label(triple.subject_label);
+        add_label(triple.object_label);
+    }
+    return base.entity_count() + pending_labels.size();
+}
+
+[[nodiscard]] std::size_t knowledge_overlay_triple_count(
+    const KnowledgeGraphStore& base,
+    const std::vector<KnowledgeOverlayPendingTriple>& pending
+) noexcept {
+    std::size_t staged_new_triples = 0U;
+    for (const KnowledgeOverlayPendingTriple& triple : pending) {
+        if (!triple.exists_in_base) {
+            ++staged_new_triples;
+        }
+    }
+    return base.triple_count() + staged_new_triples;
+}
+
+[[nodiscard]] int64_t knowledge_relation_rank(
+    const StringInterner& strings,
+    InternedStringId relation
+) {
+    const std::string_view name = strings.resolve(relation);
+    const auto contains = [&](std::string_view needle) {
+        return name.find(needle) != std::string_view::npos;
+    };
+    if (contains("evidence") || contains("support") || contains("prove") || contains("cite")) {
+        return 320;
+    }
+    if (contains("cause") || contains("affect") || contains("block") || contains("depend") ||
+        contains("require")) {
+        return 280;
+    }
+    if (contains("mitigate") || contains("resolve") || contains("route") || contains("own")) {
+        return 240;
+    }
+    if (contains("feature") || contains("has_") || contains("use") || contains("provide")) {
+        return 180;
+    }
+    return 100;
+}
+
+[[nodiscard]] RuntimeKnowledgePathCacheTriple knowledge_path_cache_triple(
+    const KnowledgeOverlayTripleResult& triple
+) noexcept {
+    return RuntimeKnowledgePathCacheTriple{
+        triple.id,
+        triple.subject,
+        triple.relation,
+        triple.object,
+        triple.payload
+    };
+}
+
+[[nodiscard]] KnowledgeOverlayTripleResult knowledge_overlay_triple_from_cache(
+    const RuntimeKnowledgePathCacheTriple& triple
+) noexcept {
+    return KnowledgeOverlayTripleResult{
+        triple.id,
+        triple.subject,
+        triple.relation,
+        triple.object,
+        triple.payload
+    };
+}
+
+bool set_interned_field(
+    PyObject* dict,
+    const char* field_name,
+    InternedStringId id,
+    const StringInterner& strings,
+    std::string* error_message
+) {
+    PyObject* value = nullptr;
+    if (id == 0U) {
+        Py_INCREF(Py_None);
+        value = Py_None;
+    } else {
+        value = unicode_from_utf8(strings.resolve(id));
+    }
+    return set_python_dict_item(dict, field_name, value, error_message);
+}
+
+PyObject* context_task_to_python(
+    const GraphHandle& handle,
+    const IntelligenceTask& task,
+    const BlobStore& blobs,
+    const StringInterner& strings,
+    std::string* error_message
+) {
+    PyObject* item = PyDict_New();
+    if (item == nullptr ||
+        !set_python_dict_item(item, "id", PyLong_FromUnsignedLong(task.id), error_message) ||
+        !set_interned_field(item, "key", task.key, strings, error_message) ||
+        !set_interned_field(item, "title", task.title, strings, error_message) ||
+        !set_interned_field(item, "owner", task.owner, strings, error_message) ||
+        !set_python_dict_item(item, "status", unicode_from_utf8(intelligence_task_status_name(task.status)), error_message) ||
+        !set_python_dict_item(item, "priority", PyLong_FromLong(task.priority), error_message) ||
+        !set_python_dict_item(item, "confidence", PyFloat_FromDouble(task.confidence), error_message) ||
+        !set_python_dict_item(item, "payload", intelligence_blob_to_python(handle, task.payload, blobs, strings, error_message), error_message) ||
+        !set_python_dict_item(item, "result", intelligence_blob_to_python(handle, task.result, blobs, strings, error_message), error_message)) {
+        Py_XDECREF(item);
+        return nullptr;
+    }
+    return item;
+}
+
+PyObject* context_claim_to_python(
+    const GraphHandle& handle,
+    const IntelligenceClaim& claim,
+    const BlobStore& blobs,
+    const StringInterner& strings,
+    std::string* error_message
+) {
+    PyObject* item = PyDict_New();
+    if (item == nullptr ||
+        !set_python_dict_item(item, "id", PyLong_FromUnsignedLong(claim.id), error_message) ||
+        !set_interned_field(item, "key", claim.key, strings, error_message) ||
+        !set_interned_field(item, "subject", claim.subject_label, strings, error_message) ||
+        !set_interned_field(item, "relation", claim.relation, strings, error_message) ||
+        !set_interned_field(item, "object", claim.object_label, strings, error_message) ||
+        !set_python_dict_item(item, "status", unicode_from_utf8(intelligence_claim_status_name(claim.status)), error_message) ||
+        !set_python_dict_item(item, "confidence", PyFloat_FromDouble(claim.confidence), error_message) ||
+        !set_python_dict_item(item, "statement", intelligence_blob_to_python(handle, claim.statement, blobs, strings, error_message), error_message)) {
+        Py_XDECREF(item);
+        return nullptr;
+    }
+    return item;
+}
+
+PyObject* context_evidence_to_python(
+    const GraphHandle& handle,
+    const IntelligenceEvidence& evidence,
+    const BlobStore& blobs,
+    const StringInterner& strings,
+    std::string* error_message
+) {
+    PyObject* item = PyDict_New();
+    if (item == nullptr ||
+        !set_python_dict_item(item, "id", PyLong_FromUnsignedLong(evidence.id), error_message) ||
+        !set_interned_field(item, "key", evidence.key, strings, error_message) ||
+        !set_interned_field(item, "kind", evidence.kind, strings, error_message) ||
+        !set_interned_field(item, "source", evidence.source, strings, error_message) ||
+        !set_interned_field(item, "task_key", evidence.task_key, strings, error_message) ||
+        !set_interned_field(item, "claim_key", evidence.claim_key, strings, error_message) ||
+        !set_python_dict_item(item, "confidence", PyFloat_FromDouble(evidence.confidence), error_message) ||
+        !set_python_dict_item(item, "content", intelligence_blob_to_python(handle, evidence.content, blobs, strings, error_message), error_message)) {
+        Py_XDECREF(item);
+        return nullptr;
+    }
+    return item;
+}
+
+PyObject* context_decision_to_python(
+    const GraphHandle& handle,
+    const IntelligenceDecision& decision,
+    const BlobStore& blobs,
+    const StringInterner& strings,
+    std::string* error_message
+) {
+    PyObject* item = PyDict_New();
+    if (item == nullptr ||
+        !set_python_dict_item(item, "id", PyLong_FromUnsignedLong(decision.id), error_message) ||
+        !set_interned_field(item, "key", decision.key, strings, error_message) ||
+        !set_interned_field(item, "task_key", decision.task_key, strings, error_message) ||
+        !set_interned_field(item, "claim_key", decision.claim_key, strings, error_message) ||
+        !set_python_dict_item(item, "status", unicode_from_utf8(intelligence_decision_status_name(decision.status)), error_message) ||
+        !set_python_dict_item(item, "confidence", PyFloat_FromDouble(decision.confidence), error_message) ||
+        !set_python_dict_item(item, "summary", intelligence_blob_to_python(handle, decision.summary, blobs, strings, error_message), error_message)) {
+        Py_XDECREF(item);
+        return nullptr;
+    }
+    return item;
+}
+
+PyObject* context_memory_to_python(
+    const GraphHandle& handle,
+    const IntelligenceMemoryEntry& memory,
+    const BlobStore& blobs,
+    const StringInterner& strings,
+    std::string* error_message
+) {
+    PyObject* item = PyDict_New();
+    if (item == nullptr ||
+        !set_python_dict_item(item, "id", PyLong_FromUnsignedLong(memory.id), error_message) ||
+        !set_interned_field(item, "key", memory.key, strings, error_message) ||
+        !set_interned_field(item, "scope", memory.scope, strings, error_message) ||
+        !set_interned_field(item, "task_key", memory.task_key, strings, error_message) ||
+        !set_interned_field(item, "claim_key", memory.claim_key, strings, error_message) ||
+        !set_python_dict_item(item, "layer", unicode_from_utf8(intelligence_memory_layer_name(memory.layer)), error_message) ||
+        !set_python_dict_item(item, "importance", PyFloat_FromDouble(memory.importance), error_message) ||
+        !set_python_dict_item(item, "content", intelligence_blob_to_python(handle, memory.content, blobs, strings, error_message), error_message)) {
+        Py_XDECREF(item);
+        return nullptr;
+    }
+    return item;
+}
+
+PyObject* context_knowledge_to_python(
+    const GraphHandle& handle,
+    const KnowledgeGraphStore& knowledge_graph,
+    const KnowledgeTriple& triple,
+    const BlobStore& blobs,
+    const StringInterner& strings,
+    std::string* error_message
+) {
+    const KnowledgeEntity* subject = knowledge_graph.find_entity(triple.subject);
+    const KnowledgeEntity* object = knowledge_graph.find_entity(triple.object);
+    if (subject == nullptr || object == nullptr) {
+        if (error_message != nullptr) {
+            *error_message = "context graph selected an invalid knowledge triple";
+        }
+        return nullptr;
+    }
+    PyObject* item = PyDict_New();
+    if (item == nullptr ||
+        !set_python_dict_item(item, "id", PyLong_FromUnsignedLong(triple.id), error_message) ||
+        !set_interned_field(item, "subject", subject->label, strings, error_message) ||
+        !set_interned_field(item, "relation", triple.relation, strings, error_message) ||
+        !set_interned_field(item, "object", object->label, strings, error_message) ||
+        !set_python_dict_item(item, "payload", handle.convert_value_to_python(Value{triple.payload}, blobs, strings, error_message), error_message) ||
+        !set_python_dict_item(item, "source", unicode_from_utf8("native"), error_message)) {
+        Py_XDECREF(item);
+        return nullptr;
+    }
+    return item;
+}
+
+PyObject* context_record_to_python(
+    const ContextGraphRecordRef& ref,
+    const GraphHandle& handle,
+    const IntelligenceStore& intelligence,
+    const KnowledgeGraphStore& knowledge_graph,
+    const BlobStore& blobs,
+    const StringInterner& strings,
+    std::string* error_message
+) {
+    switch (ref.kind) {
+        case ContextRecordKind::Task: {
+            const IntelligenceTask* task = intelligence.find_task(ref.id);
+            return task == nullptr ? nullptr : context_task_to_python(handle, *task, blobs, strings, error_message);
+        }
+        case ContextRecordKind::Claim: {
+            const IntelligenceClaim* claim = intelligence.find_claim(ref.id);
+            return claim == nullptr ? nullptr : context_claim_to_python(handle, *claim, blobs, strings, error_message);
+        }
+        case ContextRecordKind::Evidence: {
+            const IntelligenceEvidence* evidence = intelligence.find_evidence(ref.id);
+            return evidence == nullptr ? nullptr : context_evidence_to_python(handle, *evidence, blobs, strings, error_message);
+        }
+        case ContextRecordKind::Decision: {
+            const IntelligenceDecision* decision = intelligence.find_decision(ref.id);
+            return decision == nullptr ? nullptr : context_decision_to_python(handle, *decision, blobs, strings, error_message);
+        }
+        case ContextRecordKind::Memory: {
+            const IntelligenceMemoryEntry* memory = intelligence.find_memory(ref.id);
+            return memory == nullptr ? nullptr : context_memory_to_python(handle, *memory, blobs, strings, error_message);
+        }
+        case ContextRecordKind::Knowledge: {
+            const KnowledgeTriple* triple = knowledge_graph.find_triple(ref.id);
+            return triple == nullptr ? nullptr : context_knowledge_to_python(handle, knowledge_graph, *triple, blobs, strings, error_message);
+        }
+        case ContextRecordKind::Count: break;
+    }
+    if (error_message != nullptr && error_message->empty()) {
+        *error_message = "context graph selected an unknown record kind";
+    }
+    return nullptr;
+}
+
+bool build_context_query_plan(
+    PyObject* spec,
+    RuntimeViewProxy* view,
+    ContextQueryPlan* plan,
+    std::string* error_message
+) {
+    if (!require_spec_dict(spec, error_message)) {
+        return false;
+    }
+
+    if (PyObject* include_value = PyDict_GetItemString(spec, "include");
+        include_value != nullptr && include_value != Py_None) {
+        if (PyUnicode_Check(include_value)) {
+            Py_ssize_t size = 0;
+            const char* utf8 = PyUnicode_AsUTF8AndSize(include_value, &size);
+            if (utf8 == nullptr) {
+                if (error_message != nullptr) {
+                    *error_message = fetch_python_error();
+                }
+                return false;
+            }
+            static_cast<void>(context_query_plan_add_selector(*plan, std::string_view(utf8, static_cast<std::size_t>(size))));
+        } else if (PySequence_Check(include_value)) {
+            const Py_ssize_t size = PySequence_Size(include_value);
+            if (size < 0) {
+                if (error_message != nullptr) {
+                    *error_message = fetch_python_error();
+                }
+                return false;
+            }
+            for (Py_ssize_t index = 0; index < size; ++index) {
+                PyObject* item = PySequence_GetItem(include_value, index);
+                if (item == nullptr) {
+                    if (error_message != nullptr) {
+                        *error_message = fetch_python_error();
+                    }
+                    return false;
+                }
+                if (!PyUnicode_Check(item)) {
+                    Py_DECREF(item);
+                    if (error_message != nullptr) {
+                        *error_message = "ContextSpec.include entries must be strings";
+                    }
+                    return false;
+                }
+                Py_ssize_t text_size = 0;
+                const char* utf8 = PyUnicode_AsUTF8AndSize(item, &text_size);
+                if (utf8 == nullptr) {
+                    Py_DECREF(item);
+                    if (error_message != nullptr) {
+                        *error_message = fetch_python_error();
+                    }
+                    return false;
+                }
+                static_cast<void>(context_query_plan_add_selector(
+                    *plan,
+                    std::string_view(utf8, static_cast<std::size_t>(text_size))
+                ));
+                Py_DECREF(item);
+            }
+        } else {
+            if (error_message != nullptr) {
+                *error_message = "ContextSpec.include must be a string or sequence of strings";
+            }
+            return false;
+        }
+    }
+
+    uint32_t ignored_mask = 0U;
+    if (!parse_optional_spec_string_id(spec, "task_key", view->runtime->strings, &plan->task_key, 0U, &ignored_mask, error_message) ||
+        !parse_optional_spec_string_id(spec, "claim_key", view->runtime->strings, &plan->claim_key, 0U, &ignored_mask, error_message) ||
+        !parse_optional_spec_string_id(spec, "subject", view->runtime->strings, &plan->subject_label, 0U, &ignored_mask, error_message) ||
+        !parse_optional_spec_string_id(spec, "relation", view->runtime->strings, &plan->relation, 0U, &ignored_mask, error_message) ||
+        !parse_optional_spec_string_id(spec, "object", view->runtime->strings, &plan->object_label, 0U, &ignored_mask, error_message) ||
+        !parse_optional_spec_string_id(spec, "owner", view->runtime->strings, &plan->owner, 0U, &ignored_mask, error_message) ||
+        !parse_optional_spec_string_id(spec, "source", view->runtime->strings, &plan->source, 0U, &ignored_mask, error_message) ||
+        !parse_optional_spec_string_id(spec, "scope", view->runtime->strings, &plan->scope, 0U, &ignored_mask, error_message) ||
+        !parse_optional_query_limit(spec, "budget_items", &plan->limit, error_message) ||
+        !parse_optional_query_limit(spec, "limit_per_source", &plan->limit_per_source, error_message)) {
+        return false;
+    }
+
+    if (plan->limit == 0U || plan->limit == std::numeric_limits<uint32_t>::max()) {
+        plan->limit = 32U;
+    }
+    if (plan->limit_per_source == 0U) {
+        plan->limit_per_source = 1U;
+    }
+    const uint32_t selector_count = std::max<uint32_t>(1U, plan->selector_count);
+    plan->limit = std::max<uint32_t>(plan->limit, plan->limit_per_source * selector_count);
+    return true;
+}
+
+void mix_context_cache_hash(uint64_t* hash, uint64_t value) noexcept {
+    *hash ^= value + 0x9e3779b97f4a7c15ULL + (*hash << 6U) + (*hash >> 2U);
+}
+
+void mix_context_cache_blob(uint64_t* hash, BlobRef ref) noexcept {
+    mix_context_cache_hash(hash, ref.pool_id);
+    mix_context_cache_hash(hash, ref.offset);
+    mix_context_cache_hash(hash, ref.size);
+}
+
+uint64_t context_graph_plan_hash(const ContextQueryPlan& plan) noexcept {
+    uint64_t hash = 0xcbf29ce484222325ULL;
+    mix_context_cache_hash(&hash, plan.include_mask);
+    mix_context_cache_hash(&hash, plan.task_key);
+    mix_context_cache_hash(&hash, plan.claim_key);
+    mix_context_cache_hash(&hash, plan.subject_label);
+    mix_context_cache_hash(&hash, plan.relation);
+    mix_context_cache_hash(&hash, plan.object_label);
+    mix_context_cache_hash(&hash, plan.owner);
+    mix_context_cache_hash(&hash, plan.source);
+    mix_context_cache_hash(&hash, plan.scope);
+    mix_context_cache_hash(&hash, plan.limit);
+    mix_context_cache_hash(&hash, plan.limit_per_source);
+    mix_context_cache_hash(&hash, plan.selector_count);
+    mix_context_cache_hash(&hash, plan.supported_claims_only ? 1U : 0U);
+    mix_context_cache_hash(&hash, plan.confirmed_claims_only ? 1U : 0U);
+    mix_context_cache_hash(&hash, plan.selected_decisions_only ? 1U : 0U);
+    mix_context_cache_hash(&hash, plan.knowledge_neighborhood ? 1U : 0U);
+    for (uint16_t order : plan.selector_order) {
+        mix_context_cache_hash(&hash, order);
+    }
+    return hash;
+}
+
+uint64_t context_graph_patch_hash(
+    const IntelligencePatch& intelligence,
+    const KnowledgeGraphPatch& knowledge_graph
+) noexcept {
+    uint64_t hash = 0x84222325cbf29ce4ULL;
+    mix_context_cache_hash(&hash, intelligence.tasks.size());
+    for (const IntelligenceTaskWrite& write : intelligence.tasks) {
+        mix_context_cache_hash(&hash, write.key);
+        mix_context_cache_hash(&hash, write.title);
+        mix_context_cache_hash(&hash, write.owner);
+        mix_context_cache_blob(&hash, write.payload);
+        mix_context_cache_blob(&hash, write.result);
+        mix_context_cache_hash(&hash, static_cast<uint8_t>(write.status));
+        mix_context_cache_hash(&hash, static_cast<uint32_t>(write.priority));
+        mix_context_cache_hash(&hash, static_cast<uint32_t>(std::max(0.0F, write.confidence) * 100000.0F));
+        mix_context_cache_hash(&hash, write.field_mask);
+    }
+    mix_context_cache_hash(&hash, intelligence.claims.size());
+    for (const IntelligenceClaimWrite& write : intelligence.claims) {
+        mix_context_cache_hash(&hash, write.key);
+        mix_context_cache_hash(&hash, write.subject_label);
+        mix_context_cache_hash(&hash, write.relation);
+        mix_context_cache_hash(&hash, write.object_label);
+        mix_context_cache_blob(&hash, write.statement);
+        mix_context_cache_hash(&hash, static_cast<uint8_t>(write.status));
+        mix_context_cache_hash(&hash, static_cast<uint32_t>(std::max(0.0F, write.confidence) * 100000.0F));
+        mix_context_cache_hash(&hash, write.field_mask);
+    }
+    mix_context_cache_hash(&hash, intelligence.evidence.size());
+    for (const IntelligenceEvidenceWrite& write : intelligence.evidence) {
+        mix_context_cache_hash(&hash, write.key);
+        mix_context_cache_hash(&hash, write.kind);
+        mix_context_cache_hash(&hash, write.source);
+        mix_context_cache_blob(&hash, write.content);
+        mix_context_cache_hash(&hash, write.task_key);
+        mix_context_cache_hash(&hash, write.claim_key);
+        mix_context_cache_hash(&hash, static_cast<uint32_t>(std::max(0.0F, write.confidence) * 100000.0F));
+        mix_context_cache_hash(&hash, write.field_mask);
+    }
+    mix_context_cache_hash(&hash, intelligence.decisions.size());
+    for (const IntelligenceDecisionWrite& write : intelligence.decisions) {
+        mix_context_cache_hash(&hash, write.key);
+        mix_context_cache_hash(&hash, write.task_key);
+        mix_context_cache_hash(&hash, write.claim_key);
+        mix_context_cache_blob(&hash, write.summary);
+        mix_context_cache_hash(&hash, static_cast<uint8_t>(write.status));
+        mix_context_cache_hash(&hash, static_cast<uint32_t>(std::max(0.0F, write.confidence) * 100000.0F));
+        mix_context_cache_hash(&hash, write.field_mask);
+    }
+    mix_context_cache_hash(&hash, intelligence.memories.size());
+    for (const IntelligenceMemoryWrite& write : intelligence.memories) {
+        mix_context_cache_hash(&hash, write.key);
+        mix_context_cache_hash(&hash, static_cast<uint8_t>(write.layer));
+        mix_context_cache_hash(&hash, write.scope);
+        mix_context_cache_blob(&hash, write.content);
+        mix_context_cache_hash(&hash, write.task_key);
+        mix_context_cache_hash(&hash, write.claim_key);
+        mix_context_cache_hash(&hash, static_cast<uint32_t>(std::max(0.0F, write.importance) * 100000.0F));
+        mix_context_cache_hash(&hash, write.field_mask);
+    }
+    mix_context_cache_hash(&hash, knowledge_graph.entities.size());
+    for (const KnowledgeEntityWrite& write : knowledge_graph.entities) {
+        mix_context_cache_hash(&hash, write.label);
+        mix_context_cache_blob(&hash, write.payload);
+    }
+    mix_context_cache_hash(&hash, knowledge_graph.triples.size());
+    for (const KnowledgeTripleWrite& write : knowledge_graph.triples) {
+        mix_context_cache_hash(&hash, write.subject_label);
+        mix_context_cache_hash(&hash, write.relation);
+        mix_context_cache_hash(&hash, write.object_label);
+        mix_context_cache_blob(&hash, write.payload);
+    }
+    return hash;
+}
+
+uint64_t context_graph_cache_key(RuntimeViewProxy* view, const ContextQueryPlan& plan) noexcept {
+    uint64_t hash = context_graph_plan_hash(plan);
+    mix_context_cache_hash(&hash, view->intelligence == nullptr ? 0U : view->intelligence->task_count());
+    mix_context_cache_hash(&hash, view->intelligence == nullptr ? 0U : view->intelligence->claim_count());
+    mix_context_cache_hash(&hash, view->intelligence == nullptr ? 0U : view->intelligence->evidence_count());
+    mix_context_cache_hash(&hash, view->intelligence == nullptr ? 0U : view->intelligence->decision_count());
+    mix_context_cache_hash(&hash, view->intelligence == nullptr ? 0U : view->intelligence->memory_count());
+    mix_context_cache_hash(&hash, view->runtime->knowledge_graph.entity_count());
+    mix_context_cache_hash(&hash, view->runtime->knowledge_graph.triple_count());
+    mix_context_cache_hash(
+        &hash,
+        context_graph_patch_hash(view->pending_intelligence_patch, view->pending_knowledge_graph_patch)
+    );
+    return hash;
+}
+
+} // namespace
+
 PyObject* runtime_query_knowledge(PyObject* capsule, PyObject* spec, std::string* error_message) {
     RuntimeViewProxy* view = runtime_view_from_object(capsule, error_message);
     if (view == nullptr || !require_spec_dict(spec, error_message)) {
@@ -4510,40 +5213,285 @@ PyObject* runtime_query_knowledge(PyObject* capsule, PyObject* spec, std::string
     const std::optional<InternedStringId> object =
         object_id == 0U ? std::nullopt : std::optional<InternedStringId>{object_id};
 
-    KnowledgeGraphStore graph = view->runtime->knowledge_graph;
-    if (!view->pending_knowledge_graph_patch.empty()) {
-        graph.apply(view->pending_knowledge_graph_patch);
-    }
+    const KnowledgeGraphStore& graph = view->runtime->knowledge_graph;
+    KnowledgeOverlayPendingIndex pending_index;
+    std::vector<KnowledgeOverlayPendingTriple> pending_triples = build_knowledge_overlay_pending_triples(
+        graph,
+        view->pending_knowledge_graph_patch,
+        &pending_index
+    );
+    const std::size_t overlay_triple_count = knowledge_overlay_triple_count(graph, pending_triples);
 
-    std::vector<const KnowledgeTriple*> triples;
-    triples.reserve(std::min<std::size_t>(graph.triple_count(), limit));
-    std::unordered_set<KnowledgeTripleId> seen;
-    seen.reserve(std::min<std::size_t>(graph.triple_count(), limit));
+    std::vector<KnowledgeOverlayTripleResult> triples;
+    triples.reserve(std::min<std::size_t>(overlay_triple_count, limit));
+    KnowledgeOverlaySeenSet seen;
+    seen.reserve(std::min<std::size_t>(overlay_triple_count, limit));
 
-    const auto append_matches = [&](std::vector<const KnowledgeTriple*> matches) {
+    const auto append_base_matches = [&](std::vector<const KnowledgeTriple*> matches) {
         for (const KnowledgeTriple* triple : matches) {
-            if (triple == nullptr || seen.find(triple->id) != seen.end()) {
+            if (triple == nullptr) {
                 continue;
             }
-            seen.insert(triple->id);
-            triples.push_back(triple);
+            const KnowledgeOverlayKey key = knowledge_overlay_key_from_triple(graph, *triple);
+            if (key.subject == 0U || key.object == 0U || seen.find(key) != seen.end()) {
+                continue;
+            }
+            BlobRef payload = triple->payload;
+            const auto pending = pending_index.find(key);
+            if (pending != pending_index.end() && !pending_triples[pending->second].payload.empty()) {
+                payload = pending_triples[pending->second].payload;
+            }
+            seen.insert(key);
+            triples.push_back(KnowledgeOverlayTripleResult{
+                triple->id,
+                key.subject,
+                key.relation,
+                key.object,
+                payload
+            });
             if (triples.size() >= limit) {
                 return;
             }
         }
     };
 
+    const auto append_pending_matches = [&](
+        std::optional<InternedStringId> match_subject,
+        std::optional<InternedStringId> match_relation,
+        std::optional<InternedStringId> match_object
+    ) {
+        for (const KnowledgeOverlayPendingTriple& triple : pending_triples) {
+            if (triple.exists_in_base ||
+                seen.find(triple.key) != seen.end() ||
+                !knowledge_overlay_key_matches(triple.key, match_subject, match_relation, match_object)) {
+                continue;
+            }
+            seen.insert(triple.key);
+            triples.push_back(KnowledgeOverlayTripleResult{
+                triple.id,
+                triple.key.subject,
+                triple.key.relation,
+                triple.key.object,
+                triple.payload
+            });
+            if (triples.size() >= limit) {
+                return;
+            }
+        }
+    };
+
+    const auto append_matches = [&](
+        std::optional<InternedStringId> match_subject,
+        std::optional<InternedStringId> match_relation,
+        std::optional<InternedStringId> match_object
+    ) {
+        append_base_matches(graph.match(match_subject, match_relation, match_object));
+        if (triples.size() < limit) {
+            append_pending_matches(match_subject, match_relation, match_object);
+        }
+    };
+
     if (limit > 0U) {
         const bool centered_on_subject = subject.has_value() && !object.has_value();
         if (direction == "incoming" && centered_on_subject) {
-            append_matches(graph.match(std::nullopt, relation, subject));
-        } else if ((direction == "both" || direction == "neighborhood") && centered_on_subject) {
-            append_matches(graph.match(subject, relation, std::nullopt));
+            append_matches(std::nullopt, relation, subject);
+        } else if (direction == "neighborhood" && centered_on_subject) {
+            const RuntimeKnowledgePathCacheKey cache_key{
+                *subject,
+                relation.value_or(0U),
+                limit,
+                graph.entity_count(),
+                overlay_triple_count,
+                view->pending_knowledge_graph_patch.entities.size(),
+                view->pending_knowledge_graph_patch.triples.size()
+            };
+            const auto cached = view->knowledge_path_cache.entries.find(cache_key);
+            if (cached != view->knowledge_path_cache.entries.end()) {
+                for (const RuntimeKnowledgePathCacheTriple& cached_triple : cached->second) {
+                    const KnowledgeOverlayKey key{
+                        cached_triple.subject,
+                        cached_triple.relation,
+                        cached_triple.object
+                    };
+                    if (seen.find(key) != seen.end()) {
+                        continue;
+                    }
+                    seen.insert(key);
+                    triples.push_back(knowledge_overlay_triple_from_cache(cached_triple));
+                    if (triples.size() >= limit) {
+                        break;
+                    }
+                }
+            } else {
+                const std::size_t bounded_limit = limit == std::numeric_limits<uint32_t>::max()
+                    ? overlay_triple_count
+                    : static_cast<std::size_t>(limit);
+                const std::size_t candidate_reserve =
+                    std::min<std::size_t>(overlay_triple_count, bounded_limit * 4U);
+                std::vector<ScoredKnowledgePathTriple> candidates;
+                candidates.reserve(candidate_reserve);
+                KnowledgeOverlaySeenSet candidate_seen;
+                candidate_seen.reserve(candidate_reserve);
+                uint64_t candidate_order = 0U;
+
+                const auto collect_ranked_matches = [&](
+                    std::optional<InternedStringId> match_subject,
+                    std::optional<InternedStringId> match_relation,
+                    std::optional<InternedStringId> match_object,
+                    uint8_t depth,
+                    int64_t direction_bonus,
+                    int64_t frontier_bonus
+                ) {
+                    const auto append_ranked = [&](KnowledgeOverlayTripleResult triple) {
+                        const KnowledgeOverlayKey key{triple.subject, triple.relation, triple.object};
+                        if (seen.find(key) != seen.end() || candidate_seen.find(key) != candidate_seen.end()) {
+                            return;
+                        }
+                        candidate_seen.insert(key);
+                        const int64_t depth_base = depth == 1U ? 100000 : 70000;
+                        const int64_t relation_score =
+                            knowledge_relation_rank(view->runtime->strings, triple.relation) * 10;
+                        const int64_t score =
+                            depth_base + relation_score + direction_bonus + frontier_bonus;
+                        candidates.push_back(ScoredKnowledgePathTriple{
+                            knowledge_path_cache_triple(triple),
+                            score,
+                            depth,
+                            candidate_order++
+                        });
+                    };
+
+                    for (const KnowledgeTriple* base_triple : graph.match(match_subject, match_relation, match_object)) {
+                        if (base_triple == nullptr) {
+                            continue;
+                        }
+                        const KnowledgeOverlayKey key = knowledge_overlay_key_from_triple(graph, *base_triple);
+                        if (key.subject == 0U || key.object == 0U) {
+                            continue;
+                        }
+                        BlobRef payload = base_triple->payload;
+                        const auto pending = pending_index.find(key);
+                        if (pending != pending_index.end() && !pending_triples[pending->second].payload.empty()) {
+                            payload = pending_triples[pending->second].payload;
+                        }
+                        append_ranked(KnowledgeOverlayTripleResult{
+                            base_triple->id,
+                            key.subject,
+                            key.relation,
+                            key.object,
+                            payload
+                        });
+                    }
+
+                    for (const KnowledgeOverlayPendingTriple& pending_triple : pending_triples) {
+                        if (pending_triple.exists_in_base ||
+                            !knowledge_overlay_key_matches(
+                                pending_triple.key,
+                                match_subject,
+                                match_relation,
+                                match_object
+                            )) {
+                            continue;
+                        }
+                        append_ranked(KnowledgeOverlayTripleResult{
+                            pending_triple.id,
+                            pending_triple.key.subject,
+                            pending_triple.key.relation,
+                            pending_triple.key.object,
+                            pending_triple.payload
+                        });
+                    }
+                };
+
+                collect_ranked_matches(subject, relation, std::nullopt, 1U, 220, 0);
+                collect_ranked_matches(std::nullopt, relation, subject, 1U, 180, 0);
+
+                std::unordered_map<InternedStringId, uint32_t> frontier_counts;
+                frontier_counts.reserve(candidates.size());
+                for (const ScoredKnowledgePathTriple& candidate : candidates) {
+                    if (candidate.depth != 1U) {
+                        continue;
+                    }
+                    const RuntimeKnowledgePathCacheTriple& triple = candidate.triple;
+                    if (triple.subject == *subject && triple.object != *subject) {
+                        ++frontier_counts[triple.object];
+                    } else if (triple.object == *subject && triple.subject != *subject) {
+                        ++frontier_counts[triple.subject];
+                    }
+                }
+
+                std::vector<std::pair<InternedStringId, uint32_t>> frontier;
+                frontier.reserve(frontier_counts.size());
+                for (const auto& entry : frontier_counts) {
+                    frontier.push_back(entry);
+                }
+                std::sort(frontier.begin(), frontier.end(), [](const auto& left, const auto& right) {
+                    if (left.second != right.second) {
+                        return left.second > right.second;
+                    }
+                    return left.first < right.first;
+                });
+
+                constexpr std::size_t kMaxNeighborhoodFrontier = 32U;
+                const std::size_t frontier_limit = std::min(frontier.size(), kMaxNeighborhoodFrontier);
+                for (std::size_t index = 0U; index < frontier_limit; ++index) {
+                    const InternedStringId frontier_label = frontier[index].first;
+                    const int64_t frontier_bonus = static_cast<int64_t>(frontier[index].second) * 120;
+                    collect_ranked_matches(frontier_label, relation, std::nullopt, 2U, 110, frontier_bonus);
+                    collect_ranked_matches(std::nullopt, relation, frontier_label, 2U, 90, frontier_bonus);
+                }
+
+                std::sort(candidates.begin(), candidates.end(), [](const auto& left, const auto& right) {
+                    if (left.score != right.score) {
+                        return left.score > right.score;
+                    }
+                    if (left.depth != right.depth) {
+                        return left.depth < right.depth;
+                    }
+                    if (left.triple.subject != right.triple.subject) {
+                        return left.triple.subject < right.triple.subject;
+                    }
+                    if (left.triple.relation != right.triple.relation) {
+                        return left.triple.relation < right.triple.relation;
+                    }
+                    if (left.triple.object != right.triple.object) {
+                        return left.triple.object < right.triple.object;
+                    }
+                    return left.order < right.order;
+                });
+
+                std::vector<RuntimeKnowledgePathCacheTriple> cache_value;
+                cache_value.reserve(std::min<std::size_t>(candidates.size(), limit));
+                for (const ScoredKnowledgePathTriple& candidate : candidates) {
+                    const KnowledgeOverlayKey key{
+                        candidate.triple.subject,
+                        candidate.triple.relation,
+                        candidate.triple.object
+                    };
+                    if (seen.find(key) != seen.end()) {
+                        continue;
+                    }
+                    seen.insert(key);
+                    triples.push_back(knowledge_overlay_triple_from_cache(candidate.triple));
+                    cache_value.push_back(candidate.triple);
+                    if (triples.size() >= limit) {
+                        break;
+                    }
+                }
+
+                constexpr std::size_t kMaxPathCacheEntries = 64U;
+                if (view->knowledge_path_cache.entries.size() >= kMaxPathCacheEntries) {
+                    view->knowledge_path_cache.entries.clear();
+                }
+                view->knowledge_path_cache.entries.emplace(cache_key, std::move(cache_value));
+            }
+        } else if (direction == "both" && centered_on_subject) {
+            append_matches(subject, relation, std::nullopt);
             if (triples.size() < limit) {
-                append_matches(graph.match(std::nullopt, relation, subject));
+                append_matches(std::nullopt, relation, subject);
             }
         } else {
-            append_matches(graph.match(subject, relation, object));
+            append_matches(subject, relation, object);
         }
     }
 
@@ -4560,39 +5508,33 @@ PyObject* runtime_query_knowledge(PyObject* capsule, PyObject* spec, std::string
         return nullptr;
     }
 
-    for (const KnowledgeTriple* triple : triples) {
-        const KnowledgeEntity* subject_entity = graph.find_entity(triple->subject);
-        const KnowledgeEntity* object_entity = graph.find_entity(triple->object);
-        if (subject_entity == nullptr || object_entity == nullptr) {
-            continue;
-        }
-
+    for (const KnowledgeOverlayTripleResult& triple : triples) {
         PyObject* item = PyDict_New();
         if (item == nullptr ||
-            !set_python_dict_item(item, "id", PyLong_FromUnsignedLong(triple->id), error_message) ||
+            !set_python_dict_item(item, "id", PyLong_FromUnsignedLong(triple.id), error_message) ||
             !set_python_dict_item(
                 item,
                 "subject",
-                unicode_from_utf8(view->runtime->strings.resolve(subject_entity->label)),
+                unicode_from_utf8(view->runtime->strings.resolve(triple.subject)),
                 error_message
             ) ||
             !set_python_dict_item(
                 item,
                 "relation",
-                unicode_from_utf8(view->runtime->strings.resolve(triple->relation)),
+                unicode_from_utf8(view->runtime->strings.resolve(triple.relation)),
                 error_message
             ) ||
             !set_python_dict_item(
                 item,
                 "object",
-                unicode_from_utf8(view->runtime->strings.resolve(object_entity->label)),
+                unicode_from_utf8(view->runtime->strings.resolve(triple.object)),
                 error_message
             ) ||
             !set_python_dict_item(
                 item,
                 "payload",
                 handle->convert_value_to_python(
-                    Value{triple->payload},
+                    Value{triple.payload},
                     view->runtime->blobs,
                     view->runtime->strings,
                     error_message
@@ -4620,8 +5562,13 @@ PyObject* runtime_query_knowledge(PyObject* capsule, PyObject* spec, std::string
         Py_DECREF(item);
     }
 
-    if (!set_python_dict_item(counts, "entities", PyLong_FromSize_t(graph.entity_count()), error_message) ||
-        !set_python_dict_item(counts, "triples", PyLong_FromSize_t(graph.triple_count()), error_message) ||
+    if (!set_python_dict_item(
+            counts,
+            "entities",
+            PyLong_FromSize_t(knowledge_overlay_entity_count(graph, view->pending_knowledge_graph_patch)),
+            error_message
+        ) ||
+        !set_python_dict_item(counts, "triples", PyLong_FromSize_t(overlay_triple_count), error_message) ||
         !set_python_dict_item(result, "triples", list, error_message) ||
         !set_python_dict_item(result, "counts", counts, error_message) ||
         !set_python_dict_item(
@@ -5005,6 +5952,150 @@ bool resolve_runtime_intelligence_store(
         out_store->apply(view->pending_intelligence_patch);
     }
     return true;
+}
+
+PyObject* runtime_rank_context_graph(PyObject* capsule, PyObject* spec, std::string* error_message) {
+    RuntimeViewProxy* view = runtime_view_from_object(capsule, error_message);
+    if (view == nullptr) {
+        return nullptr;
+    }
+
+    GraphHandle* handle = GraphHandleRegistry::instance().find(view->runtime->graph_id);
+    if (handle == nullptr) {
+        if (error_message != nullptr) {
+            *error_message = "Graph handle not found";
+        }
+        return nullptr;
+    }
+
+    ContextQueryPlan plan;
+    if (!build_context_query_plan(spec, view, &plan, error_message)) {
+        return nullptr;
+    }
+
+    const uint64_t cache_key = context_graph_cache_key(view, plan);
+    RuntimeContextGraphCache& cache = view->context_graph_cache;
+    if (cache.valid && cache.key == cache_key && cache.result != nullptr) {
+        Py_INCREF(cache.result);
+        return cache.result;
+    }
+
+    if (!cache.valid || cache.key != cache_key || cache.index == nullptr) {
+        cache.clear_result();
+        cache.intelligence = *view->intelligence;
+        if (!view->pending_intelligence_patch.empty()) {
+            cache.intelligence.apply(view->pending_intelligence_patch);
+        }
+        cache.knowledge_graph = view->runtime->knowledge_graph;
+        if (!view->pending_knowledge_graph_patch.empty()) {
+            cache.knowledge_graph.apply(view->pending_knowledge_graph_patch);
+        }
+        cache.index = std::make_unique<ContextGraphIndex>(
+            cache.intelligence,
+            cache.knowledge_graph,
+            plan
+        );
+        cache.key = cache_key;
+        cache.valid = true;
+    } else {
+        cache.clear_result();
+    }
+
+    const ContextGraphResult ranked = cache.index->rank();
+    PyObject* result = PyDict_New();
+    PyObject* records = PyList_New(0);
+    PyObject* counts = PyDict_New();
+    if (result == nullptr || records == nullptr || counts == nullptr) {
+        Py_XDECREF(result);
+        Py_XDECREF(records);
+        Py_XDECREF(counts);
+        if (error_message != nullptr) {
+            *error_message = fetch_python_error();
+        }
+        return nullptr;
+    }
+
+    std::array<uint32_t, static_cast<std::size_t>(ContextRecordKind::Count)> kind_counts{};
+    for (const ContextGraphRecordRef& ref : ranked.records) {
+        PyObject* item = PyDict_New();
+        PyObject* record = context_record_to_python(
+            ref,
+            *handle,
+            cache.intelligence,
+            cache.knowledge_graph,
+            *view->blobs,
+            *view->strings,
+            error_message
+        );
+        if (item == nullptr || record == nullptr) {
+            Py_XDECREF(item);
+            Py_XDECREF(record);
+            Py_DECREF(records);
+            Py_DECREF(counts);
+            Py_DECREF(result);
+            if (error_message != nullptr && error_message->empty()) {
+                *error_message = "context graph selected a missing record";
+            }
+            return nullptr;
+        }
+
+        if (!set_python_dict_item(item, "kind", unicode_from_utf8(context_record_kind_name(ref.kind)), error_message) ||
+            !set_python_dict_item(item, "score", PyLong_FromLongLong(ref.score), error_message)) {
+            Py_DECREF(record);
+            Py_DECREF(item);
+            Py_DECREF(records);
+            Py_DECREF(counts);
+            Py_DECREF(result);
+            return nullptr;
+        }
+        if (!set_python_dict_item(item, "record", record, error_message)) {
+            Py_DECREF(item);
+            Py_DECREF(records);
+            Py_DECREF(counts);
+            Py_DECREF(result);
+            return nullptr;
+        }
+        record = nullptr;
+        if (PyList_Append(records, item) != 0) {
+            Py_DECREF(item);
+            Py_DECREF(records);
+            Py_DECREF(counts);
+            Py_DECREF(result);
+            if (error_message != nullptr) {
+                *error_message = fetch_python_error();
+            }
+            return nullptr;
+        }
+        Py_DECREF(item);
+        ++kind_counts[static_cast<std::size_t>(ref.kind)];
+    }
+
+    for (std::size_t index = 0U; index < kind_counts.size(); ++index) {
+        const auto kind = static_cast<ContextRecordKind>(index);
+        if (!set_python_dict_item(
+                counts,
+                context_record_kind_name(kind),
+                PyLong_FromUnsignedLong(kind_counts[index]),
+                error_message
+            )) {
+            Py_DECREF(records);
+            Py_DECREF(counts);
+            Py_DECREF(result);
+            return nullptr;
+        }
+    }
+
+    if (!set_python_dict_item(result, "records", records, error_message) ||
+        !set_python_dict_item(result, "counts", counts, error_message) ||
+        !set_python_dict_item(result, "native", PyBool_FromLong(1), error_message)) {
+        Py_DECREF(result);
+        return nullptr;
+    }
+    records = nullptr;
+    counts = nullptr;
+    Py_INCREF(result);
+    cache.result = result;
+    return result;
 }
 
 bool build_intelligence_query(

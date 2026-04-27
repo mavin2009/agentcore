@@ -7,6 +7,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
+from ._context_graph import ContextGraphIndex
+
 
 _DEFAULT_CONTEXT_INCLUDE = (
     "messages.recent",
@@ -313,9 +315,11 @@ def assemble_context_view(
     identity: dict[str, Any] | None = None,
 ) -> ContextView:
     goal = _state_get(state, spec.goal_key) if spec.goal_key else None
-    items: list[dict[str, Any]] = []
-    for selector in spec.include or ():
-        items.extend(_collect_selector(runtime_context, state, spec, str(selector)))
+    items = _collect_context_graph(runtime_context, state, spec, goal=goal)
+    if items is None:
+        items = []
+        for selector in spec.include or ():
+            items.extend(_collect_selector(runtime_context, state, spec, str(selector)))
 
     items = _assign_citations(_apply_budget(items, spec))
     conflicts = _detect_claim_conflicts(items)
@@ -333,6 +337,151 @@ def assemble_context_view(
         conflicts=conflicts,
         budget=budget,
         identity=identity,
+    )
+
+
+def _collect_context_graph(
+    runtime_context: Any,
+    state: Mapping[str, Any],
+    spec: ContextSpec,
+    *,
+    goal: Any,
+) -> list[dict[str, Any]] | None:
+    selectors = [str(selector) for selector in (spec.include or ())]
+    if not any(_selector_uses_context_graph(selector) for selector in selectors):
+        return None
+
+    requested_items = int(spec.budget_items) if spec.budget_items is not None else 32
+    expanded_limit = max(int(spec.limit_per_source), requested_items, 8) * 3
+    ranked_limit = max(requested_items, int(spec.limit_per_source) * max(1, len(selectors)))
+    native_items = _collect_native_context_graph(runtime_context, spec, limit=ranked_limit)
+    if native_items is not None:
+        side_items: list[dict[str, Any]] = []
+        try:
+            for selector in selectors:
+                if _selector_uses_context_graph(selector):
+                    continue
+                side_items.extend(_collect_selector(runtime_context, state, spec, selector))
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            side_items = []
+        combined = native_items + side_items
+        if not combined:
+            return None
+        if side_items:
+            return ContextGraphIndex(
+                combined,
+                spec=spec.to_dict(),
+                goal=goal,
+            ).rank(limit=ranked_limit)
+        return combined[:ranked_limit]
+
+    try:
+        expanded_spec = spec.replace(limit_per_source=expanded_limit)
+        candidates: list[dict[str, Any]] = []
+        for selector in selectors:
+            candidates.extend(_collect_selector(runtime_context, state, expanded_spec, selector))
+        if not candidates:
+            return None
+        return ContextGraphIndex(
+            candidates,
+            spec=spec.to_dict(),
+            goal=goal,
+        ).rank(limit=ranked_limit)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _collect_native_context_graph(
+    runtime_context: Any,
+    spec: ContextSpec,
+    *,
+    limit: int,
+) -> list[dict[str, Any]] | None:
+    try:
+        result = runtime_context._rank_context_graph(spec.to_dict())
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+    if not isinstance(result, Mapping) or not result.get("native"):
+        return None
+    records = result.get("records")
+    if not isinstance(records, list):
+        return None
+
+    selectors = [str(selector) for selector in (spec.include or ())]
+    items: list[dict[str, Any]] = []
+    for entry in records:
+        if not isinstance(entry, Mapping):
+            continue
+        kind = str(entry.get("kind") or "")
+        record = entry.get("record")
+        if not kind or not isinstance(record, Mapping):
+            continue
+        raw = dict(record.items())
+        source = _native_context_source(kind, selectors)
+        if kind == "knowledge":
+            items.extend(_items_from_knowledge_records([raw], source=source, limit=1))
+            continue
+        key = raw.get("key") or raw.get("id") or f"{kind}:{len(items)}"
+        items.append(_make_item(source, kind, str(key), raw))
+        if len(items) >= limit:
+            break
+    return items[:limit]
+
+
+def _native_context_source(kind: str, selectors: Sequence[str]) -> str:
+    normalized_kind = kind.strip().lower()
+    for selector in selectors:
+        normalized = selector.strip().lower()
+        if normalized_kind == "task" and normalized in {"tasks", "tasks.agenda", "actions.candidates", "intelligence.focus"}:
+            return normalized
+        if normalized_kind == "claim" and normalized in {"claims", "claims.all", "claims.supported", "claims.confirmed", "intelligence.focus"}:
+            return normalized
+        if normalized_kind == "evidence" and normalized in {"evidence", "evidence.all", "evidence.relevant", "intelligence.focus"}:
+            return normalized
+        if normalized_kind == "decision" and normalized in {"decisions", "decisions.all", "decisions.selected", "intelligence.focus"}:
+            return normalized
+        if normalized_kind == "memory" and (normalized in {"memories", "memories.recall", "intelligence.focus"} or normalized.startswith("memories.")):
+            return normalized
+        if normalized_kind == "knowledge" and normalized in {"knowledge", "knowledge.neighborhood"}:
+            return normalized
+    if normalized_kind == "task":
+        return "tasks.agenda"
+    if normalized_kind == "claim":
+        return "claims.supported"
+    if normalized_kind == "evidence":
+        return "evidence.relevant"
+    if normalized_kind == "decision":
+        return "decisions.selected"
+    if normalized_kind == "memory":
+        return "memories.recall"
+    if normalized_kind == "knowledge":
+        return "knowledge.neighborhood"
+    return normalized_kind or "context"
+
+
+def _selector_uses_context_graph(selector: str) -> bool:
+    normalized = selector.strip().lower()
+    return (
+        normalized in {
+            "tasks",
+            "tasks.agenda",
+            "claims",
+            "claims.all",
+            "claims.supported",
+            "claims.confirmed",
+            "evidence",
+            "evidence.all",
+            "evidence.relevant",
+            "decisions",
+            "decisions.all",
+            "decisions.selected",
+            "memories",
+            "memories.recall",
+            "actions.candidates",
+            "intelligence.focus",
+            "knowledge",
+            "knowledge.neighborhood",
+        } or normalized.startswith("memories.")
     )
 
 

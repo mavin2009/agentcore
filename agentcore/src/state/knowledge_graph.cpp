@@ -45,6 +45,19 @@ BlobRef read_blob_ref(std::istream& input) {
 
 } // namespace
 
+struct KnowledgeGraphStore::ReasoningIndex {
+    uint64_t version{0};
+    std::size_t entity_count{0};
+    std::size_t triple_count{0};
+    std::vector<uint32_t> outgoing_offsets;
+    std::vector<uint32_t> incoming_offsets;
+    std::vector<KnowledgeTripleId> outgoing_triples;
+    std::vector<KnowledgeTripleId> incoming_triples;
+    std::vector<uint32_t> outgoing_degree;
+    std::vector<uint32_t> incoming_degree;
+    std::unordered_map<InternedStringId, uint32_t> relation_degree;
+};
+
 struct KnowledgeGraphStore::Storage {
     std::vector<KnowledgeEntity> entities;
     std::vector<KnowledgeTriple> triples;
@@ -53,6 +66,8 @@ struct KnowledgeGraphStore::Storage {
     TripleIndex outgoing_index;
     TripleIndex incoming_index;
     std::unordered_map<InternedStringId, std::vector<KnowledgeTripleId>> relation_index;
+    uint64_t version{1};
+    mutable ReasoningIndex reasoning_index;
 };
 
 std::size_t KnowledgeGraphStore::TripleKeyHash::operator()(const TripleKey& key) const noexcept {
@@ -70,6 +85,57 @@ void KnowledgeGraphStore::ensure_unique() {
     }
 }
 
+const KnowledgeGraphStore::ReasoningIndex& KnowledgeGraphStore::reasoning_index() const {
+    ReasoningIndex& index = storage_->reasoning_index;
+    if (index.version == storage_->version &&
+        index.entity_count == storage_->entities.size() &&
+        index.triple_count == storage_->triples.size()) {
+        return index;
+    }
+
+    index = ReasoningIndex{};
+    index.version = storage_->version;
+    index.entity_count = storage_->entities.size();
+    index.triple_count = storage_->triples.size();
+    index.outgoing_offsets.assign(index.entity_count + 2U, 0U);
+    index.incoming_offsets.assign(index.entity_count + 2U, 0U);
+    index.outgoing_degree.assign(index.entity_count + 1U, 0U);
+    index.incoming_degree.assign(index.entity_count + 1U, 0U);
+    index.relation_degree.reserve(storage_->relation_index.size());
+
+    for (const KnowledgeTriple& triple : storage_->triples) {
+        if (triple.subject <= index.entity_count) {
+            ++index.outgoing_offsets[static_cast<std::size_t>(triple.subject) + 1U];
+            ++index.outgoing_degree[triple.subject];
+        }
+        if (triple.object <= index.entity_count) {
+            ++index.incoming_offsets[static_cast<std::size_t>(triple.object) + 1U];
+            ++index.incoming_degree[triple.object];
+        }
+        ++index.relation_degree[triple.relation];
+    }
+
+    for (std::size_t offset = 1U; offset < index.outgoing_offsets.size(); ++offset) {
+        index.outgoing_offsets[offset] += index.outgoing_offsets[offset - 1U];
+        index.incoming_offsets[offset] += index.incoming_offsets[offset - 1U];
+    }
+
+    index.outgoing_triples.assign(storage_->triples.size(), 0U);
+    index.incoming_triples.assign(storage_->triples.size(), 0U);
+    std::vector<uint32_t> outgoing_cursor = index.outgoing_offsets;
+    std::vector<uint32_t> incoming_cursor = index.incoming_offsets;
+    for (const KnowledgeTriple& triple : storage_->triples) {
+        if (triple.subject <= index.entity_count) {
+            index.outgoing_triples[outgoing_cursor[triple.subject]++] = triple.id;
+        }
+        if (triple.object <= index.entity_count) {
+            index.incoming_triples[incoming_cursor[triple.object]++] = triple.id;
+        }
+    }
+
+    return index;
+}
+
 KnowledgeEntityId KnowledgeGraphStore::resolve_or_create_entity(InternedStringId label) {
     ensure_unique();
     const auto existing = storage_->entity_by_label.find(label);
@@ -80,6 +146,7 @@ KnowledgeEntityId KnowledgeGraphStore::resolve_or_create_entity(InternedStringId
     const KnowledgeEntityId id = static_cast<KnowledgeEntityId>(storage_->entities.size() + 1U);
     storage_->entities.push_back(KnowledgeEntity{id, label, {}});
     storage_->entity_by_label[label] = id;
+    ++storage_->version;
     return id;
 }
 
@@ -117,6 +184,7 @@ KnowledgeTripleId KnowledgeGraphStore::upsert_triple(
     storage_->outgoing_index[subject].push_back(id);
     storage_->incoming_index[object].push_back(id);
     storage_->relation_index[relation].push_back(id);
+    ++storage_->version;
     return id;
 }
 
@@ -179,13 +247,16 @@ std::vector<const KnowledgeTriple*> KnowledgeGraphStore::outgoing(
     std::optional<InternedStringId> relation
 ) const {
     std::vector<const KnowledgeTriple*> triples;
-    const auto iterator = storage_->outgoing_index.find(subject);
-    if (iterator == storage_->outgoing_index.end()) {
+    const ReasoningIndex& index = reasoning_index();
+    if (subject == 0U || subject > index.entity_count) {
         return triples;
     }
 
-    triples.reserve(iterator->second.size());
-    for (KnowledgeTripleId triple_id : iterator->second) {
+    const std::size_t begin = index.outgoing_offsets[subject];
+    const std::size_t end = index.outgoing_offsets[static_cast<std::size_t>(subject) + 1U];
+    triples.reserve(end - begin);
+    for (std::size_t offset = begin; offset < end; ++offset) {
+        const KnowledgeTripleId triple_id = index.outgoing_triples[offset];
         const KnowledgeTriple* triple = find_triple(triple_id);
         if (triple == nullptr) {
             continue;
@@ -203,13 +274,16 @@ std::vector<const KnowledgeTriple*> KnowledgeGraphStore::incoming(
     std::optional<InternedStringId> relation
 ) const {
     std::vector<const KnowledgeTriple*> triples;
-    const auto iterator = storage_->incoming_index.find(object);
-    if (iterator == storage_->incoming_index.end()) {
+    const ReasoningIndex& index = reasoning_index();
+    if (object == 0U || object > index.entity_count) {
         return triples;
     }
 
-    triples.reserve(iterator->second.size());
-    for (KnowledgeTripleId triple_id : iterator->second) {
+    const std::size_t begin = index.incoming_offsets[object];
+    const std::size_t end = index.incoming_offsets[static_cast<std::size_t>(object) + 1U];
+    triples.reserve(end - begin);
+    for (std::size_t offset = begin; offset < end; ++offset) {
+        const KnowledgeTripleId triple_id = index.incoming_triples[offset];
         const KnowledgeTriple* triple = find_triple(triple_id);
         if (triple == nullptr) {
             continue;
@@ -227,30 +301,87 @@ std::vector<const KnowledgeTriple*> KnowledgeGraphStore::select_candidate_set(
     std::optional<InternedStringId> relation,
     std::optional<KnowledgeEntityId> object
 ) const {
+    enum class CandidateKind : uint8_t {
+        All,
+        Outgoing,
+        Incoming,
+        Relation
+    };
+
+    struct CandidatePlan {
+        CandidateKind kind{CandidateKind::All};
+        std::size_t begin{0};
+        std::size_t end{0};
+        const std::vector<KnowledgeTripleId>* relation_ids{nullptr};
+        std::size_t size{0};
+        bool set{false};
+    };
+
+    const ReasoningIndex& index = reasoning_index();
+    CandidatePlan best;
+    const auto consider = [&](CandidatePlan candidate) {
+        if (!best.set || candidate.size < best.size) {
+            best = candidate;
+            best.set = true;
+        }
+    };
+
     if (subject.has_value()) {
-        return outgoing(*subject, relation);
+        if (*subject == 0U || *subject > index.entity_count) {
+            return {};
+        }
+        const std::size_t begin = index.outgoing_offsets[*subject];
+        const std::size_t end = index.outgoing_offsets[static_cast<std::size_t>(*subject) + 1U];
+        consider(CandidatePlan{CandidateKind::Outgoing, begin, end, nullptr, end - begin, true});
     }
     if (object.has_value()) {
-        return incoming(*object, relation);
+        if (*object == 0U || *object > index.entity_count) {
+            return {};
+        }
+        const std::size_t begin = index.incoming_offsets[*object];
+        const std::size_t end = index.incoming_offsets[static_cast<std::size_t>(*object) + 1U];
+        consider(CandidatePlan{CandidateKind::Incoming, begin, end, nullptr, end - begin, true});
     }
     if (relation.has_value()) {
-        std::vector<const KnowledgeTriple*> triples;
-        const auto iterator = storage_->relation_index.find(*relation);
-        if (iterator == storage_->relation_index.end()) {
-            return triples;
+        const auto relation_iterator = storage_->relation_index.find(*relation);
+        if (relation_iterator == storage_->relation_index.end()) {
+            return {};
         }
+        consider(CandidatePlan{
+            CandidateKind::Relation,
+            0U,
+            relation_iterator->second.size(),
+            &relation_iterator->second,
+            relation_iterator->second.size(),
+            true
+        });
+    }
 
-        triples.reserve(iterator->second.size());
-        for (KnowledgeTripleId triple_id : iterator->second) {
+    std::vector<const KnowledgeTriple*> triples;
+    if (best.set) {
+        triples.reserve(best.size);
+        const auto append_id = [&](KnowledgeTripleId triple_id) {
             const KnowledgeTriple* triple = find_triple(triple_id);
             if (triple != nullptr) {
                 triples.push_back(triple);
+            }
+        };
+        if (best.kind == CandidateKind::Outgoing) {
+            for (std::size_t offset = best.begin; offset < best.end; ++offset) {
+                append_id(index.outgoing_triples[offset]);
+            }
+        } else if (best.kind == CandidateKind::Incoming) {
+            for (std::size_t offset = best.begin; offset < best.end; ++offset) {
+                append_id(index.incoming_triples[offset]);
+            }
+        } else if (best.relation_ids != nullptr) {
+            for (KnowledgeTripleId triple_id : *best.relation_ids) {
+                append_id(triple_id);
             }
         }
         return triples;
     }
 
-    std::vector<const KnowledgeTriple*> triples;
     triples.reserve(storage_->triples.size());
     for (const KnowledgeTriple& triple : storage_->triples) {
         triples.push_back(&triple);
@@ -280,6 +411,18 @@ std::vector<const KnowledgeTriple*> KnowledgeGraphStore::match(
             return {};
         }
         object = entity->id;
+    }
+
+    if (subject.has_value() && relation.has_value() && object.has_value()) {
+        const auto iterator = storage_->triple_by_key.find(TripleKey{*subject, *relation, *object});
+        if (iterator == storage_->triple_by_key.end()) {
+            return {};
+        }
+        const KnowledgeTriple* triple = find_triple(iterator->second);
+        if (triple == nullptr) {
+            return {};
+        }
+        return {triple};
     }
 
     std::vector<const KnowledgeTriple*> matches = select_candidate_set(subject, relation, object);
