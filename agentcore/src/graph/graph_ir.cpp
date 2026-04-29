@@ -520,6 +520,16 @@ bool GraphDefinition::validate(std::string* error_message) const {
         return fail_validation(error_message, "entry node does not exist");
     }
 
+    std::unordered_set<StateKey> state_reducer_keys;
+    for (const FieldMergeRule& rule : state_reducer_rules) {
+        if (!state_reducer_keys.insert(rule.key).second) {
+            return fail_validation(
+                error_message,
+                "duplicate graph state reducer for state key " + std::to_string(rule.key)
+            );
+        }
+    }
+
     std::unordered_set<NodeId> node_ids;
     for (const NodeDefinition& node : nodes) {
         if (!node_ids.insert(node.id).second) {

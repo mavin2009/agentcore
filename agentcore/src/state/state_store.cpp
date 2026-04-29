@@ -984,6 +984,13 @@ uint64_t StateStore::apply(const StatePatch& patch) {
 }
 
 StateApplyResult StateStore::apply_with_summary(const StatePatch& patch) {
+    return apply_with_summary(patch, patch);
+}
+
+StateApplyResult StateStore::apply_with_summary(
+    const StatePatch& patch,
+    const StatePatch& log_patch
+) {
     StateApplyResult result;
     result.patch_log_offset = static_cast<uint64_t>(patch_log_.size());
     if (patch.empty()) {
@@ -1004,9 +1011,17 @@ StateApplyResult StateStore::apply_with_summary(const StatePatch& patch) {
     }
 
     if (!patch.knowledge_graph.empty()) {
-        KnowledgeGraphStore working_graph = knowledge_graph_;
+        KnowledgeGraphStore& working_graph = knowledge_graph_;
         std::unordered_map<InternedStringId, std::size_t> entity_delta_indices;
         std::unordered_map<TripleDeltaKey, std::size_t, TripleDeltaKeyHash> triple_delta_indices;
+        entity_delta_indices.reserve(
+            patch.knowledge_graph.entities.size() + (patch.knowledge_graph.triples.size() * 2U)
+        );
+        triple_delta_indices.reserve(patch.knowledge_graph.triples.size());
+        result.knowledge_graph_delta.entities.reserve(
+            patch.knowledge_graph.entities.size() + (patch.knowledge_graph.triples.size() * 2U)
+        );
+        result.knowledge_graph_delta.triples.reserve(patch.knowledge_graph.triples.size());
 
         auto record_entity_delta = [&](KnowledgeEntityId id,
                                        InternedStringId label,
@@ -1130,12 +1145,41 @@ StateApplyResult StateStore::apply_with_summary(const StatePatch& patch) {
                 );
             }
         }
-
-        knowledge_graph_ = std::move(working_graph);
     }
 
     if (!patch.intelligence.empty()) {
-        IntelligenceStore working_intelligence = intelligence_;
+        for (const IntelligenceTaskWrite& task : patch.intelligence.tasks) {
+            if (task.key == 0U) {
+                throw std::invalid_argument("intelligence task key must not be empty");
+            }
+        }
+        for (const IntelligenceClaimWrite& claim : patch.intelligence.claims) {
+            if (claim.key == 0U) {
+                throw std::invalid_argument("intelligence claim key must not be empty");
+            }
+        }
+        for (const IntelligenceEvidenceWrite& evidence : patch.intelligence.evidence) {
+            if (evidence.key == 0U) {
+                throw std::invalid_argument("intelligence evidence key must not be empty");
+            }
+        }
+        for (const IntelligenceDecisionWrite& decision : patch.intelligence.decisions) {
+            if (decision.key == 0U) {
+                throw std::invalid_argument("intelligence decision key must not be empty");
+            }
+        }
+        for (const IntelligenceMemoryWrite& memory : patch.intelligence.memories) {
+            if (memory.key == 0U) {
+                throw std::invalid_argument("intelligence memory key must not be empty");
+            }
+        }
+
+        IntelligenceStore& working_intelligence = intelligence_;
+        result.intelligence_delta.tasks.reserve(patch.intelligence.tasks.size());
+        result.intelligence_delta.claims.reserve(patch.intelligence.claims.size());
+        result.intelligence_delta.evidence.reserve(patch.intelligence.evidence.size());
+        result.intelligence_delta.decisions.reserve(patch.intelligence.decisions.size());
+        result.intelligence_delta.memories.reserve(patch.intelligence.memories.size());
 
         for (const IntelligenceTaskWrite& task : patch.intelligence.tasks) {
             const IntelligenceTask* existing = working_intelligence.find_task_by_key(task.key);
@@ -1226,8 +1270,6 @@ StateApplyResult StateStore::apply_with_summary(const StatePatch& patch) {
                 changed_fields
             });
         }
-
-        intelligence_ = std::move(working_intelligence);
     }
 
     const bool task_journal_changed = task_journal_.apply(patch.task_records);
@@ -1242,7 +1284,10 @@ StateApplyResult StateStore::apply_with_summary(const StatePatch& patch) {
     }
 
     current_state_.version.fetch_add(1U, std::memory_order_acq_rel);
-    result.patch_log_offset = patch_log_.append(current_state_.version.load(std::memory_order_acquire), patch);
+    result.patch_log_offset = patch_log_.append(
+        current_state_.version.load(std::memory_order_acquire),
+        log_patch
+    );
     return result;
 }
 

@@ -445,11 +445,12 @@ Those currently raise a clear `NotImplementedError` instead of being silently ig
 4. Move chat history fields to `MessagesState` or `Annotated[list[dict], add_messages]` when you need ID-aware message merging.
 5. Replace manual child-graph persistence with `add_subgraph(...)`.
 6. Replace interrupt-style flows with explicit wait/resume surfaces where needed.
-6. Add `invoke_with_metadata(...)` or `stream(...)` once you want better observability.
-7. If your application already has an OpenTelemetry stack, add `telemetry=True` or `OpenTelemetryObserver()` after the behavior is stable.
+7. Add `invoke_with_metadata(...)` or `stream(...)` once you want better observability.
+8. If your application already has an OpenTelemetry stack, add `telemetry=True` or `OpenTelemetryObserver()` after the behavior is stable.
 
 ## Related Pages
 
 - Comparison benchmarks: [`../comparisons/langgraph-head-to-head.md`](../comparisons/langgraph-head-to-head.md)
 - Python quickstart: [`../quickstarts/python.md`](../quickstarts/python.md)
 - API map: [`../reference/api.md`](../reference/api.md)
+- Design lineage: [`../concepts/design-lineage.md`](../concepts/design-lineage.md)

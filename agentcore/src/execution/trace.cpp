@@ -1,6 +1,7 @@
 #include "agentcore/execution/checkpoint.h"
 
 #include <algorithm>
+#include <cstddef>
 
 namespace agentcore {
 
@@ -22,11 +23,15 @@ void TraceSink::trim_run_locked(RunTrace& run_trace) {
             continue;
         }
 
-        front_segment.erase(front_segment.begin());
-        run_trace.event_count -= 1U;
-        if (front_segment.empty()) {
+        const std::size_t overflow = run_trace.event_count - max_events_per_run_;
+        if (overflow >= front_segment.size()) {
+            run_trace.event_count -= front_segment.size();
             run_trace.segments.pop_front();
+            continue;
         }
+        front_segment.erase(front_segment.begin(), front_segment.begin() + static_cast<std::ptrdiff_t>(overflow));
+        run_trace.event_count -= overflow;
+        return;
     }
 }
 
@@ -102,6 +107,12 @@ std::vector<TraceEvent> TraceSink::take_events_for_run(RunId run_id) {
         return events;
     }
 
+    if (iterator->second.segments.size() == 1U) {
+        events = std::move(iterator->second.segments.front());
+        events_by_run_.erase(iterator);
+        return events;
+    }
+
     events.reserve(iterator->second.event_count);
     for (std::vector<TraceEvent>& segment : iterator->second.segments) {
         events.insert(
@@ -126,6 +137,9 @@ std::vector<TraceEvent> TraceSink::events_for_run_since_sequence(
     }
 
     for (const std::vector<TraceEvent>& segment : iterator->second.segments) {
+        if (!segment.empty() && segment.back().sequence < next_sequence) {
+            continue;
+        }
         for (const TraceEvent& event : segment) {
             if (event.sequence >= next_sequence) {
                 events.push_back(event);

@@ -995,4 +995,5 @@ That split is intentional: `resume(checkpoint_id)` restores a run from persisted
 - Python quickstart: [`../quickstarts/python.md`](../quickstarts/python.md)
 - C++ quickstart: [`../quickstarts/cpp.md`](../quickstarts/cpp.md)
 - Runtime model: [`../concepts/runtime-model.md`](../concepts/runtime-model.md)
+- Design lineage: [`../concepts/design-lineage.md`](../concepts/design-lineage.md)
 - Validation: [`../operations/validation.md`](../operations/validation.md)

@@ -1023,6 +1023,7 @@ PyObject* py_add_node(PyObject*, PyObject* args, PyObject* kwargs) {
     PyObject* read_keys_object = Py_None;
     unsigned int cache_size = 16U;
     PyObject* intelligence_subscriptions_object = Py_None;
+    PyObject* native_callback_spec = Py_None;
     static const char* keywords[] = {
         "graph",
         "name",
@@ -1037,12 +1038,13 @@ PyObject* py_add_node(PyObject*, PyObject* args, PyObject* kwargs) {
         "read_keys",
         "cache_size",
         "intelligence_subscriptions",
+        "native_callback_spec",
         nullptr
     };
     if (!PyArg_ParseTupleAndKeywords(
             args,
             kwargs,
-            "OsO|OppppOpOIO",
+            "OsO|OppppOpOIOO",
             const_cast<char**>(keywords),
             &capsule,
             &name,
@@ -1056,7 +1058,8 @@ PyObject* py_add_node(PyObject*, PyObject* args, PyObject* kwargs) {
             &deterministic,
             &read_keys_object,
             &cache_size,
-            &intelligence_subscriptions_object
+            &intelligence_subscriptions_object,
+            &native_callback_spec
         )) {
         return nullptr;
     }
@@ -1135,8 +1138,42 @@ PyObject* py_add_node(PyObject*, PyObject* args, PyObject* kwargs) {
             memoization,
             intelligence_subscriptions,
             merge_rules,
+            native_callback_spec,
             &error_message
         )) {
+        PyErr_SetString(PyExc_ValueError, error_message.c_str());
+        return nullptr;
+    }
+    Py_RETURN_NONE;
+}
+
+PyObject* py_set_state_reducers(PyObject*, PyObject* args, PyObject* kwargs) {
+    PyObject* capsule = nullptr;
+    PyObject* reducer_rules_object = Py_None;
+    static const char* keywords[] = {"graph", "reducer_rules", nullptr};
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "OO",
+            const_cast<char**>(keywords),
+            &capsule,
+            &reducer_rules_object
+        )) {
+        return nullptr;
+    }
+
+    GraphHandle* handle = require_graph_handle(capsule);
+    if (handle == nullptr) {
+        return nullptr;
+    }
+
+    std::string error_message;
+    std::vector<std::pair<std::string, JoinMergeStrategy>> reducer_rules;
+    if (!parse_merge_rules(reducer_rules_object, &reducer_rules, &error_message)) {
+        PyErr_SetString(PyExc_ValueError, error_message.c_str());
+        return nullptr;
+    }
+    if (!handle->set_state_reducer_rules(reducer_rules, &error_message)) {
         PyErr_SetString(PyExc_ValueError, error_message.c_str());
         return nullptr;
     }
@@ -2763,6 +2800,12 @@ PyMethodDef kModuleMethods[] = {
         reinterpret_cast<PyCFunction>(py_add_node),
         METH_VARARGS | METH_KEYWORDS,
         "Register a node callback with the native graph builder."
+    },
+    {
+        "_set_state_reducers",
+        reinterpret_cast<PyCFunction>(py_set_state_reducers),
+        METH_VARARGS | METH_KEYWORDS,
+        "Configure graph-wide native state reducer rules."
     },
     {
         "_add_subgraph_node",

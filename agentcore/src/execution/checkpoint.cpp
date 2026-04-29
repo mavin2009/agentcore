@@ -362,6 +362,11 @@ void write_graph(std::ostream& output, const GraphDefinition& graph) {
     write_pod(output, graph.id);
     write_string(output, graph.name);
     write_pod(output, graph.entry);
+    write_pod<uint64_t>(output, static_cast<uint64_t>(graph.state_reducer_rules.size()));
+    for (const FieldMergeRule& rule : graph.state_reducer_rules) {
+        write_pod(output, rule.key);
+        write_pod(output, static_cast<uint8_t>(rule.strategy));
+    }
 
     write_pod<uint64_t>(output, static_cast<uint64_t>(graph.nodes.size()));
     for (const NodeDefinition& node : graph.nodes) {
@@ -465,6 +470,14 @@ GraphDefinition read_graph(std::istream& input) {
     graph.id = read_pod<GraphId>(input);
     graph.name = read_string(input);
     graph.entry = read_pod<NodeId>(input);
+    const uint64_t state_reducer_count = read_pod<uint64_t>(input);
+    graph.state_reducer_rules.reserve(static_cast<std::size_t>(state_reducer_count));
+    for (uint64_t rule_index = 0; rule_index < state_reducer_count; ++rule_index) {
+        graph.state_reducer_rules.push_back(FieldMergeRule{
+            read_pod<StateKey>(input),
+            static_cast<JoinMergeStrategy>(read_pod<uint8_t>(input))
+        });
+    }
 
     const uint64_t node_count = read_pod<uint64_t>(input);
     graph.nodes.reserve(static_cast<std::size_t>(node_count));

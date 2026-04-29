@@ -16,7 +16,9 @@ from typing import Any, Annotated, TypedDict
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-BUILD_PYTHON_ROOT = REPO_ROOT / "build" / "python"
+BUILD_PYTHON_ROOT = Path(
+    os.environ.get("AGENTCORE_BUILD_PYTHON_ROOT", str(REPO_ROOT / "build" / "python"))
+).resolve()
 
 
 def _normalize_pythonpath_entries(raw_value: str | None) -> list[str]:

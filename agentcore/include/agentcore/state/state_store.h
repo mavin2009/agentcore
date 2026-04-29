@@ -165,6 +165,10 @@ public:
     void reset(std::size_t initial_field_count = 0);
     void ensure_field_capacity(std::size_t field_count);
     [[nodiscard]] StateApplyResult apply_with_summary(const StatePatch& patch);
+    [[nodiscard]] StateApplyResult apply_with_summary(
+        const StatePatch& state_patch,
+        const StatePatch& log_patch
+    );
     [[nodiscard]] uint64_t apply(const StatePatch& patch);
     [[nodiscard]] const WorkflowState& get_current_state() const;
     [[nodiscard]] WorkflowState& mutable_state();

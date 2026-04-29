@@ -223,6 +223,55 @@ def _infer_schema_merge_rules(state_schema: Any) -> dict[str, str]:
     return normalized
 
 
+def _apply_reducer_strategy_for_route(strategy: str, left: Any, right: Any) -> Any:
+    if left is _MISSING or left is None:
+        return right
+    if strategy == "require_equal":
+        if left != right:
+            raise ValueError("state reducer require_equal saw conflicting values before routing")
+        return right
+    if strategy == "require_single_writer":
+        raise ValueError("state reducer require_single_writer saw more than one writer before routing")
+    if strategy == "last_writer_wins":
+        return right
+    if strategy == "first_writer_wins":
+        return left
+    if strategy == "sum_int64":
+        return int(left) + int(right)
+    if strategy == "max_int64":
+        return max(int(left), int(right))
+    if strategy == "min_int64":
+        return min(int(left), int(right))
+    if strategy == "logical_or":
+        return bool(left) or bool(right)
+    if strategy == "logical_and":
+        return bool(left) and bool(right)
+    if strategy == "concat_sequence":
+        return list(left) + list(right)
+    if strategy == "merge_messages":
+        return add_messages(left, right)
+    return right
+
+
+def _apply_schema_reducer_route_overlay(
+    schema_merge: dict[str, str],
+    state: Mapping[str, Any],
+    updates: dict[str, Any],
+) -> dict[str, Any]:
+    if not schema_merge or not updates:
+        return updates
+    reduced = dict(updates)
+    for key, strategy in schema_merge.items():
+        if key not in updates:
+            continue
+        reduced[key] = _apply_reducer_strategy_for_route(
+            strategy,
+            state.get(key, _MISSING),
+            updates[key],
+        )
+    return reduced
+
+
 def _infer_shared_subgraph_bindings(parent_schema: Any, graph: Any) -> dict[str, str]:
     child_schema = getattr(graph, "_state_schema", None)
     parent_fields = set(_extract_state_schema_fields(parent_schema))
@@ -473,6 +522,8 @@ class StateGraph:
             name=self._name if name is None else _normalize_compile_name(name),
             worker_count=self._worker_count if worker_count is None else max(1, int(worker_count)),
         )
+        if self._schema_merge:
+            _native._set_state_reducers(native_graph, self._schema_merge)
         owned_subgraphs: list[CompiledStateGraph] = []
         owned_subgraph_ids: set[int] = set()
 
@@ -573,7 +624,12 @@ class StateGraph:
                 return updates
 
             route_fn, route_map = routing_spec
-            merged_state = state_view if not updates else _OverlayMapping(state_view, updates)
+            route_updates = (
+                _apply_schema_reducer_route_overlay(self._schema_merge, state_view, updates)
+                if updates
+                else updates
+            )
+            merged_state = state_view if not route_updates else _OverlayMapping(state_view, route_updates)
             route_value = route_fn(merged_state, config)
             if route_map:
                 if route_value not in route_map:

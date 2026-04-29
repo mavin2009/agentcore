@@ -1118,4 +1118,5 @@ Use `batch(...)` when deterministic in-process sequencing is more useful than ou
 
 - API summary: [`../reference/api.md`](../reference/api.md)
 - Runtime model: [`../concepts/runtime-model.md`](../concepts/runtime-model.md)
+- Design lineage: [`../concepts/design-lineage.md`](../concepts/design-lineage.md)
 - Validation commands: [`../operations/validation.md`](../operations/validation.md)

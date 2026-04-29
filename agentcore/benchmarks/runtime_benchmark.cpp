@@ -4,6 +4,7 @@
 #include "agentcore/state/context/context_graph.h"
 #include "agentcore/state/intelligence/ops.h"
 #include "agentcore/state/knowledge_graph.h"
+#include "agentcore/state/state_store.h"
 
 #include <algorithm>
 #include <atomic>
@@ -113,6 +114,8 @@ constexpr std::size_t kMemoizationBenchmarkVisitLimit = 64U;
 constexpr std::size_t kMemoizationBenchmarkMixRounds = 262144U;
 constexpr std::size_t kKnowledgeReasoningBenchmarkTriples = 8192U;
 constexpr std::size_t kKnowledgeReasoningBenchmarkIterations = 4096U;
+constexpr std::size_t kKnowledgeIngestBenchmarkTriples = 10000U;
+constexpr std::size_t kKnowledgeIngestBenchmarkBatchSize = 100U;
 constexpr std::size_t kIntelligenceBenchmarkRecords = 4096U;
 constexpr std::size_t kIntelligenceBenchmarkIterations = 4096U;
 constexpr std::size_t kContextGraphBenchmarkRecords = 1024U;
@@ -1639,6 +1642,17 @@ struct KnowledgeReasoningBenchmarkRun {
     bool neighbor_matched{false};
 };
 
+struct KnowledgeIngestBenchmarkRun {
+    uint64_t triples{0};
+    uint64_t batches{0};
+    uint64_t elapsed_ns{0};
+    uint64_t created_entities{0};
+    uint64_t created_triples{0};
+    uint64_t final_entities{0};
+    uint64_t final_triples{0};
+    bool exact_matched{false};
+};
+
 struct IntelligenceQueryBenchmarkRun {
     uint64_t records{0};
     uint64_t iterations{0};
@@ -2119,6 +2133,83 @@ KnowledgeReasoningBenchmarkRun run_knowledge_reasoning_benchmark_once() {
             (kKnowledgeReasoningBenchmarkTriples / 4U) *
             kKnowledgeReasoningBenchmarkIterations
         )
+    };
+}
+
+KnowledgeIngestBenchmarkRun run_knowledge_ingest_benchmark_once() {
+    StateStore store;
+    StringInterner& strings = store.strings();
+    BlobStore& blobs = store.blobs();
+
+    std::vector<StatePatch> patches;
+    patches.reserve(
+        (kKnowledgeIngestBenchmarkTriples + kKnowledgeIngestBenchmarkBatchSize - 1U) /
+        kKnowledgeIngestBenchmarkBatchSize
+    );
+
+    InternedStringId exact_subject = 0U;
+    InternedStringId exact_relation = 0U;
+    InternedStringId exact_object = 0U;
+
+    for (std::size_t offset = 0; offset < kKnowledgeIngestBenchmarkTriples;) {
+        StatePatch patch;
+        patch.knowledge_graph.triples.reserve(kKnowledgeIngestBenchmarkBatchSize);
+        const std::size_t batch_end = std::min(
+            offset + kKnowledgeIngestBenchmarkBatchSize,
+            kKnowledgeIngestBenchmarkTriples
+        );
+        for (; offset < batch_end; ++offset) {
+            const InternedStringId subject =
+                strings.intern("ingest:subject:" + std::to_string(offset % 512U));
+            const InternedStringId relation =
+                strings.intern("ingest:rel:" + std::to_string(offset % 32U));
+            const InternedStringId object =
+                strings.intern("ingest:object:" + std::to_string(offset));
+            patch.knowledge_graph.triples.push_back(KnowledgeTripleWrite{
+                subject,
+                relation,
+                object,
+                blobs.append_string("ingest-payload:" + std::to_string(offset))
+            });
+            if (offset == kKnowledgeIngestBenchmarkTriples - 3U) {
+                exact_subject = subject;
+                exact_relation = relation;
+                exact_object = object;
+            }
+        }
+        patches.push_back(std::move(patch));
+    }
+
+    uint64_t created_entities = 0U;
+    uint64_t created_triples = 0U;
+    const auto started_at = std::chrono::steady_clock::now();
+    for (const StatePatch& patch : patches) {
+        const StateApplyResult result = store.apply_with_summary(patch);
+        for (const KnowledgeEntityDelta& delta : result.knowledge_graph_delta.entities) {
+            created_entities += delta.created ? 1U : 0U;
+        }
+        for (const KnowledgeTripleDelta& delta : result.knowledge_graph_delta.triples) {
+            created_triples += delta.created ? 1U : 0U;
+        }
+    }
+    const auto ended_at = std::chrono::steady_clock::now();
+
+    const std::vector<const KnowledgeTriple*> exact_matches =
+        store.knowledge_graph().match(exact_subject, exact_relation, exact_object);
+
+    return KnowledgeIngestBenchmarkRun{
+        static_cast<uint64_t>(kKnowledgeIngestBenchmarkTriples),
+        static_cast<uint64_t>(patches.size()),
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                ended_at - started_at
+            ).count()
+        ),
+        created_entities,
+        created_triples,
+        static_cast<uint64_t>(store.knowledge_graph().entity_count()),
+        static_cast<uint64_t>(store.knowledge_graph().triple_count()),
+        exact_matches.size() == 1U
     };
 }
 
@@ -3597,6 +3688,12 @@ int main() {
     assert(knowledge_reasoning_benchmark.exact_matched);
     assert(knowledge_reasoning_benchmark.constrained_matched);
     assert(knowledge_reasoning_benchmark.neighbor_matched);
+    const KnowledgeIngestBenchmarkRun knowledge_ingest_benchmark =
+        run_knowledge_ingest_benchmark_once();
+    assert(knowledge_ingest_benchmark.triples == kKnowledgeIngestBenchmarkTriples);
+    assert(knowledge_ingest_benchmark.final_triples == kKnowledgeIngestBenchmarkTriples);
+    assert(knowledge_ingest_benchmark.created_triples == kKnowledgeIngestBenchmarkTriples);
+    assert(knowledge_ingest_benchmark.exact_matched);
     const IntelligenceQueryBenchmarkRun intelligence_query_benchmark =
         run_intelligence_query_benchmark_once();
     assert(intelligence_query_benchmark.records == kIntelligenceBenchmarkRecords);
@@ -3747,6 +3844,19 @@ int main() {
               << knowledge_reasoning_benchmark.constrained_matches << '\n'
               << "knowledge_reasoning_neighbor_total="
               << knowledge_reasoning_benchmark.neighbor_total << '\n'
+              << "knowledge_ingest_triples=" << knowledge_ingest_benchmark.triples << '\n'
+              << "knowledge_ingest_batches=" << knowledge_ingest_benchmark.batches << '\n'
+              << "knowledge_ingest_ns=" << knowledge_ingest_benchmark.elapsed_ns << '\n'
+              << "knowledge_ingest_created_entities="
+              << knowledge_ingest_benchmark.created_entities << '\n'
+              << "knowledge_ingest_created_triples="
+              << knowledge_ingest_benchmark.created_triples << '\n'
+              << "knowledge_ingest_final_entities="
+              << knowledge_ingest_benchmark.final_entities << '\n'
+              << "knowledge_ingest_final_triples="
+              << knowledge_ingest_benchmark.final_triples << '\n'
+              << "knowledge_ingest_exact_matched="
+              << static_cast<int>(knowledge_ingest_benchmark.exact_matched) << '\n'
               << "intelligence_benchmark_records=" << intelligence_query_benchmark.records << '\n'
               << "intelligence_benchmark_iterations=" << intelligence_query_benchmark.iterations << '\n'
               << "intelligence_task_query_ns=" << intelligence_query_benchmark.task_query_ns << '\n'

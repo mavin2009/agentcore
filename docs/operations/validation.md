@@ -28,7 +28,7 @@ ctest --preset release-perf
 cmake -S . -B build -DAGENTCORE_BUILD_PYTHON_BINDINGS=ON -DAGENTCORE_BUILD_BENCHMARKS=ON
 cmake --build build -j
 PYTHONPATH=./build/python python3 ./python/benchmarks/state_graph_api_benchmark.py
-PYTHONPATH=./build/python python3 ./python/benchmarks/langgraph_head_to_head.py
+AGENTCORE_BUILD_PYTHON_ROOT=./build/release-perf/python python3 ./python/benchmarks/langgraph_head_to_head.py
 ```
 
 That path validates the optimized native runtime first, then runs the Python-facing benchmark surfaces. Published native numbers should come from `Release` builds only, so the `release-perf` preset is the default entry point for any benchmark or release-candidate validation pass.
@@ -47,13 +47,11 @@ The current configure presets are:
 - `ubsan`
 - `tsan`
 
-When you want a structured artifact for documentation updates or CI-side parsing, rerun the comparison benchmark with:
+When you want a structured artifact for documentation updates or CI-side parsing, rerun the comparison benchmark against the same build tree you want to document. For the current release-perf lane:
 
 ```bash
-PYTHONPATH=./build/python python3 ./python/benchmarks/langgraph_head_to_head.py --format json
+AGENTCORE_BUILD_PYTHON_ROOT=./build/release-perf/python python3 ./python/benchmarks/langgraph_head_to_head.py --format json
 ```
-
-This is also the release-candidate path used for the current published benchmark snapshot in [`../comparisons/langgraph-head-to-head.md`](../comparisons/langgraph-head-to-head.md).
 
 ## Python Smoke Tests
 
@@ -105,6 +103,7 @@ What they cover:
 - async Python node callbacks
 - metadata and streaming surfaces
 - graph-native context assembly, native context-graph ranking for intelligence/knowledge selectors, native knowledge-graph context reads, context digests, provenance, conflict metadata, Python fallback behavior, and stream decoration
+- structured knowledge and intelligence writes flowing through the native patch path without changing public state shape
 - an end-to-end incident-style pipeline with retrieval, native knowledge graph writes, persistent specialist subgraphs, context assembly, model invocation, stream metadata, and explicit parent/child knowledge-graph boundaries
 - external graph-store hydration into native knowledge, context use of hydrated triples, explicit sync back to the store, and Neo4j adapter relation-parameterization safety
 - optional live Neo4j validation for batch writes, neighborhood traversal, filtered query, runtime hydration, context assembly, and sync-back persistence
@@ -218,14 +217,14 @@ PYTHONPATH=./build/python python3 ./python/benchmarks/state_graph_api_benchmark.
 If you want the optional public comparison against upstream LangGraph, install LangGraph into the active Python environment and run:
 
 ```bash
-python3 -m pip install langgraph
-PYTHONPATH=./build/python python3 ./python/benchmarks/langgraph_head_to_head.py
+python3 -m pip install "langgraph==0.6.11"
+AGENTCORE_BUILD_PYTHON_ROOT=./build/release-perf/python python3 ./python/benchmarks/langgraph_head_to_head.py
 ```
 
 For a machine-readable report that can be copied directly into documentation updates, use:
 
 ```bash
-PYTHONPATH=./build/python python3 ./python/benchmarks/langgraph_head_to_head.py --format json
+AGENTCORE_BUILD_PYTHON_ROOT=./build/release-perf/python python3 ./python/benchmarks/langgraph_head_to_head.py --format json
 ```
 
 For a narrower stress test of wide fan-out/join behavior from Python, there is also:
@@ -242,6 +241,7 @@ The current benchmark surfaces include:
 
 - native scheduler, routing, checkpoint, subgraph, and knowledge-frontier benchmarks
 - native context-graph cold/warm ranking over intelligence records plus knowledge triples, including selected claim/evidence/knowledge invariants
+- native knowledge-ingestion counters over batched entity/triple commits, exact-match lookup, and final store cardinality through `knowledge_ingest_*`
 - native intelligence-query/index regression counters for task lookup, claim-semantic lookup, ranked supporting-claims retrieval, ranked action-candidate retrieval, ranked task agenda, ranked memory recall, bounded focus-set retrieval, first-hop and multi-hop related-record expansion, route selection, and top-match invariants for focused task/claim/memory ranking
 - native persistent-session fan-out and resume determinism benchmarks
 - native deterministic-node memoization hit/invalidation benchmark with executor-invocation counters
@@ -298,6 +298,26 @@ python_context_graph_python_rank_avg_ns=9231312
 
 Treat those as same-machine regression numbers, not portable guarantees.
 
+The knowledge-ingestion benchmark is the structural regression gate for streamed and batched knowledge writes. It checks:
+
+- the expected number of triples and batches are committed through the native patch path
+- exact lookup over the ingested graph returns the expected match
+- final entity and triple counts match the generated workload
+- `knowledge_ingest_*` counters are emitted so copy-elimination and indexing changes remain measurable
+
+The most useful counters are:
+
+```text
+knowledge_ingest_triples
+knowledge_ingest_batches
+knowledge_ingest_ns
+knowledge_ingest_created_entities
+knowledge_ingest_created_triples
+knowledge_ingest_final_entities
+knowledge_ingest_final_triples
+knowledge_ingest_exact_matched
+```
+
 ## Suggested Workflow For Runtime Changes
 
 When changing scheduler, subgraph, or streaming behavior:
@@ -308,7 +328,7 @@ When changing scheduler, subgraph, or streaming behavior:
 4. Run the four Python smoke scripts from the local `build` tree if the binding layer changed.
 5. Run `./build/release-perf/agentcore_runtime_benchmark`.
 6. Run `./build/release-perf/agentcore_persistent_subgraph_session_benchmark`.
-7. Run `PYTHONPATH=./build/python python3 ./python/benchmarks/langgraph_head_to_head.py` when the change affects scheduler, state, subgraph, or Python runtime behavior. Use `--format json` when you are refreshing the published comparison doc.
+7. Run `AGENTCORE_BUILD_PYTHON_ROOT=./build/release-perf/python python3 ./python/benchmarks/langgraph_head_to_head.py` when the change affects scheduler, state, subgraph, or Python runtime behavior. Use `--format json` when you are refreshing the published comparison doc.
 8. If the change touched Python orchestration more broadly, also run `PYTHONPATH=./build/python python3 ./python/benchmarks/state_graph_api_benchmark.py`.
 
 That sequence gives fast signal on correctness first and performance second.
@@ -328,4 +348,5 @@ For durable-execution changes specifically, also pay attention to:
 
 - Documentation index: [`../README.md`](../README.md)
 - Runtime model: [`../concepts/runtime-model.md`](../concepts/runtime-model.md)
+- Design lineage: [`../concepts/design-lineage.md`](../concepts/design-lineage.md)
 - API map: [`../reference/api.md`](../reference/api.md)

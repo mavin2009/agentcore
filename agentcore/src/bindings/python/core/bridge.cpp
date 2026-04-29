@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstring>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <mutex>
 #include <string_view>
@@ -1259,9 +1260,13 @@ static PyMappingMethods StateProxy_as_mapping = {
     nullptr
 };
 
-PyObject* StateProxy_get(PyObject* self, PyObject* args) {
-    PyObject *k, *d = Py_None;
-    if (!PyArg_ParseTuple(args, "O|O", &k, &d)) return nullptr;
+PyObject* StateProxy_get(PyObject* self, PyObject* const* args, Py_ssize_t nargs) {
+    if (nargs < 1 || nargs > 2) {
+        PyErr_SetString(PyExc_TypeError, "get() expected 1 or 2 arguments");
+        return nullptr;
+    }
+    PyObject* k = args[0];
+    PyObject* d = nargs == 2 ? args[1] : Py_None;
 
     auto* proxy = reinterpret_cast<StateProxy*>(self);
     StateKey state_key = 0;
@@ -1438,7 +1443,7 @@ PyObject* StateProxy_richcompare(PyObject* self, PyObject* other, int op) {
 }
 
 static PyMethodDef StateProxy_methods[] = {
-    {"get", reinterpret_cast<PyCFunction>(StateProxy_get), METH_VARARGS, "Get value"},
+    {"get", reinterpret_cast<PyCFunction>(StateProxy_get), METH_FASTCALL, "Get value"},
     {"keys", reinterpret_cast<PyCFunction>(StateProxy_keys), METH_NOARGS, "Get keys"},
     {"items", reinterpret_cast<PyCFunction>(StateProxy_items), METH_NOARGS, "Get items"},
     {"copy", reinterpret_cast<PyCFunction>(StateProxy_copy), METH_NOARGS, "Copy to a dict"},
@@ -1548,6 +1553,301 @@ PyObject* create_borrowed_state_proxy(
     return reinterpret_cast<PyObject*>(self);
 }
 
+struct StateViewProxy {
+    PyObject_HEAD
+    PyObject* base;
+    PyObject* overlay;
+};
+
+void StateViewProxy_dealloc(StateViewProxy* self) {
+    Py_XDECREF(self->base);
+    Py_XDECREF(self->overlay);
+    Py_TYPE(self)->tp_free(reinterpret_cast<PyObject*>(self));
+}
+
+bool StateViewProxy_overlay_lookup(StateViewProxy* proxy, PyObject* key, PyObject** output, bool* found) {
+    *found = false;
+    *output = nullptr;
+    if (proxy->overlay == nullptr || proxy->overlay == Py_None) {
+        return true;
+    }
+    PyObject* value = PyDict_GetItemWithError(proxy->overlay, key);
+    if (value != nullptr) {
+        Py_INCREF(value);
+        *output = value;
+        *found = true;
+        return true;
+    }
+    return PyErr_Occurred() == nullptr;
+}
+
+bool StateViewProxy_base_value(
+    StateViewProxy* proxy,
+    PyObject* key,
+    PyObject** output,
+    bool* found
+) {
+    *found = false;
+    *output = nullptr;
+    if (proxy->base == nullptr || !PyObject_TypeCheck(proxy->base, &StateProxyType)) {
+        PyErr_SetString(PyExc_RuntimeError, "invalid state view base");
+        return false;
+    }
+
+    auto* base = reinterpret_cast<StateProxy*>(proxy->base);
+    StateKey state_key = 0;
+    bool key_found = false;
+    if (!StateProxy_resolve_key(base, key, &state_key, &key_found)) {
+        return false;
+    }
+    if (!key_found) {
+        return true;
+    }
+
+    const WorkflowState* state = nullptr;
+    const BlobStore* blobs = nullptr;
+    const StringInterner* strings = nullptr;
+    if (!StateProxy_resolve(base, &state, &blobs, &strings)) {
+        return false;
+    }
+
+    Value value = state->load(state_key);
+    if (std::holds_alternative<std::monostate>(value)) {
+        return true;
+    }
+    *output = StateProxy_cached_value(base, state_key, value, *blobs, *strings, false);
+    if (*output == nullptr) {
+        return false;
+    }
+    *found = true;
+    return true;
+}
+
+Py_ssize_t StateViewProxy_length(PyObject* self) {
+    auto* proxy = reinterpret_cast<StateViewProxy*>(self);
+    PyObject* keys = nullptr;
+    if (proxy->overlay == nullptr || proxy->overlay == Py_None) {
+        keys = StateProxy_keys(proxy->base, nullptr);
+    } else {
+        keys = StateProxy_keys(proxy->base, nullptr);
+        if (keys != nullptr) {
+            PyObject* overlay_keys = PyMapping_Keys(proxy->overlay);
+            if (overlay_keys == nullptr) {
+                Py_DECREF(keys);
+                return -1;
+            }
+            const Py_ssize_t overlay_count = PyList_GET_SIZE(overlay_keys);
+            for (Py_ssize_t index = 0; index < overlay_count; ++index) {
+                PyObject* key = PyList_GET_ITEM(overlay_keys, index);
+                const int contains = PySequence_Contains(keys, key);
+                if (contains < 0) {
+                    Py_DECREF(overlay_keys);
+                    Py_DECREF(keys);
+                    return -1;
+                }
+                if (contains == 0 && PyList_Append(keys, key) != 0) {
+                    Py_DECREF(overlay_keys);
+                    Py_DECREF(keys);
+                    return -1;
+                }
+            }
+            Py_DECREF(overlay_keys);
+        }
+    }
+    if (keys == nullptr) {
+        return -1;
+    }
+    const Py_ssize_t length = PyList_GET_SIZE(keys);
+    Py_DECREF(keys);
+    return length;
+}
+
+PyObject* StateViewProxy_subscript(PyObject* self, PyObject* key) {
+    auto* proxy = reinterpret_cast<StateViewProxy*>(self);
+    PyObject* value = nullptr;
+    bool found = false;
+    if (!StateViewProxy_overlay_lookup(proxy, key, &value, &found)) {
+        return nullptr;
+    }
+    if (found) {
+        return value;
+    }
+    if (!StateViewProxy_base_value(proxy, key, &value, &found)) {
+        return nullptr;
+    }
+    if (found) {
+        return value;
+    }
+
+    std::string err;
+    const std::string key_name = python_string(key, &err);
+    if (!err.empty()) {
+        PyErr_SetString(PyExc_KeyError, err.c_str());
+        return nullptr;
+    }
+    PyErr_Format(PyExc_KeyError, "'%s'", key_name.c_str());
+    return nullptr;
+}
+
+static PyMappingMethods StateViewProxy_as_mapping = {
+    StateViewProxy_length,
+    StateViewProxy_subscript,
+    nullptr
+};
+
+PyObject* StateViewProxy_get(PyObject* self, PyObject* const* args, Py_ssize_t nargs) {
+    if (nargs < 1 || nargs > 2) {
+        PyErr_SetString(PyExc_TypeError, "get() expected 1 or 2 arguments");
+        return nullptr;
+    }
+    auto* proxy = reinterpret_cast<StateViewProxy*>(self);
+    PyObject* value = nullptr;
+    bool found = false;
+    if (!StateViewProxy_overlay_lookup(proxy, args[0], &value, &found)) {
+        return nullptr;
+    }
+    if (found) {
+        return value;
+    }
+    if (!StateViewProxy_base_value(proxy, args[0], &value, &found)) {
+        return nullptr;
+    }
+    if (found) {
+        return value;
+    }
+    PyObject* default_value = nargs == 2 ? args[1] : Py_None;
+    Py_INCREF(default_value);
+    return default_value;
+}
+
+PyObject* StateViewProxy_keys(PyObject* self, PyObject*) {
+    auto* proxy = reinterpret_cast<StateViewProxy*>(self);
+    PyObject* keys = StateProxy_keys(proxy->base, nullptr);
+    if (keys == nullptr || proxy->overlay == nullptr || proxy->overlay == Py_None) {
+        return keys;
+    }
+    PyObject* overlay_keys = PyMapping_Keys(proxy->overlay);
+    if (overlay_keys == nullptr) {
+        Py_DECREF(keys);
+        return nullptr;
+    }
+    const Py_ssize_t overlay_count = PyList_GET_SIZE(overlay_keys);
+    for (Py_ssize_t index = 0; index < overlay_count; ++index) {
+        PyObject* key = PyList_GET_ITEM(overlay_keys, index);
+        const int contains = PySequence_Contains(keys, key);
+        if (contains < 0) {
+            Py_DECREF(overlay_keys);
+            Py_DECREF(keys);
+            return nullptr;
+        }
+        if (contains == 0 && PyList_Append(keys, key) != 0) {
+            Py_DECREF(overlay_keys);
+            Py_DECREF(keys);
+            return nullptr;
+        }
+    }
+    Py_DECREF(overlay_keys);
+    return keys;
+}
+
+PyObject* StateViewProxy_copy(PyObject* self, PyObject*) {
+    auto* proxy = reinterpret_cast<StateViewProxy*>(self);
+    PyObject* dict = StateProxy_to_dict(reinterpret_cast<StateProxy*>(proxy->base));
+    if (dict == nullptr) {
+        return nullptr;
+    }
+    if (proxy->overlay != nullptr && proxy->overlay != Py_None &&
+        PyDict_Update(dict, proxy->overlay) != 0) {
+        Py_DECREF(dict);
+        return nullptr;
+    }
+    return dict;
+}
+
+PyObject* StateViewProxy_items(PyObject* self, PyObject*) {
+    PyObject* dict = StateViewProxy_copy(self, nullptr);
+    if (dict == nullptr) {
+        return nullptr;
+    }
+    PyObject* items = PyMapping_Items(dict);
+    Py_DECREF(dict);
+    return items;
+}
+
+PyObject* StateViewProxy_iter(PyObject* self) {
+    PyObject* keys = StateViewProxy_keys(self, nullptr);
+    if (keys == nullptr) {
+        return nullptr;
+    }
+    PyObject* iterator = PyObject_GetIter(keys);
+    Py_DECREF(keys);
+    return iterator;
+}
+
+static PyMethodDef StateViewProxy_methods[] = {
+    {"get", reinterpret_cast<PyCFunction>(StateViewProxy_get), METH_FASTCALL, "Get value"},
+    {"keys", reinterpret_cast<PyCFunction>(StateViewProxy_keys), METH_NOARGS, "Get keys"},
+    {"items", reinterpret_cast<PyCFunction>(StateViewProxy_items), METH_NOARGS, "Get items"},
+    {"copy", reinterpret_cast<PyCFunction>(StateViewProxy_copy), METH_NOARGS, "Copy to a dict"},
+    {nullptr, nullptr, 0, nullptr}
+};
+
+static PyTypeObject StateViewProxyType = {
+    PyVarObject_HEAD_INIT(nullptr, 0)
+    "agentcore.StateViewProxy",           /* tp_name */
+    sizeof(StateViewProxy),               /* tp_basicsize */
+    0,                                    /* tp_itemsize */
+    (destructor)StateViewProxy_dealloc,   /* tp_dealloc */
+    0,                                    /* tp_print */
+    0,                                    /* tp_getattr */
+    0,                                    /* tp_setattr */
+    0,                                    /* tp_reserved */
+    0,                                    /* tp_repr */
+    0,                                    /* tp_as_number */
+    0,                                    /* tp_as_sequence */
+    &StateViewProxy_as_mapping,           /* tp_as_mapping */
+    0,                                    /* tp_hash */
+    0,                                    /* tp_call */
+    0,                                    /* tp_str */
+    0,                                    /* tp_getattro */
+    0,                                    /* tp_setattro */
+    0,                                    /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT,                   /* tp_flags */
+    "State View Proxy",                   /* tp_doc */
+    0,                                    /* tp_traverse */
+    0,                                    /* tp_clear */
+    0,                                    /* tp_richcompare */
+    0,                                    /* tp_weaklistoffset */
+    StateViewProxy_iter,                  /* tp_iter */
+    0,                                    /* tp_iternext */
+    StateViewProxy_methods,               /* tp_methods */
+    0,                                    /* tp_members */
+    0,                                    /* tp_getset */
+    0,                                    /* tp_base */
+    0,                                    /* tp_dict */
+    0,                                    /* tp_descr_get */
+    0,                                    /* tp_descr_set */
+    0,                                    /* tp_dictoffset */
+    0,                                    /* tp_init */
+    0,                                    /* tp_alloc */
+    0,                                    /* tp_new */
+    0,                                    /* tp_free */
+};
+
+PyObject* create_state_view_proxy(PyObject* base, PyObject* overlay = nullptr) {
+    if (PyType_Ready(&StateViewProxyType) < 0) {
+        return nullptr;
+    }
+    StateViewProxy* self = PyObject_New(StateViewProxy, &StateViewProxyType);
+    if (self != nullptr) {
+        self->base = base;
+        Py_XINCREF(self->base);
+        self->overlay = overlay;
+        Py_XINCREF(self->overlay);
+    }
+    return reinterpret_cast<PyObject*>(self);
+}
+
 struct ConfigProxy {
     PyObject_HEAD
     PyObject* base_config;
@@ -1576,11 +1876,13 @@ static PyMappingMethods ConfigProxy_as_mapping = {
     nullptr
 };
 
-PyObject* ConfigProxy_get(PyObject* self, PyObject* args) {
-    PyObject *key, *default_value = Py_None;
-    if (!PyArg_ParseTuple(args, "O|O", &key, &default_value)) {
+PyObject* ConfigProxy_get(PyObject* self, PyObject* const* args, Py_ssize_t nargs) {
+    if (nargs < 1 || nargs > 2) {
+        PyErr_SetString(PyExc_TypeError, "get() expected 1 or 2 arguments");
         return nullptr;
     }
+    PyObject* key = args[0];
+    PyObject* default_value = nargs == 2 ? args[1] : Py_None;
     PyObject* result = ConfigProxy_subscript(self, key);
     if (result == nullptr) {
         if (PyErr_ExceptionMatches(PyExc_KeyError)) {
@@ -1633,7 +1935,7 @@ PyObject* ConfigProxy_runtime_capsule(PyObject* self, PyObject*) {
 }
 
 static PyMethodDef ConfigProxy_methods[] = {
-    {"get", reinterpret_cast<PyCFunction>(ConfigProxy_get), METH_VARARGS, "Get value"},
+    {"get", reinterpret_cast<PyCFunction>(ConfigProxy_get), METH_FASTCALL, "Get value"},
     {"keys", reinterpret_cast<PyCFunction>(ConfigProxy_keys), METH_NOARGS, "Get keys"},
     {"items", reinterpret_cast<PyCFunction>(ConfigProxy_items), METH_NOARGS, "Get items"},
     {"copy", reinterpret_cast<PyCFunction>(ConfigProxy_copy), METH_NOARGS, "Copy to a dict"},
@@ -1894,6 +2196,9 @@ GraphHandle::~GraphHandle() {
         for (auto& binding : node_bindings_) {
             Py_XDECREF(binding.callback);
             Py_XDECREF(binding.patch_key_lookup);
+            Py_XDECREF(binding.native_action_callback);
+            Py_XDECREF(binding.native_route_callback);
+            Py_XDECREF(binding.native_route_map);
         }
         for (auto& entry : active_configs_) {
             Py_XDECREF(entry.second);
@@ -2469,6 +2774,7 @@ bool GraphHandle::add_node(
     const NodeMemoizationPolicy& memoization,
     const std::vector<IntelligenceSubscription>& intelligence_subscriptions,
     const std::vector<std::pair<std::string, JoinMergeStrategy>>& merge_rules,
+    PyObject* native_callback_spec,
     std::string* error_message
 ) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -2478,6 +2784,66 @@ bool GraphHandle::add_node(
     }
 
     Py_XINCREF(callback);
+    PyObject* native_action_callback = nullptr;
+    PyObject* native_route_callback = nullptr;
+    PyObject* native_route_map = nullptr;
+    uint8_t native_action_arity = 0;
+    uint8_t native_route_arity = 0;
+    bool native_simple_callback = false;
+    if (native_callback_spec != nullptr && native_callback_spec != Py_None) {
+        if (!PyDict_Check(native_callback_spec)) {
+            Py_XDECREF(callback);
+            *error_message = "native_callback_spec must be a dict or None";
+            return false;
+        }
+        PyObject* action = PyDict_GetItemString(native_callback_spec, "action");
+        PyObject* route = PyDict_GetItemString(native_callback_spec, "route");
+        PyObject* route_map = PyDict_GetItemString(native_callback_spec, "route_map");
+        PyObject* action_arity_obj = PyDict_GetItemString(native_callback_spec, "action_arity");
+        PyObject* route_arity_obj = PyDict_GetItemString(native_callback_spec, "route_arity");
+
+        auto parse_arity = [](PyObject* object, uint8_t* output) -> bool {
+            if (object == nullptr || object == Py_None) {
+                *output = 0;
+                return true;
+            }
+            const unsigned long value = PyLong_AsUnsignedLong(object);
+            if (PyErr_Occurred() != nullptr || value > 2UL) {
+                return false;
+            }
+            *output = static_cast<uint8_t>(value);
+            return true;
+        };
+        if (!parse_arity(action_arity_obj, &native_action_arity) ||
+            !parse_arity(route_arity_obj, &native_route_arity)) {
+            PyErr_Clear();
+            Py_XDECREF(callback);
+            *error_message = "native callback arity must be 0, 1, or 2";
+            return false;
+        }
+
+        if (action != nullptr && action != Py_None) {
+            native_action_callback = action;
+            Py_INCREF(native_action_callback);
+            native_simple_callback = true;
+        }
+        if (route != nullptr && route != Py_None) {
+            native_route_callback = route;
+            Py_INCREF(native_route_callback);
+            native_simple_callback = true;
+        }
+        if (route_map != nullptr && route_map != Py_None) {
+            if (!PyDict_Check(route_map)) {
+                Py_XDECREF(callback);
+                Py_XDECREF(native_action_callback);
+                Py_XDECREF(native_route_callback);
+                *error_message = "native route_map must be a dict or None";
+                return false;
+            }
+            native_route_map = route_map;
+            Py_INCREF(native_route_map);
+        }
+    }
     NodeId node_id = next_node_id_++;
     node_ids_by_name_[std::string(name)] = node_id;
 
@@ -2500,6 +2866,13 @@ bool GraphHandle::add_node(
         memoization,
         intelligence_subscriptions
     });
+    NodeBinding& binding = node_bindings_.back();
+    binding.native_action_callback = native_action_callback;
+    binding.native_route_callback = native_route_callback;
+    binding.native_route_map = native_route_map;
+    binding.native_action_arity = native_action_arity;
+    binding.native_route_arity = native_route_arity;
+    binding.native_simple_callback = native_simple_callback;
     node_binding_indices_[node_id] = node_bindings_.size() - 1U;
 
     if (!entry_node_id_) {
@@ -2577,6 +2950,41 @@ bool GraphHandle::add_edge(std::string_view source, std::string_view target, std
     return true;
 }
 
+bool GraphHandle::set_state_reducer_rules(
+    const std::vector<std::pair<std::string, JoinMergeStrategy>>& reducer_rules,
+    std::string* error_message
+) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (finalized_) {
+        if (error_message != nullptr) {
+            *error_message = "state reducer rules must be configured before graph finalization";
+        }
+        return false;
+    }
+
+    std::unordered_set<StateKey> seen_keys;
+    std::vector<FieldMergeRule> rules;
+    rules.reserve(reducer_rules.size());
+    for (const auto& [field, strategy] : reducer_rules) {
+        const StateKey state_key = ensure_state_key_locked(field);
+        if (!seen_keys.insert(state_key).second) {
+            if (error_message != nullptr) {
+                *error_message = "duplicate state reducer rule for field '" + field + "'";
+            }
+            return false;
+        }
+        if (strategy == JoinMergeStrategy::MergeMessages) {
+            message_state_keys_.insert(state_key);
+        }
+        rules.push_back(FieldMergeRule{state_key, strategy});
+    }
+    std::sort(rules.begin(), rules.end(), [](const FieldMergeRule& left, const FieldMergeRule& right) {
+        return left.key < right.key;
+    });
+    state_reducer_rules_ = std::move(rules);
+    return true;
+}
+
 bool GraphHandle::finalize(std::string* error_message) {
     return ensure_finalized(error_message);
 }
@@ -2597,6 +3005,7 @@ bool GraphHandle::finalize_locked(std::string* error_message) {
     graph_.id = graph_id_;
     graph_.name = name_;
     graph_.entry = node_ids_by_name_[kInternalBootstrapNodeName];
+    graph_.state_reducer_rules = state_reducer_rules_;
 
     for (const auto& binding : node_bindings_) {
         NodeExecutorFn executor = nullptr;
@@ -2751,6 +3160,48 @@ bool GraphHandle::execute_run(PyObject* input_state, PyObject* config, bool incl
 }
 
 bool GraphHandle::invoke(PyObject* input_state, PyObject* config, PyObject** result, std::string* error_message) {
+    if (!ensure_finalized(error_message)) return false;
+
+    InputEnvelope envelope;
+    if (!build_initial_envelope(input_state, config, &envelope, error_message)) return false;
+
+    if (entry_node_id_.has_value()) {
+        envelope.entry_override = *entry_node_id_;
+    }
+
+    if (engine_->supports_fast_invoke(graph_, envelope)) {
+        const RunId fast_run_id = engine_->reserve_run_id_for_fast_invoke();
+        const auto cleanup_active_config = [&]() {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto it = active_configs_.find(fast_run_id);
+            if (it != active_configs_.end()) {
+                Py_XDECREF(it->second);
+                active_configs_.erase(it);
+            }
+        };
+        if (config && config != Py_None) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            Py_INCREF(config);
+            active_configs_[fast_run_id] = config;
+        }
+
+        ExecutionEngine::FastRunResult fast_result;
+        Py_BEGIN_ALLOW_THREADS
+        fast_result = engine_->try_run_to_completion_fast(fast_run_id, graph_, envelope);
+        Py_END_ALLOW_THREADS
+        cleanup_active_config();
+        if (fast_result.supported) {
+            static_cast<void>(fast_result.result);
+            *result = state_to_python_dict(
+                fast_result.state_store.get_current_state(),
+                fast_result.state_store.blobs(),
+                fast_result.state_store.strings(),
+                error_message
+            );
+            return *result != nullptr;
+        }
+    }
+
     RunId run_id = 0U;
     RunResult run_result;
     if (!execute_run_core(
@@ -3047,37 +3498,34 @@ bool GraphHandle::build_trace_event_dict(
 PyObject* GraphHandle::build_trace_list(RunId run_id, bool include_subgraphs, std::string* error_message) const {
     const std::vector<TraceEvent> events = engine_->trace().events_for_run_since_sequence(run_id, 1U);
 
-    std::size_t visible_event_count = 0U;
+    std::vector<PyObject*> visible_events;
+    visible_events.reserve(events.size());
     for (const TraceEvent& event : events) {
         PyObject* event_dict = nullptr;
         if (!build_trace_event_dict(event, include_subgraphs, &event_dict, error_message)) {
+            for (PyObject* owned_event : visible_events) {
+                Py_DECREF(owned_event);
+            }
             return nullptr;
         }
         if (event_dict != nullptr) {
-            ++visible_event_count;
-            Py_DECREF(event_dict);
+            visible_events.push_back(event_dict);
         }
     }
 
-    PyObject* list = PyList_New(static_cast<Py_ssize_t>(visible_event_count));
+    PyObject* list = PyList_New(static_cast<Py_ssize_t>(visible_events.size()));
     if (list == nullptr) {
+        for (PyObject* owned_event : visible_events) {
+            Py_DECREF(owned_event);
+        }
         if (error_message != nullptr) {
             *error_message = fetch_python_error();
         }
         return nullptr;
     }
 
-    Py_ssize_t event_index = 0;
-    for (const TraceEvent& event : events) {
-        PyObject* event_dict = nullptr;
-        if (!build_trace_event_dict(event, include_subgraphs, &event_dict, error_message)) {
-            Py_DECREF(list);
-            return nullptr;
-        }
-        if (event_dict == nullptr) {
-            continue;
-        }
-        PyList_SET_ITEM(list, event_index++, event_dict);
+    for (std::size_t index = 0; index < visible_events.size(); ++index) {
+        PyList_SET_ITEM(list, static_cast<Py_ssize_t>(index), visible_events[index]);
     }
     return list;
 }
@@ -3144,6 +3592,11 @@ bool GraphHandle::build_initial_envelope(PyObject* input_state, PyObject* config
     }
 
     if (config != nullptr && config != Py_None) {
+        if (PyDict_Check(config) && PyDict_Size(config) == 0) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            envelope->initial_field_count = state_names_->size();
+            return true;
+        }
         std::vector<std::byte> pickle_bytes;
         if (!dump_object_as_pickle_bytes(config, &pickle_bytes, error_message)) {
             return false;
@@ -3663,6 +4116,280 @@ bool GraphHandle::register_python_model(std::string_view name, PyObject* callbac
     return true;
 }
 
+PyObject* normalize_update_object(PyObject* value) {
+    if (value == nullptr || value == Py_None) {
+        return PyDict_New();
+    }
+    if (PyDict_CheckExact(value)) {
+        Py_INCREF(value);
+        return value;
+    }
+    PyObject* dict = PyDict_New();
+    if (dict == nullptr) {
+        return nullptr;
+    }
+    if (PyDict_Update(dict, value) == 0) {
+        return dict;
+    }
+    PyErr_Clear();
+    PyObject* items = PyObject_CallMethod(value, "items", nullptr);
+    if (items != nullptr) {
+        const int merge_status = PyDict_MergeFromSeq2(dict, items, 1);
+        Py_DECREF(items);
+        if (merge_status == 0) {
+            return dict;
+        }
+        PyErr_Clear();
+    }
+    Py_DECREF(dict);
+    PyErr_SetString(PyExc_TypeError, "node updates must be mappings or None");
+    return nullptr;
+}
+
+bool result_is_command_like(PyObject* result) {
+    if (result == nullptr || result == Py_None || PyDict_Check(result) ||
+        PyUnicode_Check(result) || PyTuple_Check(result) || PyList_Check(result)) {
+        return false;
+    }
+    return PyObject_HasAttrString(result, "update") == 1 &&
+        PyObject_HasAttrString(result, "goto") == 1 &&
+        PyObject_HasAttrString(result, "wait") == 1;
+}
+
+PyObject* normalize_goto_object(PyObject* value) {
+    if (value == nullptr || value == Py_None) {
+        return nullptr;
+    }
+    if (PyUnicode_Check(value)) {
+        Py_INCREF(value);
+        return value;
+    }
+    return PyObject_Str(value);
+}
+
+bool normalize_python_callback_result(
+    PyObject* result,
+    PyObject** updates,
+    PyObject** goto_target,
+    bool* should_wait
+) {
+    *updates = nullptr;
+    *goto_target = nullptr;
+    *should_wait = false;
+
+    if (result_is_command_like(result)) {
+        PyObject* update_obj = PyObject_GetAttrString(result, "update");
+        PyObject* goto_obj = PyObject_GetAttrString(result, "goto");
+        PyObject* wait_obj = PyObject_GetAttrString(result, "wait");
+        if (update_obj == nullptr || goto_obj == nullptr || wait_obj == nullptr) {
+            Py_XDECREF(update_obj);
+            Py_XDECREF(goto_obj);
+            Py_XDECREF(wait_obj);
+            return false;
+        }
+        *updates = normalize_update_object(update_obj);
+        *goto_target = normalize_goto_object(goto_obj);
+        const int wait_value = PyObject_IsTrue(wait_obj);
+        Py_DECREF(update_obj);
+        Py_DECREF(goto_obj);
+        Py_DECREF(wait_obj);
+        if (*updates == nullptr || wait_value < 0) {
+            Py_XDECREF(*updates);
+            Py_XDECREF(*goto_target);
+            *updates = nullptr;
+            *goto_target = nullptr;
+            return false;
+        }
+        *should_wait = wait_value != 0;
+        return true;
+    }
+
+    if (result == nullptr || result == Py_None) {
+        *updates = PyDict_New();
+        return *updates != nullptr;
+    }
+    if (PyUnicode_Check(result)) {
+        *updates = PyDict_New();
+        if (*updates == nullptr) {
+            return false;
+        }
+        Py_INCREF(result);
+        *goto_target = result;
+        return true;
+    }
+    if (PyTuple_Check(result) || PyList_Check(result)) {
+        const Py_ssize_t size = PySequence_Size(result);
+        if (size != 2) {
+            PyErr_SetString(PyExc_TypeError, "tuple/list node results must contain exactly two elements");
+            return false;
+        }
+        PyObject* update_obj = PySequence_GetItem(result, 0);
+        PyObject* goto_obj = PySequence_GetItem(result, 1);
+        if (update_obj == nullptr || goto_obj == nullptr) {
+            Py_XDECREF(update_obj);
+            Py_XDECREF(goto_obj);
+            return false;
+        }
+        *updates = normalize_update_object(update_obj);
+        *goto_target = normalize_goto_object(goto_obj);
+        Py_DECREF(update_obj);
+        Py_DECREF(goto_obj);
+        if (*updates == nullptr) {
+            Py_XDECREF(*goto_target);
+            *goto_target = nullptr;
+            return false;
+        }
+        return true;
+    }
+
+    *updates = normalize_update_object(result);
+    return *updates != nullptr;
+}
+
+PyObject* map_goto_for_native_callback(PyObject* goto_target) {
+    if (goto_target == nullptr || goto_target == Py_None) {
+        return nullptr;
+    }
+    std::string err;
+    const std::string target = python_string(goto_target, &err);
+    if (!err.empty()) {
+        PyErr_SetString(PyExc_TypeError, err.c_str());
+        return nullptr;
+    }
+    if (target == "__end__" || target == kInternalEndNodeName) {
+        return unicode_from_utf8(kInternalEndNodeName);
+    }
+    Py_INCREF(goto_target);
+    return goto_target;
+}
+
+PyObject* call_python_callback_vector(PyObject* callback, uint8_t arity, PyObject* state, PyObject* config) {
+    if (callback == nullptr || callback == Py_None) {
+        Py_RETURN_NONE;
+    }
+    if (arity >= 2) {
+        PyObject* args[2] = {state, config};
+        return PyObject_Vectorcall(callback, args, 2, nullptr);
+    }
+    PyObject* args[1] = {state};
+    return PyObject_Vectorcall(callback, args, 1, nullptr);
+}
+
+PyObject* build_native_callback_tuple(PyObject* updates, PyObject* route, bool should_wait) {
+    if (should_wait) {
+        return PyTuple_Pack(3, updates, Py_None, Py_True);
+    }
+    if (route != nullptr && route != Py_None) {
+        return PyTuple_Pack(2, updates, route);
+    }
+    Py_INCREF(updates);
+    return updates;
+}
+
+PyObject* execute_native_simple_python_callback(NodeBinding* binding, PyObject* py_state, PyObject* py_config) {
+    PyObject* state_view = create_state_view_proxy(py_state);
+    if (state_view == nullptr) {
+        return nullptr;
+    }
+
+    PyObject* updates = PyDict_New();
+    PyObject* explicit_goto = nullptr;
+    bool should_wait = false;
+    if (updates == nullptr) {
+        Py_DECREF(state_view);
+        return nullptr;
+    }
+
+    if (binding->native_action_callback != nullptr) {
+        PyObject* action_result = call_python_callback_vector(
+            binding->native_action_callback,
+            binding->native_action_arity,
+            state_view,
+            py_config
+        );
+        if (action_result == nullptr) {
+            Py_DECREF(updates);
+            Py_DECREF(state_view);
+            return nullptr;
+        }
+        Py_DECREF(updates);
+        if (!normalize_python_callback_result(action_result, &updates, &explicit_goto, &should_wait)) {
+            Py_DECREF(action_result);
+            Py_XDECREF(updates);
+            Py_DECREF(state_view);
+            return nullptr;
+        }
+        Py_DECREF(action_result);
+        if (should_wait || explicit_goto != nullptr) {
+            PyObject* mapped = map_goto_for_native_callback(explicit_goto);
+            if (explicit_goto != nullptr && mapped == nullptr && PyErr_Occurred() != nullptr) {
+                Py_DECREF(updates);
+                Py_XDECREF(explicit_goto);
+                Py_DECREF(state_view);
+                return nullptr;
+            }
+            Py_XDECREF(explicit_goto);
+            PyObject* result = build_native_callback_tuple(updates, mapped, should_wait);
+            Py_DECREF(updates);
+            Py_XDECREF(mapped);
+            Py_DECREF(state_view);
+            return result;
+        }
+    }
+
+    if (binding->native_route_callback == nullptr) {
+        Py_DECREF(state_view);
+        return updates;
+    }
+
+    PyObject* route_state = state_view;
+    if (PyDict_Size(updates) > 0) {
+        route_state = create_state_view_proxy(py_state, updates);
+        if (route_state == nullptr) {
+            Py_DECREF(updates);
+            Py_DECREF(state_view);
+            return nullptr;
+        }
+    } else {
+        Py_INCREF(route_state);
+    }
+
+    PyObject* route_value = call_python_callback_vector(
+        binding->native_route_callback,
+        binding->native_route_arity,
+        route_state,
+        py_config
+    );
+    Py_DECREF(route_state);
+    Py_DECREF(state_view);
+    if (route_value == nullptr) {
+        Py_DECREF(updates);
+        return nullptr;
+    }
+
+    PyObject* mapped_route = nullptr;
+    if (binding->native_route_map != nullptr) {
+        mapped_route = PyDict_GetItemWithError(binding->native_route_map, route_value);
+        if (mapped_route == nullptr) {
+            if (PyErr_Occurred() == nullptr) {
+                PyErr_SetString(PyExc_KeyError, "missing conditional route mapping");
+            }
+            Py_DECREF(route_value);
+            Py_DECREF(updates);
+            return nullptr;
+        }
+        Py_INCREF(mapped_route);
+    } else {
+        mapped_route = map_goto_for_native_callback(route_value);
+    }
+    Py_DECREF(route_value);
+
+    PyObject* result = build_native_callback_tuple(updates, mapped_route, false);
+    Py_DECREF(updates);
+    Py_XDECREF(mapped_route);
+    return result;
+}
+
 NodeResult python_bootstrap_executor(ExecutionContext&) {
     return NodeResult::success();
 }
@@ -3770,22 +4497,18 @@ NodeResult python_node_executor(ExecutionContext& ctx) {
         return NodeResult{NodeResult::HardFail};
     }
 
-    PyObject* args = PyTuple_Pack(2, py_state, py_config);
-    if (args == nullptr) {
-        runtime_view->active.store(false, std::memory_order_release);
-        Py_DECREF(py_state);
-        Py_DECREF(py_config);
-        Py_DECREF(runtime_capsule);
-        PyGILState_Release(gil);
-        return NodeResult{NodeResult::HardFail};
+    PyObject* result = nullptr;
+    if (binding->native_simple_callback) {
+        result = execute_native_simple_python_callback(binding, py_state, py_config);
+    } else {
+        PyObject* call_args[2] = {py_state, py_config};
+        result = PyObject_Vectorcall(binding->callback, call_args, 2, nullptr);
     }
-    PyObject* result = PyObject_CallObject(binding->callback, args);
 
-    const KnowledgeGraphPatch pending_knowledge_graph_patch = runtime_view->pending_knowledge_graph_patch;
-    const IntelligencePatch pending_intelligence_patch = runtime_view->pending_intelligence_patch;
+    KnowledgeGraphPatch pending_knowledge_graph_patch = std::move(runtime_view->pending_knowledge_graph_patch);
+    IntelligencePatch pending_intelligence_patch = std::move(runtime_view->pending_intelligence_patch);
     runtime_view->active.store(false, std::memory_order_release);
 
-    Py_DECREF(args);
     Py_DECREF(py_state);
     Py_DECREF(py_config);
     Py_DECREF(runtime_capsule);
@@ -3847,46 +4570,30 @@ NodeResult python_node_executor(ExecutionContext& ctx) {
         }
     }
 
-    if (!pending_knowledge_graph_patch.empty()) {
-        node_result.patch.knowledge_graph.entities.insert(
-            node_result.patch.knowledge_graph.entities.end(),
-            pending_knowledge_graph_patch.entities.begin(),
-            pending_knowledge_graph_patch.entities.end()
+    const auto append_or_move = [](auto& destination, auto& source) {
+        if (source.empty()) {
+            return;
+        }
+        if (destination.empty()) {
+            destination = std::move(source);
+            return;
+        }
+        destination.reserve(destination.size() + source.size());
+        destination.insert(
+            destination.end(),
+            std::make_move_iterator(source.begin()),
+            std::make_move_iterator(source.end())
         );
-        node_result.patch.knowledge_graph.triples.insert(
-            node_result.patch.knowledge_graph.triples.end(),
-            pending_knowledge_graph_patch.triples.begin(),
-            pending_knowledge_graph_patch.triples.end()
-        );
-    }
+        source.clear();
+    };
 
-    if (!pending_intelligence_patch.empty()) {
-        node_result.patch.intelligence.tasks.insert(
-            node_result.patch.intelligence.tasks.end(),
-            pending_intelligence_patch.tasks.begin(),
-            pending_intelligence_patch.tasks.end()
-        );
-        node_result.patch.intelligence.claims.insert(
-            node_result.patch.intelligence.claims.end(),
-            pending_intelligence_patch.claims.begin(),
-            pending_intelligence_patch.claims.end()
-        );
-        node_result.patch.intelligence.evidence.insert(
-            node_result.patch.intelligence.evidence.end(),
-            pending_intelligence_patch.evidence.begin(),
-            pending_intelligence_patch.evidence.end()
-        );
-        node_result.patch.intelligence.decisions.insert(
-            node_result.patch.intelligence.decisions.end(),
-            pending_intelligence_patch.decisions.begin(),
-            pending_intelligence_patch.decisions.end()
-        );
-        node_result.patch.intelligence.memories.insert(
-            node_result.patch.intelligence.memories.end(),
-            pending_intelligence_patch.memories.begin(),
-            pending_intelligence_patch.memories.end()
-        );
-    }
+    append_or_move(node_result.patch.knowledge_graph.entities, pending_knowledge_graph_patch.entities);
+    append_or_move(node_result.patch.knowledge_graph.triples, pending_knowledge_graph_patch.triples);
+    append_or_move(node_result.patch.intelligence.tasks, pending_intelligence_patch.tasks);
+    append_or_move(node_result.patch.intelligence.claims, pending_intelligence_patch.claims);
+    append_or_move(node_result.patch.intelligence.evidence, pending_intelligence_patch.evidence);
+    append_or_move(node_result.patch.intelligence.decisions, pending_intelligence_patch.decisions);
+    append_or_move(node_result.patch.intelligence.memories, pending_intelligence_patch.memories);
 
     if (should_wait) {
         node_result.status = NodeResult::Waiting;

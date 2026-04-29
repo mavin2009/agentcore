@@ -11,6 +11,7 @@ If you are new to AgentCore, start with the path that matches what you are tryin
 | Build a graph from Python | [Python quickstart](./quickstarts/python.md) | Install/build, define nodes, route, stream, inspect metadata, and use common agent features |
 | Move an existing graph workflow | [Migration guide](./migration/langgraph-to-agentcore.md) | Import changes, callback differences, reducer support, message state, and current compatibility limits |
 | Understand why the runtime behaves this way | [Runtime model](./concepts/runtime-model.md) | State patches, scheduler behavior, checkpoints, subgraph sessions, native context-graph ranking, intelligence records, knowledge-graph state, and external graph-store boundaries |
+| Understand the ideas behind the design | [Design lineage](./concepts/design-lineage.md) | Related systems, retrieval, graph, agent-memory, reactive-matching, interoperability, and observability work |
 | Connect external tools and context | [MCP integration](./integrations/mcp.md) | Mirror MCP tools, consume prompts/resources, expose AgentCore as an MCP server, and generate client config |
 | Connect external graph data | [Graph store integration](./integrations/graph-stores.md) | Hydrate native knowledge from in-memory or Neo4j stores and implement other graph-store backends |
 | Export traces and metrics | [OpenTelemetry integration](./integrations/opentelemetry.md) | Opt-in run/node spans, metrics, and how to keep telemetry out of the default hot path |
@@ -33,14 +34,16 @@ For most Python users:
 For runtime or platform engineers:
 
 1. Read [Runtime Model](./concepts/runtime-model.md).
-2. Run the native validation path in [Validation And Benchmarks](./operations/validation.md).
-3. Inspect the public headers under `../agentcore/include/agentcore`.
+2. Skim [Design Lineage And Related Work](./concepts/design-lineage.md) to see which ideas map to which implementation choices.
+3. Run the native validation path in [Validation And Benchmarks](./operations/validation.md).
+4. Inspect the public headers under `../agentcore/include/agentcore`.
 
 ## Practical Entry Points
 
 - [Python quickstart](./quickstarts/python.md): the main tutorial surface.
 - [API reference](./reference/api.md): exact Python and C++ surfaces.
 - [Runtime model](./concepts/runtime-model.md): execution semantics and state behavior.
+- [Design lineage](./concepts/design-lineage.md): related work and design credit.
 - [MCP integration](./integrations/mcp.md): external tool, prompt, and resource interoperability.
 - [Graph store integration](./integrations/graph-stores.md): external graph database hydration and adapter contract.
 - [OpenTelemetry integration](./integrations/opentelemetry.md): observability setup and emitted attributes.

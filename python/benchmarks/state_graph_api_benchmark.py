@@ -1,5 +1,7 @@
 import asyncio
+import operator
 import time
+from typing import Annotated, TypedDict
 
 from agentcore._context_graph import ContextGraphIndex
 from agentcore.context import _collect_selector
@@ -24,6 +26,7 @@ config = {"configurable": {"target_count": 64}, "tags": ["benchmark"]}
 
 PATCH_MARSHALLING_ITERATIONS = 200
 PAYLOAD_BENCHMARK_ITERATIONS = 100
+REDUCER_BENCHMARK_ITERATIONS = 200
 CONTEXT_GRAPH_BENCHMARK_ITERATIONS = 40
 CONTEXT_GRAPH_RECORDS = 48
 MEMO_BENCHMARK_ITERATIONS = 64
@@ -138,6 +141,73 @@ payload_graph.add_conditional_edges(
     {END: END, "payload_counter": "payload_counter"},
 )
 payload_compiled = payload_graph.compile()
+
+
+class ReducerBenchmarkState(TypedDict, total=False):
+    count: Annotated[int, operator.add]
+    notes: Annotated[list[str], operator.add]
+    seen: Annotated[bool, operator.or_]
+    floor: Annotated[int, min]
+    ceiling: Annotated[int, max]
+
+
+def native_reducer_step(state, config):
+    count = int(state.get("step_count", 0)) + 1
+    return {
+        "step_count": count,
+        "count": 1,
+        "notes": [f"n{count % 7}"],
+        "seen": (count % 5) == 0,
+        "floor": 100 - count,
+        "ceiling": count,
+    }
+
+
+def native_reducer_route(state, config):
+    target_count = int(dict(config.get("configurable", {})).get("target_count", 64))
+    return END if int(state["count"]) >= target_count else "native_reducer_step"
+
+
+native_reducer_graph = StateGraph(
+    ReducerBenchmarkState,
+    name="python_native_reducer_benchmark",
+    worker_count=2,
+)
+native_reducer_graph.add_node("native_reducer_step", native_reducer_step)
+native_reducer_graph.add_edge(START, "native_reducer_step")
+native_reducer_graph.add_conditional_edges(
+    "native_reducer_step",
+    native_reducer_route,
+    {END: END, "native_reducer_step": "native_reducer_step"},
+)
+native_reducer_compiled = native_reducer_graph.compile()
+
+
+def python_reducer_step(state, config):
+    count = int(state.get("step_count", 0)) + 1
+    notes = list(state.get("notes", []))
+    notes.append(f"n{count % 7}")
+    return {
+        "step_count": count,
+        "count": int(state.get("count", 0)) + 1,
+        "notes": notes,
+        "seen": bool(state.get("seen", False)) or ((count % 5) == 0),
+        "floor": min(int(state.get("floor", 100)), 100 - count),
+        "ceiling": max(int(state.get("ceiling", 0)), count),
+    }
+
+
+python_reducer_graph = StateGraph(dict, name="python_manual_reducer_benchmark", worker_count=2)
+python_reducer_graph.add_node("python_reducer_step", python_reducer_step)
+python_reducer_graph.add_edge(START, "python_reducer_step")
+python_reducer_graph.add_conditional_edges(
+    "python_reducer_step",
+    lambda state, config: END
+    if int(state["step_count"]) >= int(dict(config.get("configurable", {})).get("target_count", 64))
+    else "python_reducer_step",
+    {END: END, "python_reducer_step": "python_reducer_step"},
+)
+python_reducer_compiled = python_reducer_graph.compile()
 
 
 context_graph_timings = {"cold_ns": 0, "warm_ns": 0, "python_rank_ns": 0, "pipeline_ns": 0}
@@ -545,6 +615,26 @@ for _ in range(PAYLOAD_BENCHMARK_ITERATIONS):
     payload_result = payload_compiled.invoke(dict(payload_input), config=config)
 payload_end_ns = time.perf_counter_ns()
 
+reducer_input = {
+    "step_count": 0,
+    "count": 0,
+    "notes": [],
+    "seen": False,
+    "floor": 100,
+    "ceiling": 0,
+}
+native_reducer_start_ns = time.perf_counter_ns()
+for _ in range(REDUCER_BENCHMARK_ITERATIONS):
+    native_reducer_result = native_reducer_compiled.invoke(dict(reducer_input), config=config)
+native_reducer_end_ns = time.perf_counter_ns()
+
+python_reducer_start_ns = time.perf_counter_ns()
+for _ in range(REDUCER_BENCHMARK_ITERATIONS):
+    python_reducer_result = python_reducer_compiled.invoke(dict(reducer_input), config=config)
+python_reducer_end_ns = time.perf_counter_ns()
+if native_reducer_result != python_reducer_result:
+    raise AssertionError("native reducer plan diverged from Python reducer baseline")
+
 context_graph_start_ns = time.perf_counter_ns()
 context_graph_result = None
 for _ in range(CONTEXT_GRAPH_BENCHMARK_ITERATIONS):
@@ -738,6 +828,8 @@ record_once_hit_elapsed_ns = record_once_hit_end_ns - record_once_hit_start_ns
 record_once_miss_elapsed_ns = record_once_miss_end_ns - record_once_miss_start_ns
 patch_elapsed_ns = patch_end_ns - patch_start_ns
 payload_elapsed_ns = payload_end_ns - payload_start_ns
+native_reducer_elapsed_ns = native_reducer_end_ns - native_reducer_start_ns
+python_reducer_elapsed_ns = python_reducer_end_ns - python_reducer_start_ns
 context_graph_elapsed_ns = context_graph_end_ns - context_graph_start_ns
 memo_baseline_elapsed_ns = memo_baseline_end_ns - memo_baseline_start_ns
 memo_hit_elapsed_ns = memo_hit_end_ns - memo_hit_start_ns
@@ -778,6 +870,22 @@ print(
     "python_state_graph_payload_materialization_result="
     f"{payload_result['payload_sum']}:{payload_result['payload_span']}"
 )
+print(f"python_native_state_reducer_iterations={REDUCER_BENCHMARK_ITERATIONS}")
+print(f"python_native_state_reducer_total_ns={native_reducer_elapsed_ns}")
+print(
+    "python_native_state_reducer_avg_ns="
+    f"{native_reducer_elapsed_ns // REDUCER_BENCHMARK_ITERATIONS}"
+)
+print(f"python_manual_state_reducer_total_ns={python_reducer_elapsed_ns}")
+print(
+    "python_manual_state_reducer_avg_ns="
+    f"{python_reducer_elapsed_ns // REDUCER_BENCHMARK_ITERATIONS}"
+)
+print(
+    "python_native_state_reducer_speedup_x="
+    f"{(python_reducer_elapsed_ns / native_reducer_elapsed_ns) if native_reducer_elapsed_ns else 0.0}"
+)
+print(f"python_native_state_reducer_equivalent=1")
 print(f"python_context_graph_iterations={CONTEXT_GRAPH_BENCHMARK_ITERATIONS}")
 print(f"python_context_graph_records={CONTEXT_GRAPH_RECORDS}")
 print(f"python_context_graph_total_ns={context_graph_elapsed_ns}")

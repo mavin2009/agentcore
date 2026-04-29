@@ -22,12 +22,13 @@ The benchmark entry point is [`../../python/benchmarks/langgraph_head_to_head.py
 
 ## Environment
 
-These numbers were generated on April 22, 2026 from this repository with:
+These numbers were generated on April 29, 2026 from this repository with:
 
 - Python `3.9.18`
 - Platform `Linux-5.15.167.4-microsoft-standard-WSL2-x86_64-with-glibc2.31`
 - CPU `Intel(R) Xeon(R) W-10885M CPU @ 2.40GHz`
 - LangGraph `0.6.11`
+- AgentCore build root `./build/release-perf/python`
 
 ## Results
 
@@ -37,12 +38,12 @@ This is the most relevant comparison if you want to benchmark an existing StateG
 
 | Metric | LangGraph | AgentCore compat | Relative |
 | --- | ---: | ---: | ---: |
-| Invoke avg latency | `3.415 ms` | `1.539 ms` | AgentCore compat `2.22x` faster |
-| Invoke throughput | `292.8/s` | `649.9/s` | - |
-| Stream avg latency | `3.676 ms` | `1.308 ms` | AgentCore compat `2.81x` faster |
-| Stream throughput | `272.0/s` | `764.5/s` | - |
-| Batch avg cost / item | `5.426 ms` | `1.804 ms` | AgentCore compat `3.01x` faster |
-| Batch throughput | `184.3 items/s` | `554.3 items/s` | - |
+| Invoke avg latency | `13.208 ms` | `716.199 us` | AgentCore compat `18.44x` faster |
+| Invoke throughput | `75.7/s` | `1,396.3/s` | - |
+| Stream avg latency | `9.980 ms` | `351.012 us` | AgentCore compat `28.43x` faster |
+| Stream throughput | `100.2/s` | `2,848.9/s` | - |
+| Batch avg cost / item | `5.884 ms` | `274.951 us` | AgentCore compat `21.40x` faster |
+| Batch throughput | `169.9 items/s` | `3,637.0 items/s` | - |
 | Stream events / run | `10` | `10` | matched |
 
 ### 2. Native runtime features
@@ -51,12 +52,12 @@ This section exercises workloads where AgentCore's native API exposes capabiliti
 
 | Workload | LangGraph | AgentCore native | Relative |
 | --- | ---: | ---: | ---: |
-| Long-running persistent specialist memory: avg latency / round | `66.389 ms` | `5.064 ms` | AgentCore native `13.11x` faster |
-| Long-running persistent specialist memory: peak RSS | `111.2 MiB` | `43.2 MiB` | AgentCore native used `61.2%` less memory |
-| Pause + resume avg latency | `6.225 ms` | `896.651 us` | AgentCore native `6.94x` faster |
-| Direct invoke avg latency | `1.354 ms` | `541.860 us` | AgentCore native `2.50x` faster |
+| Long-running persistent specialist memory: avg latency / round | `74.487 ms` | `3.425 ms` | AgentCore native `21.75x` faster |
+| Long-running persistent specialist memory: peak RSS | `105.4 MiB` | `30.2 MiB` | AgentCore native used `71.3%` less memory |
+| Pause + resume avg latency | `10.611 ms` | `472.280 us` | AgentCore native `22.47x` faster |
+| Direct invoke avg latency | `1.814 ms` | `80.096 us` | AgentCore native `22.65x` faster |
 | Direct vs resumed final state | `True` | `True` | both preserved |
-| Persistent session fan-out (24 sessions) avg latency | `149.477 ms` | `28.083 ms` | AgentCore native `5.32x` faster |
+| Persistent session fan-out (24 sessions) avg latency | `157.192 ms` | `6.182 ms` | AgentCore native `25.43x` faster |
 | Session-tagged child events on fan-out run | `n/a` | `48` | AgentCore emits child-session identities |
 
 ## What These Numbers Mean
@@ -70,6 +71,8 @@ The current picture is useful, but it is not one-dimensional.
 
 That mix is exactly why the benchmark stays in the repo. It lets scheduler, state, and subgraph-session changes be measured against a stable comparison instead of argued about abstractly.
 
+AgentCore also has native-only regression surfaces for features that are not a same-code framework comparison: context-graph ranking, knowledge ingestion, persistent session replay, deterministic memoization, recorded effects, and stream cursor cost. Those are documented in the [validation guide](../operations/validation.md) because they measure implemented runtime seams rather than replacement imports.
+
 ## Reproduce
 
 From the repository root:
@@ -81,16 +84,32 @@ python3 -m pip install "langgraph==0.6.11"
 PYTHONPATH=./build/python python3 ./python/benchmarks/langgraph_head_to_head.py
 ```
 
+For a release-perf build tree, point the benchmark harness at that Python package root:
+
+```bash
+cmake --preset release-perf
+cmake --build --preset release-perf -j --target _agentcore_native agentcore_python_package
+AGENTCORE_BUILD_PYTHON_ROOT=./build/release-perf/python python3 ./python/benchmarks/langgraph_head_to_head.py
+```
+
 To capture structured output instead of markdown:
 
 ```bash
-PYTHONPATH=./build/python python3 ./python/benchmarks/langgraph_head_to_head.py --format json
+AGENTCORE_BUILD_PYTHON_ROOT=./build/release-perf/python python3 ./python/benchmarks/langgraph_head_to_head.py --format json
 ```
 
 ## Notes On Fairness
 
 - The "same-code builder path" uses AgentCore's generated LangGraph-compatible surface rather than the native `agentcore.graph` API.
+- `AGENTCORE_BUILD_PYTHON_ROOT` lets the benchmark compare against a specific AgentCore build tree while keeping upstream LangGraph imports isolated.
 - The "native runtime features" section uses AgentCore's native API because persistent child sessions, explicit output bindings, proof-aware pause/resume, and session-tagged stream metadata are first-class there.
 - The fan-out benchmark on the LangGraph side uses child graphs plus `thread_id`-backed persistence inside branch nodes to emulate persistent specialist sessions.
 - Native context-graph ranking is measured in `agentcore_runtime_benchmark` and `state_graph_api_benchmark.py`, not in this head-to-head page. That feature depends on AgentCore's structured intelligence and native knowledge state, so it is better treated as an AgentCore-native regression benchmark than as a same-code compatibility comparison.
+- Knowledge-ingestion performance is also tracked as an AgentCore-native regression benchmark through `knowledge_ingest_*` counters. It validates structured graph writes, exact lookup, and final store cardinality rather than comparing a shared public API surface.
 - Results will vary by Python version, CPU, and workload shape. This page should be read as a reproducible benchmark snapshot, not as a universal claim.
+
+## Related Reading
+
+- Runtime model: [`../concepts/runtime-model.md`](../concepts/runtime-model.md)
+- Design lineage and related work: [`../concepts/design-lineage.md`](../concepts/design-lineage.md)
+- Validation and benchmark commands: [`../operations/validation.md`](../operations/validation.md)

@@ -21,6 +21,10 @@
 
 namespace agentcore {
 
+namespace python_binding {
+class GraphHandle;
+} // namespace python_binding
+
 class SubgraphChildEnginePool;
 
 struct InputEnvelope {
@@ -138,6 +142,7 @@ public:
 
 private:
     friend class SubgraphChildEnginePool;
+    friend class python_binding::GraphHandle;
 
     struct BranchRuntime {
         ExecutionFrame frame{};
@@ -221,7 +226,24 @@ private:
         uint32_t blocked_join_scope_id{0};
     };
 
+    struct FastRunResult {
+        bool supported{false};
+        RunResult result{};
+        StateStore state_store{};
+        std::string message;
+    };
+
     [[nodiscard]] static uint64_t now_ns();
+    [[nodiscard]] RunId reserve_run_id_for_fast_invoke() noexcept;
+    [[nodiscard]] bool supports_fast_invoke(
+        const GraphDefinition& graph,
+        const InputEnvelope& input
+    ) const;
+    [[nodiscard]] FastRunResult try_run_to_completion_fast(
+        RunId run_id,
+        const GraphDefinition& graph,
+        const InputEnvelope& input
+    );
     [[nodiscard]] TaskExecutionRecord execute_task(RunRuntime& run, const ScheduledTask& task);
     [[nodiscard]] NodeResult execute_subgraph_node(
         RunId run_id,

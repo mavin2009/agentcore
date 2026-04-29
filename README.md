@@ -2,11 +2,11 @@
 
 <div align="center">
   <img src="https://raw.githubusercontent.com/mavin2009/agentcore/main/assets/agentcore.png" alt="AgentCore logo" width="180" />
-  <h3>Native agent graphs for fast, inspectable, long-running workflows.</h3>
+  <h3>A native runtime for practical, inspectable agent graphs.</h3>
   <p>
-    AgentCore is a C++20 agent-graph runtime with a compact Python API for stateful workflows,
-    persistent subgraphs, structured memory, graph-store hydration, replay, MCP interoperability,
-    and OpenTelemetry.
+    AgentCore is a C++20 graph execution engine with a compact Python API for workflows
+    that need explicit state, persistent subgraphs, structured memory, replay-oriented metadata,
+    MCP interoperability, and OpenTelemetry hooks.
   </p>
   <p>
     <a href="https://pypi.org/project/agentcore-graph/"><img alt="PyPI version" src="https://img.shields.io/pypi/v/agentcore-graph"></a>
@@ -20,37 +20,55 @@
     · <a href="./docs/quickstarts/python.md">Python Guide</a>
     · <a href="./docs/reference/api.md">API Reference</a>
     · <a href="./docs/comparisons/langgraph-head-to-head.md">Benchmarks</a>
+    · <a href="./docs/concepts/design-lineage.md">Design Lineage</a>
     · <a href="./docs/README.md">Docs</a>
   </p>
 </div>
 
-AgentCore is designed for graph-shaped agent systems where latency, durability, and state visibility matter at the same time. The runtime keeps graph execution native, makes state mutation explicit through patches, and records checkpoints and traces from the same execution path used by normal runs.
+AgentCore is designed for graph-shaped agent systems where latency, durability, and state visibility matter at the same time. You describe a workflow as nodes and edges. Nodes return small state patches. The runtime commits those patches, routes to the next node, records trace/checkpoint metadata, and can resume or inspect the run later.
 
-The Python surface is intentionally familiar: define a `StateGraph`, add nodes and edges, compile it, and invoke it. The difference is underneath. Graph metadata, state commits, scheduling, checkpointing, message merging, persistent subgraph sessions, knowledge-graph reads, and supported intelligence/context queries run through the native runtime instead of being rebuilt in Python at each step.
+The Python surface is intentionally familiar: define a `StateGraph`, add nodes and edges, compile it, and invoke it. Underneath that surface, graph metadata, state commits, scheduling, checkpointing, message merging, persistent subgraph sessions, knowledge-graph reads, and supported intelligence/context queries run through the native runtime.
 
 AgentCore is an independent project. It is not affiliated with Amazon Web Services, AWS AgentCore, or any related AWS-branded product or service.
+
+## At A Glance
+
+AgentCore is useful when you want:
+
+- a `StateGraph`-style API backed by a native execution kernel
+- explicit state patches instead of hidden mutation of shared workflow state
+- persistent child graph sessions for specialist agents, reusable tools, or long-running branches
+- stream, trace, checkpoint, and replay metadata from the same execution path
+- structured memory through tasks, claims, evidence, decisions, memories, and knowledge triples
+- integration points for model adapters, tool adapters, MCP servers, graph stores, and OpenTelemetry
+
+It is not trying to be a full agent application framework. It does not choose prompts, tools, models, vector databases, or UI patterns for you. It gives those pieces a deterministic graph runtime to sit on.
 
 ## Start Here
 
 <table>
   <tr>
-    <td><strong>Use it from Python</strong></td>
+    <td><strong>I want to try it</strong></td>
     <td><a href="#install">Install</a>, then follow the <a href="#quick-start">quick start</a> or the full <a href="./docs/quickstarts/python.md">Python guide</a>.</td>
   </tr>
   <tr>
-    <td><strong>Migrate graph code</strong></td>
+    <td><strong>I have existing graph code</strong></td>
     <td>Use the <a href="./docs/migration/langgraph-to-agentcore.md">migration guide</a> for builder patterns, reducers, message state, and current compatibility notes.</td>
   </tr>
   <tr>
-    <td><strong>Understand the runtime</strong></td>
+    <td><strong>I want the mental model</strong></td>
     <td>Read the <a href="./docs/concepts/runtime-model.md">runtime model</a> for state patches, scheduler behavior, checkpointing, sessions, intelligence records, and knowledge-graph state.</td>
   </tr>
   <tr>
-    <td><strong>Integrate with tools</strong></td>
+    <td><strong>I want the ideas behind it</strong></td>
+    <td>Read <a href="./docs/concepts/design-lineage.md">design lineage and related work</a> for the systems, retrieval, graph, and observability ideas AgentCore builds on.</td>
+  </tr>
+  <tr>
+    <td><strong>I need integrations</strong></td>
     <td>See <a href="./docs/integrations/mcp.md">MCP</a>, <a href="./docs/integrations/graph-stores.md">graph stores</a>, <a href="./docs/integrations/opentelemetry.md">OpenTelemetry</a>, and the <a href="./docs/reference/api.md">API reference</a>.</td>
   </tr>
   <tr>
-    <td><strong>Validate performance</strong></td>
+    <td><strong>I want to validate performance</strong></td>
     <td>Use the <a href="./docs/operations/validation.md">validation guide</a> and current <a href="./docs/comparisons/langgraph-head-to-head.md">benchmark notes</a>.</td>
   </tr>
 </table>
@@ -61,7 +79,9 @@ AgentCore is an independent project. It is not affiliated with Amazon Web Servic
 
 ## Why This Exists
 
-Many agent workflows start simple and then become expensive in the wrong places: message history grows, branches join, tools wait, subgraphs need memory, and replay becomes a separate problem from execution. AgentCore tries to keep those concerns in one runtime model.
+Many agent workflows start simple and then become expensive in the wrong places. Message history grows. Branches join. Tools wait. Specialist subgraphs need memory. A run needs to be streamed, resumed, audited, or replayed. If those concerns are bolted on later, the workflow often becomes hard to reason about.
+
+AgentCore keeps those concerns in one runtime model. The engine is deliberately small: execute a node, apply a patch, choose edges, schedule work, checkpoint, and continue or stop. More specialized behavior lives at the graph, node, adapter, context, and memory layers.
 
 The core design choices are:
 
@@ -72,10 +92,13 @@ The core design choices are:
 - persistent child sessions for reusable subgraphs without shared mutable child state
 - native knowledge-graph and intelligence records for workflows that need structured context
 - opt-in observability and durability profiles so metadata does not always dominate the hot path
+- lazy public streaming and in-place structured-state ingestion so streamed and knowledge-heavy runs avoid unnecessary copies where possible
 
-This does not make AgentCore a planner, prompt framework, vector database, or agent marketplace. It is the execution layer those pieces can sit on.
+The result is a runtime that is easier to inspect than a pile of callbacks, but still small enough to embed in a larger system.
 
 ## Install
+
+For most Python users:
 
 ```bash
 python3 -m pip install agentcore-graph
@@ -83,19 +106,14 @@ python3 -m pip install agentcore-graph
 
 The package published to PyPI is `agentcore-graph`; the Python import package is `agentcore`.
 
-For OpenTelemetry dependencies:
+Optional extras:
 
 ```bash
 python3 -m pip install "agentcore-graph[otel]"
-```
-
-For optional Neo4j graph-store support:
-
-```bash
 python3 -m pip install "agentcore-graph[neo4j]"
 ```
 
-The package also installs MCP helper commands:
+The package also installs MCP helper commands that can be used after installation:
 
 ```bash
 agentcore-mcp
@@ -103,7 +121,7 @@ agentcore-mcp-server
 agentcore-mcp-config
 ```
 
-Current published wheels target Linux `x86_64` for CPython `3.9` through `3.12`. Source builds remain available from this repository.
+Current published wheels target Linux `x86_64` for CPython `3.9` through `3.12`. Source builds remain available from this repository for other environments.
 
 ## Quick Start
 
@@ -129,6 +147,14 @@ final_state = compiled.invoke({"count": 0})
 print(final_state["count"])
 ```
 
+The important habit is that nodes return patches:
+
+```python
+return {"count": state["count"] + 1}
+```
+
+They do not mutate a global state object directly. That is what makes checkpointing, replay, joins, streaming metadata, and persistent sessions easier to reason about.
+
 From the same compiled graph you can also stream events, inspect metadata, pause and resume, register tools and models, mirror MCP tools, emit OpenTelemetry spans, and compose persistent subgraphs.
 
 Useful next reads:
@@ -137,19 +163,19 @@ Useful next reads:
 - [API reference](./docs/reference/api.md)
 - [Runtime model](./docs/concepts/runtime-model.md)
 
-## What Is Implemented
+## What You Can Use Today
 
-AgentCore currently includes:
+AgentCore currently includes these working surfaces:
 
 - native C++ runtime with Python bindings
 - `StateGraph`-style Python builder with conditional edges, joins, subgraphs, streaming, batch execution, and pause/resume
-- native join reducers for list concatenation and ID-aware message history merging
+- native schema reducers for sequential steps and joins, including list concatenation and ID-aware message history merging
 - multi-worker scheduling with async wait handling
 - checkpointing, trace events, proof digests, and replay-oriented metadata
 - persistent subgraph sessions with isolated child state and deterministic session revisions
 - structured intelligence state for tasks, claims, evidence, decisions, and memories
 - graph-native context assembly from messages, intelligence records, native knowledge-graph triples, and state fields, with a native context-graph ranking path for intelligence and knowledge selectors
-- knowledge-graph-backed state and reactive execution hooks
+- knowledge-graph-backed state, in-place structured ingestion, indexed matching, and reactive execution hooks
 - external graph-store hydration with an in-memory reference backend and optional Neo4j adapter
 - deterministic memoization for supported pure nodes
 - prompt templates for text, chat, and MCP-rendered prompts
@@ -157,6 +183,8 @@ AgentCore currently includes:
 - MCP over `stdio`, including tools, prompts, resources, completions, roots, sampling, elicitation, logging, subscriptions, and installable MCP server launchers
 - opt-in OpenTelemetry spans and metrics
 - native and Python benchmark and smoke-test coverage
+
+The project is still young. The core runtime, Python graph builder, persistent sessions, context/intelligence state, MCP helpers, graph-store interfaces, and benchmark surfaces are implemented, but the surrounding ecosystem is intentionally smaller than mature Python-first agent frameworks. Expect the API to keep getting smoother while preserving the explicit-patch runtime model.
 
 ## Core Python Features
 
@@ -179,13 +207,17 @@ See the [Python quickstart](./docs/quickstarts/python.md#use-message-state) and 
 
 ### Persistent Subgraphs
 
-Persistent subgraph sessions let the same child graph run across many `session_id` values with isolated child state, checkpoints, task journal, knowledge graph, and stream metadata. Distinct sessions can run concurrently; concurrent reuse of the same session is rejected deterministically.
+Persistent subgraph sessions let the same child graph run across many `session_id` values with isolated child state, checkpoints, task journal, knowledge graph, and stream metadata. This is useful for specialist agents, per-user memory, repeated tool workflows, or any child graph that should remember its own local state without sharing mutable state with other sessions.
+
+Distinct sessions can run concurrently. Concurrent reuse of the same session is rejected deterministically instead of being merged implicitly.
 
 See the [runtime model](./docs/concepts/runtime-model.md#persistent-session-lifecycle) and [Python quickstart](./docs/quickstarts/python.md#persistent-subgraph-sessions).
 
 ### Context Assembly
 
-Nodes can declare a `ContextSpec` and then call `runtime.context.view()` to assemble a deterministic context view from message history, intelligence records, native knowledge-graph triples, selected state fields, and optional graph-shaped state carried by the workflow. For intelligence and knowledge selectors, AgentCore compiles the request into a native context-graph query plan, ranks connected task/claim/evidence/decision/memory/triple records with deterministic activation scoring, and returns a kind-balanced top-k. The Python context graph remains as a compatibility fallback and as the final merge layer when a view also includes message or arbitrary state selectors.
+Nodes can declare a `ContextSpec` and then call `runtime.context.view()` to assemble a deterministic context view from message history, intelligence records, native knowledge-graph triples, selected state fields, and optional graph-shaped state carried by the workflow.
+
+For intelligence and knowledge selectors, AgentCore compiles the request into a native context-graph query plan, ranks connected task/claim/evidence/decision/memory/triple records with deterministic activation scoring, and returns a kind-balanced top-k. The Python context graph remains as a compatibility fallback and as the final merge layer when a view also includes message or arbitrary state selectors.
 
 The returned `ContextView` includes citations, provenance, budget stats, conflict metadata, prompt/message rendering helpers, and a stable digest that is surfaced through `invoke_with_metadata(...)`.
 
@@ -216,7 +248,7 @@ See the [Python quickstart](./docs/quickstarts/python.md#assemble-context-for-a-
 
 ### Intelligence State
 
-The intelligence layer stores operational records inside runtime state:
+The intelligence layer stores operational records inside runtime state. It is meant for workflow-relevant structure that should be inspectable and replayable:
 
 - tasks
 - claims
@@ -224,7 +256,7 @@ The intelligence layer stores operational records inside runtime state:
 - decisions
 - memories
 
-Python nodes use `runtime.intelligence` to write and query those records. The records participate in normal patch commits, checkpoints, replay, and persistent subgraph sessions.
+Python nodes use `runtime.intelligence` to write and query those records. The records participate in normal patch commits, checkpoints, replay, and persistent subgraph sessions, so they can be used as durable context rather than side-channel memory.
 
 ```python
 def analyze(state, config, runtime):
@@ -278,7 +310,7 @@ compiled.graph_stores.register_memory(
 )
 ```
 
-The first shipped backends are `InMemoryGraphStore` and `Neo4jGraphStore`. The connector contract is intentionally entity/triple/neighborhood based so other graph databases can implement the same surface without changing the runtime.
+The first shipped backends are `InMemoryGraphStore` and `Neo4jGraphStore`. The connector contract is intentionally entity/triple/neighborhood based so other graph databases can implement the same surface without changing the runtime or graph API.
 
 The Neo4j adapter has an optional live Docker validation path in addition to the default dependency-free graph-store smoke test. That path exercises batch writes, neighborhood reads, filtered queries, runtime hydration, context assembly, and sync-back persistence against a real Neo4j process.
 
@@ -286,7 +318,7 @@ See the [graph-store integration guide](./docs/integrations/graph-stores.md), [P
 
 ### MCP Interoperability
 
-AgentCore can consume MCP servers and expose AgentCore-owned tools, prompts, resources, and graph surfaces through MCP.
+AgentCore can consume MCP servers and expose AgentCore-owned tools, prompts, resources, and graph surfaces through MCP. This is useful when you want the runtime to sit inside an existing tool ecosystem instead of forcing everything through one adapter style.
 
 ```python
 compiled.tools.register_mcp_stdio(
@@ -319,36 +351,40 @@ details = compiled.invoke_with_metadata({"count": 0}, telemetry=observer)
 
 See the [OpenTelemetry guide](./docs/integrations/opentelemetry.md).
 
-## Performance
+## Performance And Validation
 
-AgentCore's performance work is focused on native graph execution, branch/join overhead, persistent subgraph sessions, resume behavior, context retrieval, and structured state operations. Current benchmark snapshots and exact reproduction commands live in [the comparison document](./docs/comparisons/langgraph-head-to-head.md) and [the validation guide](./docs/operations/validation.md).
+AgentCore's performance work is focused on places where graph runtimes often pay recurring overhead: graph dispatch, branch/join bookkeeping, persistent subgraph sessions, resume behavior, context retrieval, public streaming, and structured state operations.
 
-The latest snapshot in this repository was generated on April 22, 2026. On that machine and workload set, AgentCore's compatibility surface was about `2.22x` to `3.01x` faster on the same-code builder path, while native persistent-session workloads were about `2.50x` to `13.11x` faster with lower measured memory use. Treat those as workload-specific measurements, not universal claims.
+The public head-to-head snapshot in this repository was refreshed on April 29, 2026 from a `release-perf` build. On that machine and workload set, AgentCore's compatibility surface was about `18.44x` to `28.43x` faster on the same-code builder path, while native persistent-session workloads were about `21.75x` to `25.43x` faster with lower measured memory use. Treat those as workload-specific measurements, not universal claims.
 
-The native context graph path is tracked separately because it is not a direct head-to-head framework benchmark. In the current Release validation run, the native C++ context graph benchmark selected 24 records from a 1,024-record intelligence/knowledge workload with `context_graph_cold_rank_ns=454200` and cached warm selection at `context_graph_warm_rank_avg_ns=52`. Through the Python API benchmark, `runtime.context.view()` measured `567840 ns` warm average on the native-backed path, while the retained Python graph-ranker path measured `9231312 ns` on the same benchmark selector set.
+AgentCore-native regression benchmarks are tracked separately from head-to-head framework comparisons. Those cover native context-graph ranking, deterministic memoization, recorded effects, persistent-session replay, stream read cost, and knowledge ingestion through `knowledge_ingest_*` counters. This keeps feature-specific performance work tied to structural invariants such as equal final state, expected session counts, replay/proof checks, and exact knowledge lookup after ingest.
 
-For local validation, start with:
+The exact commands and environment details live in the [comparison document](./docs/comparisons/langgraph-head-to-head.md) and [validation guide](./docs/operations/validation.md). For local validation, start with:
 
 ```bash
 ctest --test-dir build --output-on-failure
-python3 python/benchmarks/langgraph_head_to_head.py
+AGENTCORE_BUILD_PYTHON_ROOT=./build/release-perf/python python3 python/benchmarks/langgraph_head_to_head.py
 ```
 
 See the [validation guide](./docs/operations/validation.md) for release, sanitizer, replay, and benchmark commands.
 
-## Related Ideas And Papers
+## Design Lineage
 
-AgentCore is an implementation project, not a research paper. Its design is influenced by several lines of work and industry practice:
+AgentCore is an implementation project, not a research paper. Its design is influenced by graph processing, dataflow systems, event-sourced state, retrieval-augmented generation, graph-shaped retrieval, context graphs, agent memory work, reactive pattern matching, and observability standards.
 
-- [Context graphs](https://foundationcapital.com/ideas/context-graphs-ais-trillion-dollar-opportunity) argue that production agents need durable, connected decision context rather than only chat history. AgentCore's intelligence records and knowledge-graph state are a runtime substrate for that style of workflow, with explicit commits and replay.
-- [ReAct](https://arxiv.org/abs/2210.03629) frames agents as interleaved reasoning and action. In AgentCore, that loop is represented as graph structure, node outputs, tool/model calls, and inspectable state transitions.
-- [Reflexion](https://arxiv.org/abs/2303.11366) explores feedback and memory for language agents. AgentCore's memories, decisions, evidence, and persistent sessions give applications a structured place to store those artifacts.
-- [Retrieval-Augmented Generation](https://arxiv.org/abs/2005.11401) and [GraphRAG](https://arxiv.org/abs/2404.16130) motivate external knowledge and graph-shaped retrieval. AgentCore does not replace a retrieval system, but it can carry retrieved evidence, claims, and graph memory through a deterministic workflow.
-- [Pregel](https://research.google/pubs/pregel-a-system-for-large-scale-graph-processing/) and [Apache Beam](https://beam.apache.org/) inform the broader design language around graph execution, deterministic progress, durable state, and replayable dataflow.
+The short version is:
+
+- graph execution and durable progress draw from systems such as Pregel, Beam/Dataflow, and event-sourced state
+- reducer and join semantics draw from associative reduction patterns common in dataflow and batch-processing systems
+- agent loops and structured memory are informed by ReAct-style reasoning/action flows and Reflexion-style feedback-memory work
+- context assembly and knowledge ingestion are informed by RAG, GraphRAG, context-graph thinking, and older spreading-activation ideas over semantic networks
+- reactive scheduling, memoization, and context caching borrow from compiled matching and incremental-computation traditions
+
+See [Design Lineage And Related Work](./docs/concepts/design-lineage.md) for links and a more careful mapping between those ideas and what AgentCore actually implements.
 
 ## Build From Source
 
-For a normal local build:
+For a normal local build, use CMake directly:
 
 ```bash
 cmake -S . -B build
@@ -356,7 +392,7 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-For optimized validation and benchmarks:
+For optimized validation and benchmarks, use the `release-perf` preset:
 
 ```bash
 cmake --preset release-perf
@@ -370,13 +406,14 @@ The repository also includes `relwithdebinfo-perf`, `asan`, `ubsan`, and `tsan` 
 
 ## Documentation Map
 
-The main docs index is [docs/README.md](./docs/README.md).
+The main docs index is [docs/README.md](./docs/README.md). If you are new, start with the Python guide or runtime model first; the reference pages are better once you already know the basic shape.
 
 | Area | Document |
 | --- | --- |
 | Python workflow authoring | [docs/quickstarts/python.md](./docs/quickstarts/python.md) |
 | Native C++ embedding | [docs/quickstarts/cpp.md](./docs/quickstarts/cpp.md) |
 | Runtime semantics | [docs/concepts/runtime-model.md](./docs/concepts/runtime-model.md) |
+| Design lineage and related work | [docs/concepts/design-lineage.md](./docs/concepts/design-lineage.md) |
 | Python and C++ API surface | [docs/reference/api.md](./docs/reference/api.md) |
 | MCP integration | [docs/integrations/mcp.md](./docs/integrations/mcp.md) |
 | Graph stores | [docs/integrations/graph-stores.md](./docs/integrations/graph-stores.md) |
@@ -399,12 +436,14 @@ The main docs index is [docs/README.md](./docs/README.md).
 
 AgentCore is independent and is not affiliated with or endorsed by LangChain Inc.
 
-I am grateful to the projects and ideas that helped clarify the design space for graph-oriented agent runtimes:
+I am grateful to the projects, standards, and research communities that helped clarify the design space for graph-oriented agent runtimes:
 
 - [LangGraph](https://github.com/langchain-ai/langgraph) and its [documentation](https://docs.langchain.com/langgraph) for making graph-based agent orchestration concrete and accessible
 - [NetworkX](https://networkx.org/) for graph-first modeling vocabulary
 - [Model Context Protocol](https://modelcontextprotocol.io/) for a practical interoperability layer for tools, prompts, and resources
 - [OpenTelemetry](https://opentelemetry.io/) for the standard observability vocabulary AgentCore plugs into
+
+The related systems and research references behind AgentCore's execution, retrieval, context, and observability choices are listed in [Design Lineage And Related Work](./docs/concepts/design-lineage.md).
 
 ## License
 

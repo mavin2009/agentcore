@@ -246,6 +246,7 @@ struct GraphDefinition {
     std::vector<CompiledNodeRouting> compiled_node_routing;
     std::vector<CompiledKnowledgeSubscription> compiled_knowledge_subscriptions;
     std::vector<CompiledIntelligenceSubscription> compiled_intelligence_subscriptions;
+    std::vector<FieldMergeRule> state_reducer_rules;
     std::unordered_map<std::string, std::vector<uint32_t>> compiled_entity_subscription_index;
     std::unordered_map<std::string, std::vector<uint32_t>> compiled_subject_subscription_index;
     std::unordered_map<std::string, std::vector<uint32_t>> compiled_relation_subscription_index;

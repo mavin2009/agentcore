@@ -230,6 +230,60 @@ assert reducer_result["ceiling"] == 12
 assert reducer_result["summary"] == "8|base,left,right|1|3|12"
 
 
+def reduce_step_one(state, config):
+    return {"count": 1, "notes": ["one"], "seen": False, "floor": 10, "ceiling": 10}
+
+
+def reduce_step_two(state, config):
+    return {"count": 2, "notes": ["two"], "seen": True, "floor": 3, "ceiling": 12}
+
+
+sequential_reducer_graph = StateGraph(
+    ReducerState,
+    name="python_sequential_reducer_schema_smoke",
+    worker_count=2,
+)
+sequential_reducer_graph.add_sequence(
+    [
+        ("one", reduce_step_one),
+        ("two", reduce_step_two),
+        ("summary", reduce_join),
+    ]
+)
+sequential_reducer_graph.set_finish_point("summary")
+sequential_reducer_result = sequential_reducer_graph.compile().invoke(
+    {"count": 5, "notes": ["base"], "seen": False, "floor": 7, "ceiling": 11}
+)
+assert sequential_reducer_result["count"] == 8
+assert sequential_reducer_result["notes"] == ["base", "one", "two"]
+assert sequential_reducer_result["seen"] is True
+assert sequential_reducer_result["floor"] == 3
+assert sequential_reducer_result["ceiling"] == 12
+assert sequential_reducer_result["summary"] == "8|base,one,two|1|3|12"
+
+
+def reducer_loop_step(state, config):
+    return {"count": 1}
+
+
+def reducer_loop_route(state, config):
+    return END if int(state["count"]) >= 3 else "step"
+
+
+reducer_route_graph = StateGraph(
+    ReducerState,
+    name="python_reducer_route_overlay_smoke",
+    worker_count=2,
+)
+reducer_route_graph.add_node("step", reducer_loop_step)
+reducer_route_graph.add_edge(START, "step")
+reducer_route_graph.add_conditional_edges("step", reducer_loop_route, {END: END, "step": "step"})
+reducer_route_result = reducer_route_graph.compile().invoke(
+    {"count": 0, "notes": [], "seen": False, "floor": 100, "ceiling": 0}
+)
+assert reducer_route_result["count"] == 3
+
+
 class NativeMessageState(MessagesState, total=False):
     summary: str
 
@@ -289,6 +343,38 @@ assert add_messages(
 ) == [{"id": "x", "content": "new"}, {"content": "anon"}]
 
 
+sequential_message_graph = StateGraph(
+    NativeMessageState,
+    name="python_sequential_message_schema_smoke",
+    worker_count=2,
+)
+sequential_message_graph.add_sequence(
+    [
+        ("left", message_left),
+        ("right", message_right),
+        ("summary", summarize_messages),
+    ]
+)
+sequential_message_graph.set_finish_point("summary")
+sequential_message_result = sequential_message_graph.compile().invoke(
+    {
+        "messages": [
+            {"id": "keep", "role": "user", "content": "base-keep"},
+            {"id": "replace", "role": "assistant", "content": "base-old"},
+            {"role": "user", "content": "base-anon"},
+        ]
+    }
+)
+assert [message["content"] for message in sequential_message_result["messages"]] == [
+    "base-keep",
+    "right-replace",
+    "base-anon",
+    "left-anon",
+    "right-new",
+]
+assert sequential_message_result["summary"] == "base-keep,right-replace,base-anon,left-anon,right-new"
+
+
 class SharedSubgraphState(TypedDict, total=False):
     topic: str
     steps: int
@@ -346,6 +432,46 @@ assert compat_reducer_result["seen"] is True
 assert compat_reducer_result["floor"] == 3
 assert compat_reducer_result["ceiling"] == 12
 assert compat_reducer_result["summary"] == "8|base,left,right|1|3|12"
+
+compat_sequential_reducer_graph = CompatStateGraph(
+    ReducerState,
+    name="python_compat_sequential_reducer_smoke",
+    worker_count=2,
+)
+compat_sequential_reducer_graph.add_sequence(
+    [
+        ("one", reduce_step_one),
+        ("two", reduce_step_two),
+        ("summary", reduce_join),
+    ]
+)
+compat_sequential_reducer_graph.set_finish_point("summary")
+compat_sequential_reducer_result = compat_sequential_reducer_graph.compile().invoke(
+    {"count": 5, "notes": ["base"], "seen": False, "floor": 7, "ceiling": 11}
+)
+assert compat_sequential_reducer_result["count"] == 8
+assert compat_sequential_reducer_result["notes"] == ["base", "one", "two"]
+assert compat_sequential_reducer_result["seen"] is True
+assert compat_sequential_reducer_result["floor"] == 3
+assert compat_sequential_reducer_result["ceiling"] == 12
+assert compat_sequential_reducer_result["summary"] == "8|base,one,two|1|3|12"
+
+compat_reducer_route_graph = CompatStateGraph(
+    ReducerState,
+    name="python_compat_reducer_route_overlay_smoke",
+    worker_count=2,
+)
+compat_reducer_route_graph.add_node("step", reducer_loop_step)
+compat_reducer_route_graph.add_edge(COMPAT_START, "step")
+compat_reducer_route_graph.add_conditional_edges(
+    "step",
+    lambda state, config: COMPAT_END if int(state["count"]) >= 3 else "step",
+    {COMPAT_END: COMPAT_END, "step": "step"},
+)
+compat_reducer_route_result = compat_reducer_route_graph.compile().invoke(
+    {"count": 0, "notes": [], "seen": False, "floor": 100, "ceiling": 0}
+)
+assert compat_reducer_route_result["count"] == 3
 
 
 class CompatMessageState(CompatMessagesState, total=False):

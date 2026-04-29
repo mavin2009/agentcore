@@ -39,6 +39,12 @@ struct NodeBinding {
     std::optional<SubgraphBinding> subgraph;
     GraphHandle* subgraph_handle{nullptr};
     PyObject* patch_key_lookup{nullptr};
+    PyObject* native_action_callback{nullptr};
+    PyObject* native_route_callback{nullptr};
+    PyObject* native_route_map{nullptr};
+    uint8_t native_action_arity{0};
+    uint8_t native_route_arity{0};
+    bool native_simple_callback{false};
 };
 
 struct RunArtifacts {
@@ -68,6 +74,7 @@ public:
         const NodeMemoizationPolicy& memoization,
         const std::vector<IntelligenceSubscription>& intelligence_subscriptions,
         const std::vector<std::pair<std::string, JoinMergeStrategy>>& merge_rules,
+        PyObject* native_callback_spec,
         std::string* error_message
     );
     bool add_subgraph_node(
@@ -83,6 +90,10 @@ public:
     );
     bool set_entry_point(std::string_view name, std::string* error_message);
     bool add_edge(std::string_view source, std::string_view target, std::string* error_message);
+    bool set_state_reducer_rules(
+        const std::vector<std::pair<std::string, JoinMergeStrategy>>& reducer_rules,
+        std::string* error_message
+    );
     bool finalize(std::string* error_message);
 
     bool invoke(PyObject* input_state, PyObject* config, PyObject** result, std::string* error_message);
@@ -194,6 +205,7 @@ private:
     std::shared_ptr<std::vector<std::string>> state_names_;
     std::shared_ptr<std::unordered_map<std::string, StateKey>> state_keys_by_name_;
     std::unordered_set<StateKey> message_state_keys_;
+    std::vector<FieldMergeRule> state_reducer_rules_;
     PyObject* state_key_lookup_{nullptr};
     std::unordered_map<RunId, PyObject*> active_configs_;
 };

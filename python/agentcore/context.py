@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
@@ -290,6 +290,19 @@ def _decorate_stream_events(events: list[dict[str, Any]]) -> list[dict[str, Any]
     views = _pop_context_views_for_run(run_id)
     _decorate_trace_events(events, views)
     return events
+
+
+def _decorate_stream_event_iter(events: Iterable[dict[str, Any]]) -> Iterable[dict[str, Any]]:
+    views: list[dict[str, Any]] | None = None
+    by_event: dict[tuple[int, int, int], list[dict[str, Any]]] | None = None
+    for event in events:
+        if views is None:
+            run_id = event.get("run_id") if isinstance(event, Mapping) else None
+            views = _pop_context_views_for_run(run_id)
+            by_event = _context_views_by_event(views)
+        if isinstance(event, dict):
+            _decorate_trace_event(event, by_event or {})
+        yield event
 
 
 def _build_context_summary(views: list[dict[str, Any]]) -> dict[str, Any]:
@@ -880,7 +893,7 @@ def _pop_context_views_for_run(run_id: Any) -> list[dict[str, Any]]:
         return _CONTEXT_VIEWS_BY_RUN.pop(normalized_run_id, [])
 
 
-def _decorate_trace_events(events: list[dict[str, Any]], views: list[dict[str, Any]]) -> None:
+def _context_views_by_event(views: list[dict[str, Any]]) -> dict[tuple[int, int, int], list[dict[str, Any]]]:
     by_event: dict[tuple[int, int, int], list[dict[str, Any]]] = {}
     for view in views:
         try:
@@ -888,18 +901,30 @@ def _decorate_trace_events(events: list[dict[str, Any]], views: list[dict[str, A
         except (KeyError, TypeError, ValueError):
             continue
         by_event.setdefault(key, []).append(view)
+    return by_event
+
+
+def _decorate_trace_event(
+    event: dict[str, Any],
+    by_event: dict[tuple[int, int, int], list[dict[str, Any]]],
+) -> None:
+    try:
+        key = (int(event["run_id"]), int(event["node_id"]), int(event.get("branch_id", 0)))
+    except (KeyError, TypeError, ValueError):
+        return
+    matched = by_event.get(key)
+    if not matched:
+        return
+    event["context_views"] = matched
+    event["context_digest"] = _stable_digest([view.get("digest") for view in matched])
+
+
+def _decorate_trace_events(events: list[dict[str, Any]], views: list[dict[str, Any]]) -> None:
+    by_event = _context_views_by_event(views)
     for event in events:
         if not isinstance(event, dict):
             continue
-        try:
-            key = (int(event["run_id"]), int(event["node_id"]), int(event.get("branch_id", 0)))
-        except (KeyError, TypeError, ValueError):
-            continue
-        matched = by_event.get(key)
-        if not matched:
-            continue
-        event["context_views"] = matched
-        event["context_digest"] = _stable_digest([view.get("digest") for view in matched])
+        _decorate_trace_event(event, by_event)
 
 
 def _state_get(state: Mapping[str, Any], key: str | None, default: Any = None) -> Any:

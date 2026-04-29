@@ -19,6 +19,8 @@ That model is useful when a workflow has to answer practical production question
 
 The runtime is intentionally not a prompt policy layer. Prompts, tools, model calls, retrieval, and planning strategies live at the edges. The engine stays focused on graph execution, state commits, scheduling, durability, and inspection.
 
+For the systems and research ideas behind those choices, see [Design Lineage And Related Work](./design-lineage.md). This page focuses on implemented behavior.
+
 ## Core Separation
 
 AgentCore is organized around a narrow execution kernel with explicit boundaries:
@@ -93,6 +95,8 @@ The state layer intentionally separates:
 - recorded synchronous outcomes in `TaskJournal`
 
 This keeps the hot execution path focused on compact control state while still allowing prompts, model outputs, tool payloads, and serialized artifacts to move through the runtime.
+
+Structured stores follow the same hot/cold split. Knowledge-graph and intelligence deltas still commit through `StatePatch`, but the state store now applies them in place when the underlying structured store is uniquely owned. That preserves the observable patch semantics while avoiding clone-then-swap work on knowledge-heavy or intelligence-heavy runs. The Python bridge follows the same direction by moving staged structured patches into the native result path instead of copying them after a callback returns.
 
 ## Context Assembly
 
@@ -370,6 +374,8 @@ In `Balanced` and `Fast`, persistence is decoupled from the hot step path throug
 
 Trace retention follows the same direction. Traces are stored per run rather than in one global append vector, which keeps stream reads scoped to one run and avoids unrelated-run scans during public event reads.
 
+Public stream decoration stays close to consumption. The native trace remains the execution record; Python only decorates user-facing stream dictionaries as they are yielded, unless a metadata call explicitly asks for the full details object.
+
 Because `TaskJournal` is serialized as part of the state layer, a restored run can reuse previously committed synchronous outcomes without re-executing the underlying side effect. The runtime tests validate both the success path and the failure path where a resumed node presents a different request for the same recorded-effect key.
 
 Persistent child sessions inherit that same rule. Each committed child snapshot carries its own task journal state, so a resumed persistent session can replay previously committed once-only work while still rejecting mismatched requests for the same recorded-effect key.
@@ -399,3 +405,4 @@ Those belong in node callbacks, adapters, graph definitions, or higher-level bui
 - C++ quickstart: [`../quickstarts/cpp.md`](../quickstarts/cpp.md)
 - API map: [`../reference/api.md`](../reference/api.md)
 - Validation: [`../operations/validation.md`](../operations/validation.md)
+- Design lineage: [`design-lineage.md`](./design-lineage.md)

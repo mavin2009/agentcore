@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <iostream>
+#include <iterator>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
@@ -859,6 +860,21 @@ const FieldMergeRule* find_field_merge_rule(const NodeDefinition& node, StateKey
     return &(*iterator);
 }
 
+const FieldMergeRule* find_state_reducer_rule(const GraphDefinition& graph, StateKey key) {
+    const auto iterator = std::lower_bound(
+        graph.state_reducer_rules.begin(),
+        graph.state_reducer_rules.end(),
+        key,
+        [](const FieldMergeRule& rule, StateKey target_key) {
+            return rule.key < target_key;
+        }
+    );
+    if (iterator == graph.state_reducer_rules.end() || iterator->key != key) {
+        return nullptr;
+    }
+    return &(*iterator);
+}
+
 KnowledgeGraphPatch rebase_knowledge_graph_patch(
     const StateStore& source_state,
     StateStore& destination_state,
@@ -1210,6 +1226,180 @@ std::optional<Value> merge_join_field_values(
     );
 }
 
+std::optional<Value> reduce_state_field_value(
+    const GraphDefinition& graph,
+    const FieldMergeRule& rule,
+    StateStore& state_store,
+    StateKey key,
+    const Value& update,
+    std::string* error_message
+) {
+    const Value base = state_store.get_current_state().load(key);
+    const bool has_base = !std::holds_alternative<std::monostate>(base);
+    if (std::holds_alternative<std::monostate>(update) || !has_base) {
+        return update;
+    }
+
+    const auto fail_reduce = [&](std::string message) -> std::optional<Value> {
+        if (error_message != nullptr) {
+            *error_message = std::move(message);
+        }
+        return std::nullopt;
+    };
+
+    switch (rule.strategy) {
+        case JoinMergeStrategy::RequireEqual:
+            if (!logical_value_equal(state_store, base, state_store, update)) {
+                return fail_reduce(
+                    "state reducer requires equal values for state key " + std::to_string(key) +
+                    " in graph " + graph.name
+                );
+            }
+            return update;
+        case JoinMergeStrategy::RequireSingleWriter:
+            return fail_reduce(
+                "state reducer requires a single writer for state key " + std::to_string(key) +
+                " in graph " + graph.name
+            );
+        case JoinMergeStrategy::LastWriterWins:
+            return update;
+        case JoinMergeStrategy::FirstWriterWins:
+            return base;
+        case JoinMergeStrategy::SumInt64:
+            if (!std::holds_alternative<int64_t>(base) || !std::holds_alternative<int64_t>(update)) {
+                return fail_reduce(
+                    "state reducer requires int64 values for SumInt64 on state key " + std::to_string(key)
+                );
+            }
+            return Value{std::get<int64_t>(base) + std::get<int64_t>(update)};
+        case JoinMergeStrategy::MaxInt64:
+        case JoinMergeStrategy::MinInt64:
+            if (!std::holds_alternative<int64_t>(base) || !std::holds_alternative<int64_t>(update)) {
+                return fail_reduce(
+                    "state reducer requires int64 values for ordered int64 merge on state key " +
+                    std::to_string(key)
+                );
+            }
+            if (rule.strategy == JoinMergeStrategy::MaxInt64) {
+                return Value{std::max(std::get<int64_t>(base), std::get<int64_t>(update))};
+            }
+            return Value{std::min(std::get<int64_t>(base), std::get<int64_t>(update))};
+        case JoinMergeStrategy::LogicalOr:
+        case JoinMergeStrategy::LogicalAnd:
+            if (!std::holds_alternative<bool>(base) || !std::holds_alternative<bool>(update)) {
+                return fail_reduce(
+                    "state reducer requires bool values for logical merge on state key " +
+                    std::to_string(key)
+                );
+            }
+            if (rule.strategy == JoinMergeStrategy::LogicalOr) {
+                return Value{std::get<bool>(base) || std::get<bool>(update)};
+            }
+            return Value{std::get<bool>(base) && std::get<bool>(update)};
+        case JoinMergeStrategy::ConcatSequence: {
+            if (!std::holds_alternative<BlobRef>(base) || !std::holds_alternative<BlobRef>(update)) {
+                return fail_reduce(
+                    "state reducer requires sequence values for ConcatSequence on state key " +
+                    std::to_string(key)
+                );
+            }
+
+            std::vector<std::byte> merged;
+            merged.reserve(kSequenceHeaderSize);
+            merged.push_back(kSequenceBlobTag);
+            append_u64(merged, 0U);
+
+            uint64_t item_count = 0;
+            if (!append_sequence_items_from_blob(
+                    state_store.blobs(),
+                    std::get<BlobRef>(base),
+                    merged,
+                    &item_count,
+                    error_message
+                ) ||
+                !append_sequence_items_from_blob(
+                    state_store.blobs(),
+                    std::get<BlobRef>(update),
+                    merged,
+                    &item_count,
+                    error_message
+                )) {
+                return std::nullopt;
+            }
+            write_u64_at(merged, 1U, item_count);
+            return Value{state_store.blobs().append(merged.data(), merged.size())};
+        }
+        case JoinMergeStrategy::MergeMessages: {
+            if (!std::holds_alternative<BlobRef>(base) || !std::holds_alternative<BlobRef>(update)) {
+                return fail_reduce(
+                    "state reducer requires message values for MergeMessages on state key " +
+                    std::to_string(key)
+                );
+            }
+
+            std::vector<MessageRecordView> records;
+            std::unordered_map<std::string, std::size_t> index_by_id;
+            if (!append_message_records_from_blob(
+                    state_store.blobs(),
+                    std::get<BlobRef>(base),
+                    records,
+                    index_by_id,
+                    error_message
+                ) ||
+                !append_message_records_from_blob(
+                    state_store.blobs(),
+                    std::get<BlobRef>(update),
+                    records,
+                    index_by_id,
+                    error_message
+                )) {
+                return std::nullopt;
+            }
+            return Value{append_merged_message_blob(state_store.blobs(), records)};
+        }
+    }
+
+    return fail_reduce(
+        "graph " + graph.name + " references an unsupported state reducer strategy"
+    );
+}
+
+std::optional<StatePatch> apply_graph_state_reducers(
+    const GraphDefinition& graph,
+    StateStore& state_store,
+    const StatePatch& raw_patch,
+    std::string* error_message
+) {
+    if (graph.state_reducer_rules.empty() || raw_patch.updates.empty()) {
+        return raw_patch;
+    }
+
+    StatePatch reduced = raw_patch;
+    reduced.updates.clear();
+    reduced.updates.reserve(raw_patch.updates.size());
+    for (const FieldUpdate& update : raw_patch.updates) {
+        const FieldMergeRule* rule = find_state_reducer_rule(graph, update.key);
+        if (rule == nullptr) {
+            reduced.updates.push_back(update);
+            continue;
+        }
+
+        const auto reduced_value = reduce_state_field_value(
+            graph,
+            *rule,
+            state_store,
+            update.key,
+            update.value,
+            error_message
+        );
+        if (!reduced_value.has_value()) {
+            return std::nullopt;
+        }
+        reduced.updates.push_back(FieldUpdate{update.key, *reduced_value});
+    }
+    return reduced;
+}
+
 bool branch_snapshot_is_join_blocked(const RunSnapshot& snapshot, const BranchSnapshot& branch) {
     if (branch.join_stack.empty()) {
         return false;
@@ -1371,6 +1561,44 @@ bool graph_requires_runtime_rebind(const GraphDefinition& graph) {
            std::any_of(graph.edges.begin(), graph.edges.end(), [](const EdgeDefinition& edge) {
                return edge.kind == EdgeKind::Conditional && edge.condition == nullptr;
            });
+}
+
+bool fast_invoke_disabled() {
+    static const bool disabled = std::getenv("AGENTCORE_DISABLE_FAST_INVOKE") != nullptr;
+    return disabled;
+}
+
+bool graph_supports_fast_invoke(const GraphDefinition& graph, const InputEnvelope& input) {
+    if (fast_invoke_disabled() || !graph.is_runtime_compiled()) {
+        return false;
+    }
+    if (input.entry_override.has_value() && graph.find_node(*input.entry_override) == nullptr) {
+        return false;
+    }
+    for (const NodeDefinition& node : graph.nodes) {
+        if (node.kind == NodeKind::Subgraph || node.kind == NodeKind::Human) {
+            return false;
+        }
+        if (node.executor == nullptr) {
+            return false;
+        }
+        if (node.memoization.enabled()) {
+            return false;
+        }
+        if (!node.field_merge_rules.empty()) {
+            return false;
+        }
+        constexpr uint32_t unsupported_policy_mask =
+            node_policy_mask(NodePolicyFlag::AllowFanOut) |
+            node_policy_mask(NodePolicyFlag::JoinIncomingBranches) |
+            node_policy_mask(NodePolicyFlag::CreateJoinScope) |
+            node_policy_mask(NodePolicyFlag::ReactToKnowledgeGraph) |
+            node_policy_mask(NodePolicyFlag::ReactToIntelligence);
+        if ((node.policy_flags & unsupported_policy_mask) != 0U) {
+            return false;
+        }
+    }
+    return true;
 }
 
 } // namespace
@@ -2031,6 +2259,174 @@ RunResult ExecutionEngine::run_to_completion(RunId run_id) {
     }
 
     return result;
+}
+
+RunId ExecutionEngine::reserve_run_id_for_fast_invoke() noexcept {
+    return next_run_id_++;
+}
+
+bool ExecutionEngine::supports_fast_invoke(
+    const GraphDefinition& graph,
+    const InputEnvelope& input
+) const {
+    return graph_supports_fast_invoke(graph, input);
+}
+
+ExecutionEngine::FastRunResult ExecutionEngine::try_run_to_completion_fast(
+    RunId run_id,
+    const GraphDefinition& graph,
+    const InputEnvelope& input
+) {
+    FastRunResult fast_result;
+    fast_result.result.run_id = run_id;
+    if (!graph_supports_fast_invoke(graph, input)) {
+        return fast_result;
+    }
+    fast_result.supported = true;
+    fast_result.result.status = ExecutionStatus::Running;
+
+    StateStore state_store(input.initial_field_count);
+    state_store.blobs() = input.initial_blobs;
+    state_store.strings() = input.initial_strings;
+    if (!input.initial_patch.empty()) {
+        static_cast<void>(state_store.apply(input.initial_patch));
+    }
+
+    ScratchArena scratch;
+    CancellationToken cancel;
+    TraceSink local_trace;
+    local_trace.configure(options_.profile);
+    std::optional<PendingAsyncOperation> pending_async;
+    uint16_t retry_count = 0U;
+    NodeId current_node = input.entry_override.value_or(graph.entry);
+
+    while (true) {
+        const NodeDefinition* node = graph.find_node(current_node);
+        if (node == nullptr || node->executor == nullptr) {
+            fast_result.result.status = ExecutionStatus::Failed;
+            fast_result.message = "node executor not found";
+            break;
+        }
+
+        scratch.reset();
+        std::vector<TaskRecord> recorded_effects;
+        NodeResult node_result{NodeResult::Success};
+        const uint64_t started_at_ns = now_ns();
+        try {
+            ExecutionContext context{
+                state_store.get_current_state(),
+                run_id,
+                graph.id,
+                current_node,
+                0U,
+                input.runtime_config_payload,
+                scratch,
+                state_store.blobs(),
+                state_store.strings(),
+                state_store.knowledge_graph(),
+                state_store.intelligence(),
+                state_store.task_journal(),
+                runtime_tools(),
+                runtime_models(),
+                local_trace,
+                Deadline(
+                    node->timeout_ms == 0U
+                        ? 0U
+                        : started_at_ns + (static_cast<uint64_t>(node->timeout_ms) * 1000000ULL)
+                ),
+                cancel,
+                pending_async,
+                &recorded_effects
+            };
+            node_result = node->executor(context);
+        } catch (const std::exception& error) {
+            node_result.status = NodeResult::HardFail;
+            node_result.flags = kToolFlagHandlerException;
+            fast_result.message = error.what();
+        } catch (...) {
+            node_result.status = NodeResult::HardFail;
+            node_result.flags = kToolFlagHandlerException;
+            fast_result.message = "unknown execution failure";
+        }
+
+        if (!recorded_effects.empty()) {
+            node_result.patch.task_records.insert(
+                node_result.patch.task_records.end(),
+                std::make_move_iterator(recorded_effects.begin()),
+                std::make_move_iterator(recorded_effects.end())
+            );
+            node_result.flags |= kTraceFlagRecordedEffect;
+        }
+        if (cancel.is_cancelled()) {
+            node_result.status = NodeResult::Cancelled;
+        }
+
+        StatePatch reduced_patch;
+        const StatePatch* patch_to_apply = &node_result.patch;
+        if (!graph.state_reducer_rules.empty() && !node_result.patch.updates.empty()) {
+            std::string reducer_error;
+            const auto maybe_reduced_patch =
+                apply_graph_state_reducers(graph, state_store, node_result.patch, &reducer_error);
+            if (!maybe_reduced_patch.has_value()) {
+                fast_result.result.status = ExecutionStatus::Failed;
+                fast_result.message = reducer_error.empty()
+                    ? "failed to apply graph state reducers"
+                    : std::move(reducer_error);
+                break;
+            }
+            reduced_patch = std::move(*maybe_reduced_patch);
+            patch_to_apply = &reduced_patch;
+        }
+        static_cast<void>(state_store.apply_with_summary(*patch_to_apply));
+        fast_result.result.steps_executed += 1U;
+
+        if ((node_result.status == NodeResult::SoftFail ||
+             node_result.status == NodeResult::HardFail) &&
+            retry_count < node->retry_limit) {
+            retry_count += 1U;
+            continue;
+        }
+        retry_count = 0U;
+
+        if (node_result.status == NodeResult::HardFail) {
+            fast_result.result.status = ExecutionStatus::Failed;
+            break;
+        }
+        if (node_result.status == NodeResult::Cancelled) {
+            fast_result.result.status = ExecutionStatus::Cancelled;
+            break;
+        }
+        if (node_result.status == NodeResult::Waiting) {
+            pending_async = node_result.pending_async;
+            fast_result.result.status = ExecutionStatus::Paused;
+            break;
+        }
+        if (has_node_policy(node->policy_flags, NodePolicyFlag::StopAfterNode)) {
+            fast_result.result.status = ExecutionStatus::Completed;
+            break;
+        }
+        if (node_result.next_override.has_value()) {
+            if (graph.find_node(*node_result.next_override) == nullptr) {
+                fast_result.result.status = ExecutionStatus::Failed;
+                fast_result.message = "routing override references an unknown node";
+                break;
+            }
+            current_node = *node_result.next_override;
+            continue;
+        }
+
+        const SelectedEdges next_edges =
+            select_edges(graph, *node, state_store.get_current_state(), node_result);
+        if (next_edges.empty()) {
+            fast_result.result.status = ExecutionStatus::Completed;
+            break;
+        }
+
+        current_node = next_edges.front()->to;
+    }
+
+    fast_result.state_store = std::move(state_store);
+    return fast_result;
 }
 
 ResumeResult ExecutionEngine::resume(CheckpointId checkpoint_id) {
@@ -4010,7 +4406,35 @@ StepResult ExecutionEngine::commit_task_execution(
             checkpoint_patch_offset = static_cast<uint64_t>(checkpoint_branch->state_store.patch_log().size());
         }
     } else {
-        const StateApplyResult apply_result = branch.state_store.apply_with_summary(record.node_result.patch);
+        StatePatch reduced_patch;
+        const StatePatch* patch_to_apply = &record.node_result.patch;
+        const bool preserve_raw_join_delta_in_log = !branch.join_stack.empty();
+        if (!run.graph.state_reducer_rules.empty() &&
+            !record.node_result.patch.updates.empty()) {
+            std::string reducer_error;
+            const auto maybe_reduced_patch = apply_graph_state_reducers(
+                run.graph,
+                branch.state_store,
+                record.node_result.patch,
+                &reducer_error
+            );
+            if (!maybe_reduced_patch.has_value()) {
+                branch.frame.status = ExecutionStatus::Failed;
+                run.status = ExecutionStatus::Failed;
+                result.status = ExecutionStatus::Failed;
+                result.message = reducer_error.empty()
+                    ? "failed to apply graph state reducers"
+                    : std::move(reducer_error);
+                return result;
+            }
+            reduced_patch = std::move(*maybe_reduced_patch);
+            patch_to_apply = &reduced_patch;
+        }
+
+        const StateApplyResult apply_result =
+            preserve_raw_join_delta_in_log && patch_to_apply != &record.node_result.patch
+            ? branch.state_store.apply_with_summary(*patch_to_apply, record.node_result.patch)
+            : branch.state_store.apply_with_summary(*patch_to_apply);
         if (apply_result.knowledge_graph_delta.empty() && apply_result.intelligence_delta.empty()) {
             branch.memo_cache.invalidate(apply_result.changed_keys);
         } else {

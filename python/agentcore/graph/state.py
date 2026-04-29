@@ -14,7 +14,7 @@ from ..context import (
     ContextView,
     _attach_context_metadata,
     _begin_context_collection,
-    _decorate_stream_events,
+    _decorate_stream_event_iter,
     _end_context_collection,
 )
 from ..adapters.registry import (
@@ -222,6 +222,8 @@ def _coerce_telemetry_observer(telemetry: Any) -> Any | None:
 def _normalize_update(value: Any) -> dict[str, Any]:
     if value is None:
         return {}
+    if type(value) is dict:
+        return value
     if isinstance(value, dict):
         return dict(value)
     if hasattr(value, "items"):
@@ -1784,6 +1786,55 @@ def _merge_with_schema_rules(schema_merge: dict[str, str], merge: Any) -> dict[s
     return normalized
 
 
+def _apply_reducer_strategy_for_route(strategy: str, left: Any, right: Any) -> Any:
+    if left is _MISSING or left is None:
+        return right
+    if strategy == "require_equal":
+        if left != right:
+            raise ValueError("state reducer require_equal saw conflicting values before routing")
+        return right
+    if strategy == "require_single_writer":
+        raise ValueError("state reducer require_single_writer saw more than one writer before routing")
+    if strategy == "last_writer_wins":
+        return right
+    if strategy == "first_writer_wins":
+        return left
+    if strategy == "sum_int64":
+        return int(left) + int(right)
+    if strategy == "max_int64":
+        return max(int(left), int(right))
+    if strategy == "min_int64":
+        return min(int(left), int(right))
+    if strategy == "logical_or":
+        return bool(left) or bool(right)
+    if strategy == "logical_and":
+        return bool(left) and bool(right)
+    if strategy == "concat_sequence":
+        return list(left) + list(right)
+    if strategy == "merge_messages":
+        return add_messages(left, right)
+    return right
+
+
+def _apply_schema_reducer_route_overlay(
+    schema_merge: dict[str, str],
+    state: Mapping[str, Any],
+    updates: dict[str, Any],
+) -> dict[str, Any]:
+    if not schema_merge or not updates:
+        return updates
+    reduced = dict(updates)
+    for key, strategy in schema_merge.items():
+        if key not in updates:
+            continue
+        reduced[key] = _apply_reducer_strategy_for_route(
+            strategy,
+            state.get(key, _MISSING),
+            updates[key],
+        )
+    return reduced
+
+
 def _normalize_compile_name(name: Any) -> str | None:
     if name is None:
         return None
@@ -2159,6 +2210,8 @@ class StateGraph:
                 name=self._name if name_override is None else name_override,
                 worker_count=worker_count,
             )
+            if self._schema_merge:
+                _native._set_state_reducers(native_graph, self._schema_merge)
             graph_store_registry = graph_store_registry or GraphStoreRegistryView()
             owned_subgraphs: list[CompiledStateGraph] = []
             owned_subgraph_ids: set[int] = set()
@@ -2199,6 +2252,11 @@ class StateGraph:
                     if self._needs_python_callback(node_name)
                     else None
                 )
+                native_callback_spec = (
+                    self._build_native_callback_spec(node_name)
+                    if callback is not None
+                    else None
+                )
                 _native._add_node(
                     native_graph,
                     node_name,
@@ -2213,6 +2271,7 @@ class StateGraph:
                     cache_size=node_spec.cache_size,
                     intelligence_subscriptions=node_spec.intelligence_subscriptions,
                     merge_rules=node_spec.merge,
+                    native_callback_spec=native_callback_spec,
                 )
 
             if self._entry_point is not None:
@@ -2317,12 +2376,70 @@ class StateGraph:
         node_spec = self._nodes[node_name]
         node_action = node_spec.action
         routing_spec = self._conditional_edges.get(node_name)
+        action_arity = _positional_arity(node_action) if node_action is not None else 0
         action_invoker = _compile_callback_invoker(node_action) if node_action is not None else None
         route_invoker = None
         route_map = None
+        route_arity = 0
         if routing_spec is not None:
             route_fn, route_map = routing_spec
+            route_arity = _positional_arity(route_fn)
             route_invoker = _compile_callback_invoker(route_fn)
+
+        simple_callback = (
+            node_spec.context is None
+            and (action_arity is not None and action_arity <= 2)
+            and (route_arity is not None and route_arity <= 2)
+        )
+
+        if simple_callback:
+            def wrapped(state: Any, config: Any = None) -> Any:
+                state_view = _StateView(state)
+                updates: dict[str, Any] = {}
+                explicit_goto: str | None = None
+
+                if action_invoker is not None:
+                    node_result = action_invoker(
+                        state_view,
+                        {} if config is None else config,
+                        None,
+                    )
+                    updates, explicit_goto, should_wait = _normalize_result(
+                        _resolve_maybe_awaitable(node_result)
+                    )
+                    if should_wait:
+                        return updates, None, True
+                    if explicit_goto is not None:
+                        return updates, self._map_target_name(explicit_goto)
+
+                if routing_spec is None:
+                    return updates
+
+                route_updates = (
+                    _apply_schema_reducer_route_overlay(self._schema_merge, state_view, updates)
+                    if updates
+                    else updates
+                )
+                merged_state = state_view if not route_updates else _OverlayMapping(state_view, route_updates)
+                route_result = route_invoker(
+                    merged_state,
+                    {} if config is None else config,
+                    None,
+                )
+                route_value = _resolve_maybe_awaitable(route_result)
+                if route_map:
+                    if route_value not in route_map:
+                        raise KeyError(f"missing conditional route mapping for {route_value!r}")
+                    goto_target = route_map[route_value]
+                else:
+                    if route_value is None:
+                        return updates
+                    if not isinstance(route_value, str):
+                        raise TypeError("conditional routes without a path_map must return node names")
+                    goto_target = route_value
+                return updates, self._map_target_name(goto_target)
+
+            return wrapped
 
         def wrapped(state: Any, config: Any = None) -> Any:
             normalized_config, runtime = _extract_runtime_and_config(config)
@@ -2354,7 +2471,12 @@ class StateGraph:
             if routing_spec is None:
                 return updates
 
-            merged_state = state_view if not updates else _OverlayMapping(state_view, updates)
+            route_updates = (
+                _apply_schema_reducer_route_overlay(self._schema_merge, state_view, updates)
+                if updates
+                else updates
+            )
+            merged_state = state_view if not route_updates else _OverlayMapping(state_view, route_updates)
             runtime._bind_context(
                 spec=node_spec.context,
                 state=merged_state,
@@ -2380,6 +2502,47 @@ class StateGraph:
             return updates, self._map_target_name(goto_target)
 
         return wrapped
+
+    def _build_native_callback_spec(self, node_name: str) -> dict[str, Any] | None:
+        node_spec = self._nodes[node_name]
+        if node_spec.context is not None:
+            return None
+
+        node_action = node_spec.action
+        routing_spec = self._conditional_edges.get(node_name)
+        action_arity = _positional_arity(node_action) if node_action is not None else 0
+        if action_arity is None or action_arity > 2:
+            return None
+        if node_action is not None and inspect.iscoroutinefunction(node_action):
+            return None
+
+        route_fn = None
+        route_map = None
+        route_arity = 0
+        if routing_spec is not None:
+            route_fn, route_map = routing_spec
+            route_arity = _positional_arity(route_fn)
+            if route_arity is None or route_arity > 2:
+                return None
+            if inspect.iscoroutinefunction(route_fn):
+                return None
+            if route_map is None:
+                return None
+            if self._schema_merge:
+                return None
+
+        native_route_map = (
+            {key: self._map_target_name(value) for key, value in route_map.items()}
+            if route_map
+            else None
+        )
+        return {
+            "action": node_action,
+            "action_arity": action_arity,
+            "route": route_fn,
+            "route_arity": route_arity,
+            "route_map": native_route_map,
+        }
 
 
 class CompiledStateGraph:
@@ -2595,22 +2758,24 @@ class CompiledStateGraph:
         initial_state = {} if input_state is None else dict(input_state)
         normalized_config = _normalize_config(config)
         observer = _coerce_telemetry_observer(telemetry)
-        _begin_context_collection()
-        try:
-            event_sequence = _native._stream(
-                self._native_graph,
-                initial_state,
-                normalized_config,
-                include_subgraphs=include_subgraphs,
-            )
-            events = list(event_sequence)
-        finally:
-            _end_context_collection()
-        events = _decorate_stream_events(events)
+
+        def run_events():
+            _begin_context_collection()
+            try:
+                event_sequence = _native._stream(
+                    self._native_graph,
+                    initial_state,
+                    normalized_config,
+                    include_subgraphs=include_subgraphs,
+                )
+                yield from _decorate_stream_event_iter(event_sequence)
+            finally:
+                _end_context_collection()
+
         if observer is None:
-            for event in events:
-                yield event
+            yield from run_events()
             return
+        events = list(run_events())
         for event in observer.capture_stream(
             lambda: list(events),
             graph_name=self._name,

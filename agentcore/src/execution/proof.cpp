@@ -51,6 +51,12 @@ void hash_graph(Fnv1a64& hasher, const GraphDefinition& graph) {
     hasher.update_pod(graph.id);
     hasher.update_string(graph.name);
     hasher.update_pod(graph.entry);
+    const uint64_t state_reducer_count = static_cast<uint64_t>(graph.state_reducer_rules.size());
+    hasher.update_pod(state_reducer_count);
+    for (const FieldMergeRule& rule : graph.state_reducer_rules) {
+        hasher.update_pod(rule.key);
+        hasher.update_pod(static_cast<uint8_t>(rule.strategy));
+    }
 
     const uint64_t node_count = static_cast<uint64_t>(graph.nodes.size());
     hasher.update_pod(node_count);
